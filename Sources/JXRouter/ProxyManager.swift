@@ -219,8 +219,19 @@ final class ProxyManager {
         case "direct": return ConfigManager.KeychainKey.anthropic
         case "openrouter": return ConfigManager.KeychainKey.openrouter
         case "opencode-zen", "opencode-go": return ConfigManager.KeychainKey.opencode
-        case "openai", "nvidia-nim": return ConfigManager.KeychainKey.openai
-        case "nvidia": return ConfigManager.KeychainKey.nvidia
+        case "openai": return ConfigManager.KeychainKey.openai
+        case "nvidia-nim": return ConfigManager.KeychainKey.nvidia
+        case "deepseek": return ConfigManager.KeychainKey.deepseek
+        case "gemini": return ConfigManager.KeychainKey.gemini
+        case "mistral": return ConfigManager.KeychainKey.mistral
+        case "codestral": return ConfigManager.KeychainKey.codestral
+        case "cohere": return ConfigManager.KeychainKey.cohere
+        case "groq": return ConfigManager.KeychainKey.groq
+        case "fireworks": return ConfigManager.KeychainKey.fireworks
+        case "sambanova": return ConfigManager.KeychainKey.sambanova
+        case "cerebras": return ConfigManager.KeychainKey.cerebras
+        case "huggingface": return ConfigManager.KeychainKey.huggingface
+        case "xai": return ConfigManager.KeychainKey.xai
         default: return "\(providerId.uppercased())_API_KEY"
         }
     }
@@ -273,7 +284,7 @@ final class ProxyManager {
             startTime = Date()
             isRunning = true
 
-            // Enable system proxy on Wi-Fi so apps route traffic through JXRouter
+            // Enable system proxy on Wi-Fi so apps route traffic through JXProxy
             systemProxyManager.discoverInterfaces()
             systemProxyManager.enable()
             systemProxyEnabled = true
@@ -443,14 +454,14 @@ final class ProxyManager {
 
     func exportConfig() -> String {
         var lines: [String] = []
-        lines.append("# JXRouter Configuration (exported \(Date()))")
+        lines.append("# JXProxy Configuration (exported \(Date()))")
         lines.append("PORT=\(config.port)")
         lines.append("PROVIDER=\(config.provider)")
         lines.append("MODEL=\(config.model)")
         lines.append("FALLBACK_PROVIDERS=\(config.fallbackProviders)")
         // Note: secrets are in Keychain, not exported
         lines.append("")
-        lines.append("# API keys are stored in macOS Keychain (service: com.jxrouter)")
+        lines.append("# API keys are stored in macOS Keychain (service: com.jxproxy)")
         lines.append("# To export keys, use: security dump-keychain -d ~/Library/Keychains/login.keychain-db")
         return lines.joined(separator: "\n")
     }
@@ -484,7 +495,7 @@ final class ProxyManager {
     func setError(_ message: String) {
         errorMessage = message
         errorAcknowledged = false
-        print("[JXRouter] \(message)")
+        print("[JXProxy] \(message)")
 
         // Write to persistent error log
         let logURL = errorLogURL()
@@ -504,7 +515,7 @@ final class ProxyManager {
     private func errorLogURL() -> URL {
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
         let logs = library.appendingPathComponent("Logs")
-        return logs.appendingPathComponent("jxrouter-error.log")
+        return logs.appendingPathComponent("jxproxy-error.log")
     }
 
     func clearError() {

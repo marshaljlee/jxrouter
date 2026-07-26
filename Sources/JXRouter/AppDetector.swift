@@ -48,7 +48,7 @@ final class AppDetector {
                     if parts.count > 0 {
                         let appName = String(parts[0])
                         // Exclude our own app name
-                        if appName != "jxrouter" && appName != "JXRouter" && !appName.isEmpty {
+                        if appName != "jxproxy" && appName != "JXProxy" && !appName.isEmpty {
                             apps.insert(appName)
                         }
                     }

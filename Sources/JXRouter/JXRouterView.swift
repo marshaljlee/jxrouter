@@ -125,7 +125,7 @@ struct JXRouterView: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Uninstall JXRouter")
+                .accessibilityLabel("Uninstall JXProxy")
             }
             .padding(.horizontal, 16)
             
@@ -188,7 +188,7 @@ struct JXRouterView: View {
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Anthropic's Claude Code CLI tool was not found on your system. Would you like JXRouter to install it via npm? (Requires npm to be installed)")
+            Text("Anthropic's Claude Code CLI tool was not found on your system. Would you like JXProxy to install it via npm? (Requires npm to be installed)")
         }
     }
     

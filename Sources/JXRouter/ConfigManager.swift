@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Shared configuration manager for JXRouter.
+/// Shared configuration manager for JXProxy.
 ///
 /// - **Secrets** (API keys, auth tokens) are stored in the macOS Keychain.
 /// - **Non-secret settings** (ports, model prefs, provider config) are stored in UserDefaults.
@@ -41,6 +41,26 @@ final class ConfigManager: @unchecked Sendable {
         static let opencode = "OPENCODE_API_KEY"
         static let anthropic = "ANTHROPIC_API_KEY"
         static let nvidia = "NVIDIA_NIM_API_KEY"
+        static let deepseek = "DEEPSEEK_API_KEY"
+        static let gemini = "GEMINI_API_KEY"
+        static let mistral = "MISTRAL_API_KEY"
+        static let codestral = "CODESTRAL_API_KEY"
+        static let cohere = "COHERE_API_KEY"
+        static let groq = "GROQ_API_KEY"
+        static let fireworks = "FIREWORKS_API_KEY"
+        static let sambanova = "SAMBANOVA_API_KEY"
+        static let cerebras = "CEREBRAS_API_KEY"
+        static let huggingface = "HUGGINGFACE_API_KEY"
+        static let githubModels = "GITHUB_MODELS_TOKEN"
+        static let wafer = "WAFER_API_KEY"
+        static let kimi = "KIMI_API_KEY"
+        static let kimiCode = "KIMI_CODE_API_KEY"
+        static let minimax = "MINIMAX_API_KEY"
+        static let xai = "XAI_API_KEY"
+        static let cloudflareApiToken = "CLOUDFLARE_API_TOKEN"
+        static let zai = "ZAI_API_KEY"
+        static let ollamaCloud = "OLLAMA_API_KEY"
+        static let aiGateway = "AI_GATEWAY_API_KEY"
         static let telegramBotToken = "TELEGRAM_BOT_TOKEN"
         static let adminPassword = "ADMIN_PASSWORD"
     }
@@ -219,7 +239,27 @@ final class ConfigManager: @unchecked Sendable {
         case "opencode-zen", "opencode-go": return getApiKey(chainKey: KeychainKey.opencode)
         case "openai": return getApiKey(chainKey: KeychainKey.openai)
         case "nvidia-nim": return getApiKey(chainKey: KeychainKey.nvidia)
-        case "local", "ollama": return ""
+        case "deepseek": return getApiKey(chainKey: KeychainKey.deepseek)
+        case "gemini": return getApiKey(chainKey: KeychainKey.gemini)
+        case "mistral": return getApiKey(chainKey: KeychainKey.mistral)
+        case "codestral": return getApiKey(chainKey: KeychainKey.codestral)
+        case "cohere": return getApiKey(chainKey: KeychainKey.cohere)
+        case "groq": return getApiKey(chainKey: KeychainKey.groq)
+        case "fireworks": return getApiKey(chainKey: KeychainKey.fireworks)
+        case "sambanova": return getApiKey(chainKey: KeychainKey.sambanova)
+        case "cerebras": return getApiKey(chainKey: KeychainKey.cerebras)
+        case "huggingface": return getApiKey(chainKey: KeychainKey.huggingface)
+        case "github-models": return getApiKey(chainKey: KeychainKey.githubModels)
+        case "wafer": return getApiKey(chainKey: KeychainKey.wafer)
+        case "kimi": return getApiKey(chainKey: KeychainKey.kimi)
+        case "kimi-code": return getApiKey(chainKey: KeychainKey.kimiCode)
+        case "minimax": return getApiKey(chainKey: KeychainKey.minimax)
+        case "xai": return getApiKey(chainKey: KeychainKey.xai)
+        case "cloudflare": return getApiKey(chainKey: KeychainKey.cloudflareApiToken)
+        case "zai": return getApiKey(chainKey: KeychainKey.zai)
+        case "ollama-cloud": return getApiKey(chainKey: KeychainKey.ollamaCloud)
+        case "ai-gateway": return getApiKey(chainKey: KeychainKey.aiGateway)
+        case "local", "ollama", "lmstudio", "llamacpp": return ""
         default: return ""
         }
     }
@@ -279,6 +319,26 @@ final class ConfigManager: @unchecked Sendable {
         tryMigrateKey(env: env, key: "OPENCODE_API_KEY", chainKey: KeychainKey.opencode)
         tryMigrateKey(env: env, key: "ANTHROPIC_API_KEY", chainKey: KeychainKey.anthropic)
         tryMigrateKey(env: env, key: "NVIDIA_NIM_API_KEY", chainKey: KeychainKey.nvidia)
+        tryMigrateKey(env: env, key: "DEEPSEEK_API_KEY", chainKey: KeychainKey.deepseek)
+        tryMigrateKey(env: env, key: "GEMINI_API_KEY", chainKey: KeychainKey.gemini)
+        tryMigrateKey(env: env, key: "MISTRAL_API_KEY", chainKey: KeychainKey.mistral)
+        tryMigrateKey(env: env, key: "CODESTRAL_API_KEY", chainKey: KeychainKey.codestral)
+        tryMigrateKey(env: env, key: "COHERE_API_KEY", chainKey: KeychainKey.cohere)
+        tryMigrateKey(env: env, key: "GROQ_API_KEY", chainKey: KeychainKey.groq)
+        tryMigrateKey(env: env, key: "FIREWORKS_API_KEY", chainKey: KeychainKey.fireworks)
+        tryMigrateKey(env: env, key: "SAMBANOVA_API_KEY", chainKey: KeychainKey.sambanova)
+        tryMigrateKey(env: env, key: "CEREBRAS_API_KEY", chainKey: KeychainKey.cerebras)
+        tryMigrateKey(env: env, key: "HUGGINGFACE_API_KEY", chainKey: KeychainKey.huggingface)
+        tryMigrateKey(env: env, key: "GITHUB_MODELS_TOKEN", chainKey: KeychainKey.githubModels)
+        tryMigrateKey(env: env, key: "WAFER_API_KEY", chainKey: KeychainKey.wafer)
+        tryMigrateKey(env: env, key: "KIMI_API_KEY", chainKey: KeychainKey.kimi)
+        tryMigrateKey(env: env, key: "KIMI_CODE_API_KEY", chainKey: KeychainKey.kimiCode)
+        tryMigrateKey(env: env, key: "MINIMAX_API_KEY", chainKey: KeychainKey.minimax)
+        tryMigrateKey(env: env, key: "XAI_API_KEY", chainKey: KeychainKey.xai)
+        tryMigrateKey(env: env, key: "CLOUDFLARE_API_TOKEN", chainKey: KeychainKey.cloudflareApiToken)
+        tryMigrateKey(env: env, key: "ZAI_API_KEY", chainKey: KeychainKey.zai)
+        tryMigrateKey(env: env, key: "OLLAMA_API_KEY", chainKey: KeychainKey.ollamaCloud)
+        tryMigrateKey(env: env, key: "AI_GATEWAY_API_KEY", chainKey: KeychainKey.aiGateway)
 
         // Migrate non-secret settings — only set if currently at defaults
         migrateValue(env: env, key: "JXPROXY_PORT", to: \.port, transform: { Int($0) ?? 5255 })
@@ -337,7 +397,29 @@ final class ConfigManager: @unchecked Sendable {
         case "opencode-zen": return "https://opencode.ai/zen/v1"
         case "opencode-go": return "https://opencode.ai/zen/go/v1"
         case "openai", "nvidia-nim": return openaiBaseUrl
+        case "deepseek": return "https://api.deepseek.com/v1"
+        case "gemini": return "https://generativelanguage.googleapis.com/v1beta"
+        case "mistral": return "https://api.mistral.ai/v1"
+        case "codestral": return "https://codestral.mistral.ai/v1"
+        case "cohere": return "https://api.cohere.ai/v1"
+        case "groq": return "https://api.groq.com/openai/v1"
+        case "fireworks": return "https://api.fireworks.ai/inference/v1"
+        case "sambanova": return "https://api.sambanova.ai/v1"
+        case "cerebras": return "https://api.cerebras.ai/v1"
+        case "huggingface": return "https://router.huggingface.co/v1"
+        case "github-models": return "https://models.inference.ai.azure.com/v1"
+        case "wafer": return "https://api.wafer.ch/v1"
+        case "kimi": return "https://api.moonshot.cn/v1"
+        case "kimi-code": return "https://api.kimi-coding.com/v1"
+        case "minimax": return "https://api.minimax.chat/v1"
+        case "xai": return "https://api.x.ai/v1"
+        case "cloudflare": return "https://api.cloudflare.com/client/v4/ai/run"
+        case "zai": return "https://api.z.ai/v1"
+        case "ollama-cloud": return "https://ollama.com/api/chat"
+        case "ai-gateway": return "https://gateway.ai.vercel.ai/v1"
         case "local", "ollama": return localLlmBaseUrl
+        case "lmstudio": return "http://127.0.0.1:1234/v1"
+        case "llamacpp": return "http://127.0.0.1:8080/v1"
         default: return ""
         }
     }
@@ -345,7 +427,7 @@ final class ConfigManager: @unchecked Sendable {
     /// Resolve a friendly fallback provider name to a canonical provider ID.
     static func resolveProviderName(_ name: String) -> String {
         switch name.lowercased() {
-        case "nvidia": return "openai"
+        case "nvidia": return "nvidia-nim"
         case "ollama": return "local"
         default: return name
         }

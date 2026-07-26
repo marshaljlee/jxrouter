@@ -3,7 +3,7 @@ import Foundation
 @MainActor
 @Observable
 final class SystemProxyManager {
-    private let processQueue = DispatchQueue(label: "com.jxrouter.systemproxy", qos: .utility)
+    private let processQueue = DispatchQueue(label: "com.jxproxy.systemproxy", qos: .utility)
 
     var isEnabled = false
     var proxyPort: UInt16 = 5255

@@ -13,8 +13,8 @@ final class DNSRedirectionManager: @unchecked Sendable {
     static let shared = DNSRedirectionManager()
 
     /// Marker comment in /etc/hosts to identify our entries.
-    private let hostsMarker = "# JXRouter DNS Hijack \u{2014} do not edit manually"
-    private let pfAnchorName = "com.apple/250.jxrouter"
+    private let hostsMarker = "# JXProxy DNS Hijack \u{2014} do not edit manually"
+    private let pfAnchorName = "com.apple/250.jxproxy"
 
     /// Whether DNS redirection is currently active.
     private(set) var isActive = false
@@ -47,8 +47,8 @@ final class DNSRedirectionManager: @unchecked Sendable {
         }
 
         // Step 2: Write temp files (no admin needed)
-        let hostsPath = "/tmp/jxrouter-hosts.tmp"
-        let pfPath = "/tmp/jxrouter-pf.conf"
+        let hostsPath = "/tmp/jxproxy-hosts.tmp"
+        let pfPath = "/tmp/jxproxy-pf.conf"
         let pfConf = """
         rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port \(proxyPort)
         """
@@ -108,7 +108,7 @@ final class DNSRedirectionManager: @unchecked Sendable {
         // Write cleaned hosts to temp file if needed
         var hostsPath: String? = nil
         if let content = newHostsContent {
-            hostsPath = "/tmp/jxrouter-hosts-clean.tmp"
+            hostsPath = "/tmp/jxproxy-hosts-clean.tmp"
             try? content.write(toFile: hostsPath!, atomically: true, encoding: .utf8)
         }
 
@@ -189,7 +189,7 @@ final class DNSRedirectionManager: @unchecked Sendable {
             newEntries += "127.0.0.1\t*.\(host)\n"
         }
         newEntries += "127.0.0.1\t*.anthropic.com\n"
-        newEntries += "# End JXRouter DNS Hijack\n"
+        newEntries += "# End JXProxy DNS Hijack\n"
         content += newEntries
         return content
     }
@@ -200,7 +200,7 @@ final class DNSRedirectionManager: @unchecked Sendable {
         lines = lines.filter { line in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed == hostsMarker { inBlock = true; return false }
-            if inBlock && trimmed == "# End JXRouter DNS Hijack" { inBlock = false; return false }
+            if inBlock && trimmed == "# End JXProxy DNS Hijack" { inBlock = false; return false }
             if inBlock { return false }
             return true
         }

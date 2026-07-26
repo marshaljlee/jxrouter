@@ -32,6 +32,7 @@ struct RequestClassifier: Sendable {
         "api.groq.com",
         "api.cohere.ai",
         "api.mistral.ai",
+        "codestral.mistral.ai",
         "api.deepseek.com",
         "api.perplexity.ai",
         "api.together.xyz",
@@ -39,16 +40,23 @@ struct RequestClassifier: Sendable {
         "api.lemonfox.ai",
         "api.replicate.com",
         "inference.ai.azure.com",
-        "api-inference.huggingface.co",
+        "router.huggingface.co",
         "generativelanguage.googleapis.com",
         "api.x.ai",
         "api.sambanova.ai",
         "api.cerebras.ai",
         "api.claudette.com",
-        "api.anthropic.com",
         "api.studio.ai",
         "oai.opencode.ai",
         "zen.opencode.ai",
+        "models.inference.ai.azure.com",
+        "api.wafer.ch",
+        "api.moonshot.cn",
+        "api.kimi-coding.com",
+        "api.minimax.chat",
+        "api.z.ai",
+        "gateway.ai.vercel.ai",
+        "ollama.com",
     ]
 
     let aiHostSuffixes: [String] = [
@@ -71,6 +79,13 @@ struct RequestClassifier: Sendable {
         ".cerebras.ai",
         ".sambanova.ai",
         ".replicate.com",
+        ".wafer.ch",
+        ".moonshot.cn",
+        ".kimi-coding.com",
+        ".minimax.chat",
+        ".z.ai",
+        ".vercel.ai",
+        ".ollama.com",
     ]
 
     func classify(host: String) -> RouteAction {

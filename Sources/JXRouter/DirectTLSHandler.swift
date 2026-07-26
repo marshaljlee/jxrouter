@@ -19,7 +19,7 @@ import Network
 /// PEM files directly, avoiding the keychain import prompt entirely.
 final class DirectTLSHandler: @unchecked Sendable {
     private var tlsListener: NWListener?
-    private let queue = DispatchQueue(label: "com.jxrouter.directtls", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.jxproxy.directtls", qos: .userInitiated)
     private weak var providerRouter: ProviderRouter?
 
     /// Whether the TLS listener is active.
@@ -82,10 +82,7 @@ final class DirectTLSHandler: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { connection.cancel(); return }
             connection.start(queue: self.queue)
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 131_072) { data, _, _, error in
-                guard let data = data, error == nil else { connection.cancel(); return }
-                Task { await self.routeHTTP(connection: connection, requestData: data) }
-            }
+            self.receiveRequest(connection: connection, accumulatedData: Data())
         }
 
         listener.start(queue: queue)
@@ -101,6 +98,75 @@ final class DirectTLSHandler: @unchecked Sendable {
     }
 
     // MARK: - Connection Handling
+
+    private func receiveRequest(connection: NWConnection, accumulatedData: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 131_072) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            
+            var newData = accumulatedData
+            if let data = data, !data.isEmpty {
+                newData.append(data)
+            }
+            
+            if error != nil {
+                connection.cancel()
+                return
+            }
+            
+            if let headerEnd = newData.range(of: Data("\r\n\r\n".utf8)) {
+                let headerData = newData.prefix(upTo: headerEnd.lowerBound)
+                if let headerStr = String(data: headerData, encoding: .utf8) {
+                    let headers = self.parseHeaders(headerStr)
+                    
+                    if let clStr = headers["content-length"], let cl = Int(clStr) {
+                        let bodySize = newData.count - headerEnd.upperBound
+                        if bodySize >= cl {
+                            // Full body received
+                            let requestToProcess = newData
+                            Task { await self.routeHTTP(connection: connection, requestData: requestToProcess) }
+                            return
+                        }
+                    } else if headers["transfer-encoding"]?.lowercased() == "chunked" {
+                        if newData.range(of: Data("0\r\n\r\n".utf8)) != nil {
+                            let requestToProcess = newData
+                            Task { await self.routeHTTP(connection: connection, requestData: requestToProcess) }
+                            return
+                        }
+                    } else {
+                        // No body or unknown
+                        let requestToProcess = newData
+                        Task { await self.routeHTTP(connection: connection, requestData: requestToProcess) }
+                        return
+                    }
+                }
+            }
+            
+            if isComplete {
+                if !newData.isEmpty {
+                    Task { await self.routeHTTP(connection: connection, requestData: newData) }
+                } else {
+                    connection.cancel()
+                }
+                return
+            }
+            
+            self.receiveRequest(connection: connection, accumulatedData: newData)
+        }
+    }
+    
+    private func parseHeaders(_ headerStr: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        let lines = headerStr.components(separatedBy: "\r\n")
+        for line in lines.dropFirst() {
+            guard !line.isEmpty else { break }
+            let hParts = line.split(separator: ":", maxSplits: 1)
+            if hParts.count == 2 {
+                headers[String(hParts[0]).trimmingCharacters(in: .whitespaces).lowercased()] =
+                    String(hParts[1]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return headers
+    }
 
     private func routeHTTP(connection: NWConnection, requestData: Data) async {
         guard let requestStr = String(data: requestData, encoding: .utf8) else {
@@ -124,16 +190,7 @@ final class DirectTLSHandler: @unchecked Sendable {
         let pathRaw = parts[1]
         let path = pathRaw.components(separatedBy: "?").first ?? pathRaw
 
-        // Parse headers
-        var headers: [String: String] = [:]
-        for line in lines.dropFirst() {
-            guard !line.isEmpty else { break }
-            let hParts = line.split(separator: ":", maxSplits: 1)
-            if hParts.count == 2 {
-                headers[String(hParts[0]).trimmingCharacters(in: .whitespaces).lowercased()] =
-                    String(hParts[1]).trimmingCharacters(in: .whitespaces)
-            }
-        }
+        let headers = parseHeaders(requestStr)
 
         // Extract body
         let bodyData: Data
@@ -148,27 +205,46 @@ final class DirectTLSHandler: @unchecked Sendable {
         let trimmedBody = bodyData.prefix(contentLength)
 
         guard let router = providerRouter else {
-            sendError(connection, statusCode: 502, message: "Provider Router unavailable")
+            print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Provider Router unavailable")
             return
         }
 
         do {
-            let response = try await router.route(method: method, path: path, headers: headers, body: trimmedBody)
+            print("[DirectTLSHandler] Calling route"); let response = try await router.route(method: method, path: path, headers: headers, body: trimmedBody)
 
-            var respStr = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"
+            print("[DirectTLSHandler] Got response (response.statusCode)"); var respStr = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"
             for (key, value) in response.headers {
                 respStr += "\(key): \(value)\r\n"
             }
-            respStr += "Content-Length: \(response.body.count)\r\n"
-            respStr += "Proxy-Agent: JXRouter\r\n"
-            respStr += "\r\n"
+            respStr += "Proxy-Agent: JXProxy\r\n"
+            
+            if let stream = response.stream {
+                respStr += "Transfer-Encoding: chunked\r\n\r\n"
+                connection.send(content: Data(respStr.utf8), completion: .contentProcessed({ _ in }))
+                
+                for await chunk in stream {
+                    var chunkStr = String(format: "%X\r\n", chunk.count)
+                    var chunkData = Data(chunkStr.utf8)
+                    chunkData.append(chunk)
+                    chunkData.append(Data("\r\n".utf8))
+                    connection.send(content: chunkData, completion: .contentProcessed({ _ in }))
+                }
+                
+                let endChunk = Data("0\r\n\r\n".utf8)
+                connection.send(content: endChunk, completion: .contentProcessed({ [weak self] _ in
+                    self?.receiveRequest(connection: connection, accumulatedData: Data())
+                }))
+            } else {
+                respStr += "Content-Length: \(response.body.count)\r\n\r\n"
+                var fullResponse = Data(respStr.utf8)
+                fullResponse.append(response.body)
 
-            var fullResponse = Data(respStr.utf8)
-            fullResponse.append(response.body)
-
-            connection.send(content: fullResponse, completion: .contentProcessed({ _ in connection.cancel() }))
+                connection.send(content: fullResponse, completion: .contentProcessed({ [weak self] _ in 
+                    self?.receiveRequest(connection: connection, accumulatedData: Data())
+                }))
+            }
         } catch {
-            sendError(connection, statusCode: 502, message: "Upstream error: \(error.localizedDescription)")
+            print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Upstream error: \(error.localizedDescription)")
         }
     }
 
@@ -186,7 +262,7 @@ final class DirectTLSHandler: @unchecked Sendable {
     private func sendError(_ connection: NWConnection, statusCode: Int, message: String) {
         let escaped = message.replacingOccurrences(of: "\"", with: "\\\"")
         let body = "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"\(escaped)\"}}"
-        let resp = "HTTP/1.1 \(statusCode) \(statusText(statusCode))\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXRouter\r\n\r\n\(body)"
+        let resp = "HTTP/1.1 \(statusCode) \(statusText(statusCode))\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
         guard let data = resp.data(using: .utf8) else { connection.cancel(); return }
         connection.send(content: data, completion: .contentProcessed({ _ in connection.cancel() }))
     }

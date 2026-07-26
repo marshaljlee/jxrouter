@@ -84,7 +84,7 @@ struct JXRouterApp: App {
     private func exportConfig() {
         let config = ProxyManager.shared.exportConfig()
         let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("jxrouter-config.txt")
+            .appendingPathComponent("jxproxy-config.txt")
         try? config.write(to: tempURL, atomically: true, encoding: .utf8)
         NSWorkspace.shared.open(tempURL)
     }

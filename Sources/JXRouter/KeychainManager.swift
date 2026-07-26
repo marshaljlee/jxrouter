@@ -7,7 +7,7 @@
 /// daemon is unresponsive (e.g. securityd issue), all Keychain reads use a
 /// background dispatch with a 3-second timeout.
 enum KeychainManager {
-    static let service = "com.jxrouter"
+    static let service = "com.jxproxy"
 
     /// Performs `SecItemCopyMatching` with a 3-second timeout.
     /// Returns `(status, result)` on success, or `nil` on timeout.

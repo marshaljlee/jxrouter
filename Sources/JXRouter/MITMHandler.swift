@@ -55,7 +55,7 @@ final class MITMHandler: @unchecked Sendable {
     /// Simple TCP passthrough for CONNECT tunnels.
     /// Sends "200 Connection Established" and relays raw TCP data bidirectionally.
     private func startPassthrough(_ connection: NWConnection, host: String, port: UInt16) {
-        let established = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: JXRouter\r\n\r\n"
+        let established = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: JXProxy\r\n\r\n"
         guard let establishedData = established.data(using: .utf8) else {
             connection.cancel()
             return
@@ -86,8 +86,8 @@ final class MITMHandler: @unchecked Sendable {
 
     /// Continuously relay data from source to destination.
     private func relayLoop(source: NWConnection, destination: NWConnection) {
-        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, error in
-            guard let data = data, error == nil else {
+        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+            guard let data = data, !data.isEmpty, error == nil else {
                 source.cancel()
                 destination.cancel()
                 return
@@ -111,5 +111,5 @@ final class MITMHandler: @unchecked Sendable {
         return false
     }
 
-    private let queue = DispatchQueue(label: "com.jxrouter.mitm", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.jxproxy.mitm", qos: .userInitiated)
 }

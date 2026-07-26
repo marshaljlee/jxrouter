@@ -11,7 +11,7 @@ struct ProxyStats: Sendable {
 @Observable
 final class ProxyServer: @unchecked Sendable {
     private var httpListener: NWListener?
-    private let queue = DispatchQueue(label: "com.jxrouter.proxy", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.jxproxy.proxy", qos: .userInitiated)
     private let classifier = RequestClassifier()
 
     var isRunning = false
@@ -35,7 +35,7 @@ final class ProxyServer: @unchecked Sendable {
     var lastError: String?
 
     /// Cached config values for nonisolated access (updated via syncFromConfig).
-    var cachedProvider: String = "jxrouter"
+    var cachedProvider: String = "jxproxy"
     var cachedModelOpus: String = "claude-opus-4-8-20250701"
     var cachedModelSonnet: String = "claude-sonnet-5-20251001"
     var cachedModelHaiku: String = "claude-haiku-4-5-20251001"
@@ -51,6 +51,7 @@ final class ProxyServer: @unchecked Sendable {
         cachedModelSonnet = ConfigManager.shared.modelSonnet
         cachedModelHaiku = ConfigManager.shared.modelHaiku
         cachedMitmHosts = ConfigManager.shared.mitmHosts
+        cachedProvider = ConfigManager.shared.provider
     }
 
     /// Whether auth enforcement is enabled.
@@ -284,7 +285,7 @@ final class ProxyServer: @unchecked Sendable {
         // If the rule says block, drop it immediately.
         if ruleAction == .block {
             print("[ProxyServer] Blocked connection from \(connectedApp) due to AppRouteRule")
-            sendHttpResponse(connection, statusCode: 403, message: "Blocked by JXRouter App Rule")
+            sendHttpResponse(connection, statusCode: 403, message: "Blocked by JXProxy App Rule")
             updateStats(for: "local", action: .block)
             return
         }
@@ -337,6 +338,13 @@ final class ProxyServer: @unchecked Sendable {
 
     private func validateAuth(request: String) -> AuthResult {
         guard authEnabled else { return .allowed }
+
+        let lines = request.components(separatedBy: "\r\n")
+        if let firstLine = lines.first {
+            if firstLine.contains("/api/hello") {
+                return .allowed
+            }
+        }
 
         let headers = parseHeaders(from: request)
         let xApiKey = headers["x-api-key"]
@@ -418,7 +426,7 @@ final class ProxyServer: @unchecked Sendable {
             port = (scheme == "https") ? 443 : 80
         }
 
-        // Check if this is an internal JXRouter endpoint
+        // Check if this is an internal JXProxy endpoint
         let hostWithoutPort = host.split(separator: ":").first.map(String.init) ?? host
         if hostWithoutPort == "127.0.0.1" || hostWithoutPort == "localhost" {
             if path == "/health" || path == "/" {
@@ -429,7 +437,7 @@ final class ProxyServer: @unchecked Sendable {
                 handleModelListEndpoint(connection)
                 return
             }
-            if path == "/v1/messages" {
+            if path == "/v1/messages" || path == "/v1/v1/messages" || path == "/messages" {
                 handleAIMessages(connection, method: method, initialData: initialData)
                 return
             }
@@ -464,7 +472,7 @@ final class ProxyServer: @unchecked Sendable {
         case .passthrough:
             forwardDirectly(connection, initialData: initialData, host: host, port: port)
         case .block:
-            sendHttpResponse(connection, statusCode: 403, message: "Blocked by JXRouter")
+            sendHttpResponse(connection, statusCode: 403, message: "Blocked by JXProxy")
         }
     }
 
@@ -476,7 +484,7 @@ final class ProxyServer: @unchecked Sendable {
         {"status":"ok","provider":"\(provider)","version":"1.0.0"}
         """
         let response = """
-        HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXRouter\r\n\r\n\(body)
+        HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
         """
         guard let data = response.data(using: .utf8) else {
             connection.cancel()
@@ -490,17 +498,17 @@ final class ProxyServer: @unchecked Sendable {
     private func handleModelListEndpoint(_ connection: NWConnection) {
         let now = Int(Date().timeIntervalSince1970)
         let models: [[String: Any]] = [
-            ["id": "claude-opus-4-8-20250701", "object": "model", "created": now, "owned_by": "jxrouter"],
-            ["id": "claude-sonnet-5-20251001", "object": "model", "created": now, "owned_by": "jxrouter"],
-            ["id": "claude-haiku-4-5-20251001", "object": "model", "created": now, "owned_by": "jxrouter"],
-            ["id": cachedModelOpus, "object": "model", "created": now, "owned_by": "jxrouter"],
-            ["id": cachedModelSonnet, "object": "model", "created": now, "owned_by": "jxrouter"],
-            ["id": cachedModelHaiku, "object": "model", "created": now, "owned_by": "jxrouter"],
+            ["id": "claude-opus-4-8-20250701", "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": "claude-sonnet-5-20251001", "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": "claude-haiku-4-5-20251001", "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": cachedModelOpus, "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": cachedModelSonnet, "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": cachedModelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
         ]
         let data = try! JSONSerialization.data(withJSONObject: ["data": models])
         let body = String(data: data, encoding: .utf8) ?? "[]"
         let response = """
-        HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXRouter\r\n\r\n\(body)
+        HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
         """
         guard let respData = response.data(using: .utf8) else {
             connection.cancel()
@@ -511,7 +519,7 @@ final class ProxyServer: @unchecked Sendable {
 
     private func handleAIMessages(_ connection: NWConnection, method: String, initialData: Data) {
         if method == "HEAD" || method == "OPTIONS" {
-            let response = "HTTP/1.1 204 No Content\r\nAllow: POST, HEAD, OPTIONS\r\nProxy-Agent: JXRouter\r\n\r\n"
+            let response = "HTTP/1.1 204 No Content\r\nAllow: POST, HEAD, OPTIONS\r\nProxy-Agent: JXProxy\r\n\r\n"
             guard let data = response.data(using: .utf8) else { connection.cancel(); return }
             connection.send(content: data, completion: .contentProcessed({ _ in connection.cancel() }))
             return
@@ -521,17 +529,43 @@ final class ProxyServer: @unchecked Sendable {
             sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
             return
         }
-        let split = requestStr.components(separatedBy: "\r\n\r\n")
-        guard split.count >= 2 else {
+
+        // Parse headers to find Content-Length
+        let headers = parseHeaders(from: requestStr)
+        let contentLength = headers["content-length"].flatMap { Int($0) } ?? 0
+
+        // Split at the header/body boundary (byte-accurate)
+        let separator = Data("\r\n\r\n".utf8)
+        guard let separatorRange = initialData.range(of: separator) else {
             sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
             return
         }
-        let bodyData = Data(split.dropFirst().joined(separator: "\r\n\r\n").utf8)
+        let initialBodyData = initialData[separatorRange.upperBound...]
+        let remainingBytes = contentLength - initialBodyData.count
 
         let router = self.providerRouter
         Task {
             do {
-                let headers = parseHeaders(from: requestStr)
+                // Accumulate full body if it was truncated
+                var bodyData = Data(initialBodyData)
+                if remainingBytes > 0 {
+                    var bytesLeft = remainingBytes
+                    while bytesLeft > 0 {
+                        let chunkSize = min(bytesLeft, 65536)
+                        let chunk: Data = try await withCheckedThrowingContinuation { cont in
+                            connection.receive(minimumIncompleteLength: 1, maximumLength: chunkSize) { data, _, isComplete, error in
+                                if let error = error {
+                                    cont.resume(throwing: error)
+                                } else {
+                                    cont.resume(returning: data ?? Data())
+                                }
+                            }
+                        }
+                        bodyData.append(chunk)
+                        bytesLeft -= chunk.count
+                        if chunk.isEmpty { break }
+                    }
+                }
                 let response = try await router?.route(
                     method: method,
                     path: "/v1/messages",
@@ -557,9 +591,24 @@ final class ProxyServer: @unchecked Sendable {
                 }
 
                 connection.send(content: headerData, completion: .contentProcessed({ _ in
-                    connection.send(content: response.body, completion: .contentProcessed({ _ in
-                        connection.cancel()
-                    }))
+                    if let stream = response.stream {
+                        // Streaming SSE: pump chunks from AsyncStream into the connection
+                        Task {
+                            for await chunk in stream {
+                                guard !chunk.isEmpty else { continue }
+                                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                                    connection.send(content: chunk, completion: .contentProcessed({ _ in
+                                        cont.resume()
+                                    }))
+                                }
+                            }
+                            connection.cancel()
+                        }
+                    } else {
+                        connection.send(content: response.body, completion: .contentProcessed({ _ in
+                            connection.cancel()
+                        }))
+                    }
                 }))
             } catch {
                 sendHttpResponse(connection, statusCode: 502, message: "Upstream error")
@@ -600,7 +649,7 @@ final class ProxyServer: @unchecked Sendable {
     // MARK: - Connection Helpers
 
     private func sendHttpResponse(_ connection: NWConnection, statusCode: Int, message: String) {
-        let response = "HTTP/1.1 \(statusCode) \(message)\r\nContent-Length: 0\r\nConnection: close\r\nProxy-Agent: JXRouter\r\n\r\n"
+        let response = "HTTP/1.1 \(statusCode) \(message)\r\nContent-Length: 0\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n"
         guard let data = response.data(using: .utf8) else {
             connection.cancel()
             return
@@ -725,9 +774,12 @@ final class ProxyServer: @unchecked Sendable {
                 for (key, value) in response.headers {
                     headerString += "\(key): \(value)\r\n"
                 }
-                headerString += "Content-Length: \(response.body.count)\r\n"
+                
+                if response.stream == nil {
+                    headerString += "Content-Length: \(response.body.count)\r\n"
+                }
                 headerString += "Connection: close\r\n"
-                headerString += "Proxy-Agent: JXRouter\r\n"
+                headerString += "Proxy-Agent: JXProxy\r\n"
                 headerString += "\r\n"
 
                 guard let headerData = headerString.data(using: .utf8) else {
@@ -736,9 +788,18 @@ final class ProxyServer: @unchecked Sendable {
                 }
 
                 connection.send(content: headerData, completion: .contentProcessed({ _ in
-                    connection.send(content: response.body, completion: .contentProcessed({ _ in
-                        connection.cancel()
-                    }))
+                    if let stream = response.stream {
+                        Task {
+                            for await chunk in stream {
+                                connection.send(content: chunk, completion: .contentProcessed({ _ in }))
+                            }
+                            connection.cancel()
+                        }
+                    } else {
+                        connection.send(content: response.body, completion: .contentProcessed({ _ in
+                            connection.cancel()
+                        }))
+                    }
                 }))
             } catch {
                 sendHttpResponse(connection, statusCode: 502, message: "Upstream error")
@@ -764,8 +825,8 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     private func relayLoop(source: NWConnection, destination: NWConnection) {
-        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self, let data = data, error == nil else {
+        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self, let data = data, !data.isEmpty, error == nil else {
                 source.cancel()
                 destination.cancel()
                 return

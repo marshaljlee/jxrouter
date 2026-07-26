@@ -9,7 +9,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTab: SettingsTab = .general
     @State private var initialSettingsHash: String = ""
-
+    @State private var hasUnsavedChanges: Bool = false
+    
     @State private var config = ConfigManager.shared
     // General
     @State private var port: String = "5255"
@@ -17,7 +18,7 @@ struct SettingsView: View {
     @State private var model: String = "big-pickle"
     @State private var enableThinking: Bool = true
     @State private var provider: String = "opencode-zen"
-    @State private var fallbackProviders: String = "nvidia,local"
+    @State private var fallbackProviders: String = "deepseek,groq"
     // Model Overrides
     @State private var modelOpus: String = ""
     @State private var modelSonnet: String = ""
@@ -29,7 +30,19 @@ struct SettingsView: View {
     @State private var openaiKey: String = ""
     @State private var openrouterKey: String = ""
     @State private var opencodeKey: String = ""
+    @State private var nvidiaKey: String = ""
     @State private var anthropicKey: String = ""
+    @State private var deepseekKey: String = ""
+    @State private var geminiKey: String = ""
+    @State private var mistralKey: String = ""
+    @State private var codestralKey: String = ""
+    @State private var cohereKey: String = ""
+    @State private var groqKey: String = ""
+    @State private var fireworksKey: String = ""
+    @State private var sambanovaKey: String = ""
+    @State private var cerebrasKey: String = ""
+    @State private var huggingfaceKey: String = ""
+    @State private var xaiKey: String = ""
     
     @AppStorage("autoStartProxy") private var autoStartProxy = false
     
@@ -50,7 +63,29 @@ struct SettingsView: View {
         ("opencode-go", "OpenCode Go"),
         ("openrouter", "OpenRouter"),
         ("openai", "OpenAI / Codex"),
+        ("nvidia-nim", "NVIDIA NIM"),
+        ("deepseek", "DeepSeek"),
+        ("gemini", "Google Gemini"),
+        ("mistral", "Mistral"),
+        ("codestral", "Mistral Codestral"),
+        ("cohere", "Cohere"),
+        ("groq", "Groq"),
+        ("fireworks", "Fireworks AI"),
+        ("sambanova", "SambaNova"),
+        ("cerebras", "Cerebras"),
+        ("huggingface", "HuggingFace"),
+        ("xai", "xAI Grok"),
+        ("wafer", "Wafer"),
+        ("kimi", "Kimi API"),
+        ("kimi-code", "Kimi Code"),
+        ("minimax", "MiniMax"),
+        ("zai", "Z.ai"),
+        ("ollama-cloud", "Ollama Cloud"),
+        ("github-models", "GitHub Models"),
+        ("ai-gateway", "Vercel AI Gateway"),
         ("local", "Local (Ollama)"),
+        ("lmstudio", "LM Studio"),
+        ("llamacpp", "llama.cpp"),
     ]
 
     let knownModels = [
@@ -66,7 +101,17 @@ struct SettingsView: View {
         "ollama/qwythos-9b",
         "ollama/llama3",
         "nvidia/nemotron-3-ultra-550b-a55b",
-        "nvidia/llama3-70b-instruct"
+        "nvidia/llama3-70b-instruct",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-reasoner",
+        "gemini/gemini-3.1-flash-lite",
+        "gemini/gemini-3.5-flash",
+        "mistral/mistral-small-latest",
+        "mistral/mistral-large-latest",
+        "groq/llama-3.3-70b-versatile",
+        "cohere/command-a-plus-05-2026",
+        "xai/grok-3",
+        "xai/grok-3-mini"
     ]
 
     enum SettingsTab: String, CaseIterable {
@@ -126,7 +171,12 @@ struct SettingsView: View {
         .onDisappear {
             saveConfig()
         }
-        .onChange(of: settingsHash) { _, _ in saveConfig() }
+        .onChange(of: settingsHash) { _, newHash in 
+            if !initialSettingsHash.isEmpty && newHash != initialSettingsHash {
+                hasUnsavedChanges = true
+            }
+            saveConfig() 
+        }
     }
 
     // MARK: - Tab Bar
@@ -240,6 +290,18 @@ struct SettingsView: View {
             secureField("OpenAI API Key", text: $openaiKey)
             secureField("OpenRouter API Key", text: $openrouterKey)
             secureField("OpenCode API Key", text: $opencodeKey)
+            secureField("NVIDIA NIM API Key", text: $nvidiaKey)
+            secureField("DeepSeek API Key", text: $deepseekKey)
+            secureField("Google Gemini API Key", text: $geminiKey)
+            secureField("Mistral API Key", text: $mistralKey)
+            secureField("Mistral Codestral API Key", text: $codestralKey)
+            secureField("Cohere API Key", text: $cohereKey)
+            secureField("Groq API Key", text: $groqKey)
+            secureField("Fireworks AI API Key", text: $fireworksKey)
+            secureField("SambaNova API Key", text: $sambanovaKey)
+            secureField("Cerebras API Key", text: $cerebrasKey)
+            secureField("HuggingFace API Key", text: $huggingfaceKey)
+            secureField("xAI Grok API Key", text: $xaiKey)
 
             Divider().padding(.vertical, DesignToken.spacing4)
 
@@ -265,7 +327,7 @@ struct SettingsView: View {
     private var routingTab: some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing20) {
             sectionGroup("App Routing Rules") {
-                Text("Choose which apps route through JXRouter. Drag .app files from Finder to add rules.")
+                Text("Choose which apps route through JXProxy. Drag .app files from Finder to add rules.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
 
@@ -357,7 +419,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Text("Routes HTTP/HTTPS through JXRouter. Non-AI requests pass through unmodified.")
+                Text("Routes HTTP/HTTPS through JXProxy. Non-AI requests pass through unmodified.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
             }
@@ -469,8 +531,8 @@ struct SettingsView: View {
 
             Spacer()
 
-            if settingsHash != initialSettingsHash {
-                Text("Changes are saved automatically. Restart proxy to apply.")
+            if hasUnsavedChanges {
+                Text("Restart proxy to apply network changes.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
             }
@@ -535,7 +597,9 @@ struct SettingsView: View {
             provider, fallbackProviders,
             modelOpus, modelSonnet, modelHaiku,
             openaiBaseUrl, localBaseUrl, localModel,
-            anthropicKey, openaiKey, openrouterKey, opencodeKey,
+            anthropicKey, openaiKey, openrouterKey, opencodeKey, nvidiaKey,
+            deepseekKey, geminiKey, mistralKey, codestralKey, cohereKey,
+            groqKey, fireworksKey, sambanovaKey, cerebrasKey, huggingfaceKey, xaiKey,
             String(botIntegrationEnabled), telegramBotToken,
             adminPassword
         ].joined(separator: "\u{1F}")
@@ -558,6 +622,18 @@ struct SettingsView: View {
         openaiKey = config.apiKey(for: "openai")
         openrouterKey = config.apiKey(for: "openrouter")
         opencodeKey = config.apiKey(for: "opencode-zen")
+        nvidiaKey = config.apiKey(for: "nvidia-nim")
+        deepseekKey = config.apiKey(for: "deepseek")
+        geminiKey = config.apiKey(for: "gemini")
+        mistralKey = config.apiKey(for: "mistral")
+        codestralKey = config.apiKey(for: "codestral")
+        cohereKey = config.apiKey(for: "cohere")
+        groqKey = config.apiKey(for: "groq")
+        fireworksKey = config.apiKey(for: "fireworks")
+        sambanovaKey = config.apiKey(for: "sambanova")
+        cerebrasKey = config.apiKey(for: "cerebras")
+        huggingfaceKey = config.apiKey(for: "huggingface")
+        xaiKey = config.apiKey(for: "xai")
         enableSystemProxy = manager.systemProxyEnabled
         botIntegrationEnabled = config.botIntegrationEnabled
         telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
@@ -594,6 +670,18 @@ struct SettingsView: View {
         config.setApiKey(chainKey: ConfigManager.KeychainKey.openai, value: openaiKey)
         config.setApiKey(chainKey: ConfigManager.KeychainKey.openrouter, value: openrouterKey)
         config.setApiKey(chainKey: ConfigManager.KeychainKey.opencode, value: opencodeKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.nvidia, value: nvidiaKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.deepseek, value: deepseekKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.gemini, value: geminiKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.mistral, value: mistralKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.codestral, value: codestralKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.cohere, value: cohereKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.groq, value: groqKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.fireworks, value: fireworksKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.sambanova, value: sambanovaKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.cerebras, value: cerebrasKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.huggingface, value: huggingfaceKey)
+        config.setApiKey(chainKey: ConfigManager.KeychainKey.xai, value: xaiKey)
         config.botIntegrationEnabled = botIntegrationEnabled
         config.setApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken, value: telegramBotToken)
         config.setApiKey(chainKey: ConfigManager.KeychainKey.adminPassword, value: adminPassword)
@@ -614,10 +702,10 @@ struct SettingsView: View {
         model = "big-pickle"
         enableThinking = true
         provider = "opencode-zen"
-        fallbackProviders = "nvidia,local"
+        fallbackProviders = "deepseek,groq"
         modelOpus = "opencode/big-pickle"
-        modelSonnet = "nvidia/nemotron-3-ultra-550b-a55b"
-        modelHaiku = "ollama/qwen3:latest"
+        modelSonnet = "deepseek/deepseek-chat"
+        modelHaiku = "groq/llama-3.3-70b-versatile"
         openaiBaseUrl = "https://integrate.api.nvidia.com/v1"
         localBaseUrl = "http://127.0.0.1:11434/v1"
         localModel = "ollama/qwen"
@@ -625,6 +713,18 @@ struct SettingsView: View {
         openaiKey = ""
         openrouterKey = ""
         opencodeKey = ""
+        nvidiaKey = ""
+        deepseekKey = ""
+        geminiKey = ""
+        mistralKey = ""
+        codestralKey = ""
+        cohereKey = ""
+        groqKey = ""
+        fireworksKey = ""
+        sambanovaKey = ""
+        cerebrasKey = ""
+        huggingfaceKey = ""
+        xaiKey = ""
         enableSystemProxy = false
         appRoutes = []
         botIntegrationEnabled = false

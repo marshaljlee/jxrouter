@@ -22,7 +22,7 @@ final class CertificateAuthority: @unchecked Sendable {
 
     private init() {
         let appDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        appSupport = appDir.appendingPathComponent("JXRouter", isDirectory: true)
+        appSupport = appDir.appendingPathComponent("JXProxy", isDirectory: true)
         caCertPath = appSupport.appendingPathComponent("ca-cert.pem")
         caKeyPath = appSupport.appendingPathComponent("ca-key.pem")
         try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
@@ -71,7 +71,7 @@ final class CertificateAuthority: @unchecked Sendable {
             "-key", caKeyPath.path,
             "-out", caCertPath.path,
             "-days", "3650",
-            "-subj", "/CN=JXRouter CA",
+            "-subj", "/CN=JXProxy CA",
         ]
         return runOpenssl(args)
     }

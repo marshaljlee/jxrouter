@@ -37,7 +37,7 @@ final class StatusItemManager: NSObject {
         let iconName = proxyManager.isRunning ? "bolt.fill" : "bolt.slash"
         button.image = NSImage(
             systemSymbolName: iconName,
-            accessibilityDescription: "JXRouter"
+            accessibilityDescription: "JXProxy"
         )
         button.image?.isTemplate = true
 
@@ -85,7 +85,7 @@ final class StatusItemManager: NSObject {
         // Slim transparent title bar — the SwiftUI view provides the background
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.title = "JXRouter"
+        window.title = "JXProxy"
 
         // Let the user drag the window from anywhere on the background
         window.isMovableByWindowBackground = true
@@ -142,7 +142,7 @@ final class StatusItemManager: NSObject {
         ))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(
-            title: "Quit JXRouter",
+            title: "Quit JXProxy",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         ))
@@ -193,7 +193,7 @@ final class StatusItemManager: NSObject {
         let iconName = proxyManager.isRunning ? "bolt.fill" : "bolt.slash"
         button.image = NSImage(
             systemSymbolName: iconName,
-            accessibilityDescription: "JXRouter"
+            accessibilityDescription: "JXProxy"
         )
         button.image?.isTemplate = true
     }
