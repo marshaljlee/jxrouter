@@ -3,53 +3,83 @@ import Network
 
 /// Handles CONNECT tunnel requests for the system proxy.
 ///
-/// This is a simplified replacement for the old MITM loopback-TLS approach.
+/// For AI API hosts, CONNECT tunnels are piped through the DirectTLS listener
+/// (which terminates TLS and routes through ProviderRouter) instead of doing
+/// TCP passthrough to the real API. This catches ALL Anthropic calls from ALL
+/// apps on the system and routes them through JXProxy's provider chain.
 ///
-/// **Why this changed**: The old MITM approach tried to intercept TLS connections
-/// by creating a loopback TLS listener and relaying encrypted data through it.
-/// This was fragile, had race conditions, blocked @MainActor with DispatchSemaphore,
-/// and broke with certificate-pinned apps (like Claude Code).
-///
-/// **New approach**: For all CONNECT tunnels, we simply forward the raw TCP stream
-/// to the intended destination. No TLS interception, no MITM.
-///
-/// **How AI API traffic is still intercepted**: Instead of MITM on CONNECT tunnels,
-/// DNS redirection (DNSRedirectionManager) resolves `api.anthropic.com` and other
-/// AI hosts directly to `127.0.0.1`. Combined with pf port forwarding (443 → proxy port),
-/// apps connect directly to the proxy. The DirectTLSHandler (separate from this)
-/// terminates TLS cleanly and routes the decrypted HTTP through ProviderRouter.
+/// Non-AI hosts get standard TCP passthrough.
 final class MITMHandler: @unchecked Sendable {
     let providerRouter: ProviderRouter?
+    /// Port the DirectTLS listener is on (port+1, e.g. 5256).
+    let directTLSPort: UInt16
 
-    init(providerRouter: ProviderRouter?) {
+    init(providerRouter: ProviderRouter?, directTLSPort: UInt16) {
         self.providerRouter = providerRouter
+        self.directTLSPort = directTLSPort
     }
 
     /// Handle a CONNECT tunnel request.
-    /// Returns true if handled (always returns true — CONNECT tunnels are always relayed).
+    /// Returns true if handled.
     func intercept(connection: NWConnection, host: String, port: UInt16) -> Bool {
-        print("[MITM] Relay CONNECT \(host):\(port) — no MITM, pure TCP forward")
-
-        // For AI API hosts, we attempt to route directly via ProviderRouter.
-        // This is a "best effort" — if it fails, we fall through to passthrough.
         if isAIHost(host) {
+            print("[MITM] Routing AI CONNECT \(host):\(port) → DirectTLS:127.0.0.1:\(directTLSPort)")
             Task {
-                await tryAITunnel(connection: connection, host: host, port: port)
+                await routeAITunnel(connection: connection, host: host, port: port)
             }
             return true
         }
 
-        // Non-AI hosts: simple TCP passthrough
+        // Non-AI hosts: standard TCP passthrough
+        print("[MITM] Passthrough CONNECT \(host):\(port)")
         startPassthrough(connection, host: host, port: port)
         return true
     }
 
-    /// Try to detect and handle an AI API tunnel.
-    /// Since we can't MITM the TLS, we fall back to passthrough.
-    /// The real interception happens via DNS redirection + DirectTLSHandler.
-    private func tryAITunnel(connection: NWConnection, host: String, port: UInt16) async {
-        // Just passthrough — the AI interception happens via DNS redirect + DirectTLS
-        startPassthrough(connection, host: host, port: port)
+    /// Route an AI API CONNECT tunnel through the DirectTLS listener.
+    /// The DirectTLS handler terminates TLS and routes decrypted HTTP through ProviderRouter.
+    private func routeAITunnel(connection: NWConnection, host: String, port: UInt16) async {
+        let established = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: JXProxy\r\n\r\n"
+        guard let establishedData = established.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+
+        connection.send(content: establishedData, completion: .contentProcessed({ [weak self] _ in
+            guard let self else { return }
+
+            // Pipe to DirectTLS listener instead of the real destination
+            let target = NWConnection(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: NWEndpoint.Port(rawValue: self.directTLSPort)!,
+                using: .tcp
+            )
+
+            target.stateUpdateHandler = { state in
+                if case .ready = state {
+                    self.relayLoop(source: connection, destination: target)
+                    self.relayLoop(source: target, destination: connection)
+                } else if case .failed = state {
+                    print("[MITM] DirectTLS unavailable, raw passthrough for \(host):\(port)")
+                    // "200" already sent above — just relay raw bytes without re-sending
+                    let fallback = NWConnection(
+                        host: NWEndpoint.Host(host),
+                        port: NWEndpoint.Port(rawValue: port)!,
+                        using: .tcp
+                    )
+                    fallback.stateUpdateHandler = { state in
+                        if case .ready = state {
+                            self.relayLoop(source: connection, destination: fallback)
+                            self.relayLoop(source: fallback, destination: connection)
+                        } else {
+                            connection.cancel()
+                        }
+                    }
+                    fallback.start(queue: self.queue)
+                }
+            }
+            target.start(queue: self.queue)
+        }))
     }
 
     /// Simple TCP passthrough for CONNECT tunnels.

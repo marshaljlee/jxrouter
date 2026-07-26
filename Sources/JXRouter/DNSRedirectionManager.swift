@@ -164,21 +164,6 @@ final class DNSRedirectionManager: @unchecked Sendable {
     private let aiHosts: [String] = [
         "api.anthropic.com",
         "api.openai.com",
-        "api.openrouter.ai",
-        "opencode.ai",
-        "integrate.api.nvidia.com",
-        "api.groq.com",
-        "api.mistral.ai",
-        "api.deepseek.com",
-        "api.cerebras.ai",
-        "api.cohere.ai",
-        "api.perplexity.ai",
-        "api.together.xyz",
-        "api.fireworks.ai",
-        "api.replicate.com",
-        "api.x.ai",
-        "api.sambanova.ai",
-        "generativelanguage.googleapis.com",
     ]
 
     private func buildHostsContent(from current: String) -> String {

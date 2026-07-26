@@ -659,13 +659,13 @@ final class ProxyServer: @unchecked Sendable {
         }))
     }
 
-    // MARK: - CONNECT Tunnel Handler (Simplified — no MITM)
+    // MARK: - CONNECT Tunnel Handler (Routes AI hosts through DirectTLS)
 
     private var _mitmHandler: MITMHandler?
     @MainActor
     private var mitmHandler: MITMHandler {
         if let h = _mitmHandler { return h }
-        let h = MITMHandler(providerRouter: providerRouter)
+        let h = MITMHandler(providerRouter: providerRouter, directTLSPort: port + 1)
         _mitmHandler = h
         return h
     }
@@ -700,10 +700,9 @@ final class ProxyServer: @unchecked Sendable {
         }
 
         if isMITMHost || classifier.isKnownAiHost(connectHost) {
-            print("[ProxyServer] AI CONNECT tunnel: \(connectHost):\(connectPort)")
+            print("[ProxyServer] AI CONNECT tunnel: \(connectHost):\(connectPort) → DirectTLS:5256")
             Task { @MainActor in
-                // MITMHandler now only does simple TCP relay (no TLS interception)
-                // Real AI interception happens via DNS redirect + DirectTLS
+                // Route AI CONNECT tunnels through DirectTLS → ProviderRouter
                 mitmHandler.intercept(connection: connection, host: connectHost, port: connectPort)
             }
             return

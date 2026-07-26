@@ -44,7 +44,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "/stop":
             return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: Data(#"{"status":"stopped"}"#.utf8))
         default:
-            return ProviderResponse(statusCode: 204, headers: [:], body: Data())
+            // Silently return empty success for non-messages Anthropic calls.
+            // Tools like webfetch work locally — an error response would confuse
+            // the agent. An empty success lets local execution proceed cleanly.
+            return ProviderResponse(statusCode: 200, headers: ["Content-Length": "0", "Connection": "close"], body: Data())
         }
     }
     
@@ -542,6 +545,18 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     private func errorResponse(statusCode: Int, type: String, message: String) -> ProviderResponse {
         let body: [String: Any] = ["type": "error", "error": ["type": type, "message": message]]
         return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: body)) ?? Data())
+    }
+
+    private func blockedEndpoint(path: String) -> ProviderResponse {
+        let message = "The endpoint '\(path)' is blocked by JXProxy. This Anthropic-specific call cannot be forwarded to a third-party provider. The tool can work locally without reaching the API."
+        let body: [String: Any] = [
+            "type": "error",
+            "error": [
+                "type": "api_error",
+                "message": message,
+            ]
+        ]
+        return ProviderResponse(statusCode: 400, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: body)) ?? Data())
     }
 }
 
