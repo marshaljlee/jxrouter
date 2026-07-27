@@ -1,0 +1,45 @@
+# CI for the project workflow template. Adapt the scripts to your project — the
+# defaults assume a bun project with `format:check`, `typecheck`, and `test`
+# package scripts. The `quality` job runs on every push/PR (fast, free).
+#
+# The `eval` job is a placeholder for a DETERMINISTIC, zero-tolerance gate
+# (correctness/safety/spec assertions) — keep it separate from `quality` and
+# wire it only if the project has such a suite. It's commented out by default.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Format check
+        run: bun run format:check
+      - name: Type check
+        run: bun run typecheck
+      - name: Tests
+        run: bun test
+
+  # Deterministic eval / spec-compliance gate (optional — uncomment + adapt).
+  # Separate from `quality` so a soft lint failure and a hard correctness
+  # failure are distinguishable. Zero-tolerance: any failing assertion fails CI.
+  #
+  # eval:
+  #   runs-on: ubuntu-latest
+  #   needs: quality
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: oven-sh/setup-bun@v2
+  #       with:
+  #         bun-version: latest
+  #     - run: bun install --frozen-lockfile
+  #     - name: Deterministic eval gate
+  #       run: bun run eval        # must exit non-zero on any failing case

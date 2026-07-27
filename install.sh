@@ -24,7 +24,7 @@ rm -rf Build/ 2>/dev/null
 
 echo ""
 echo "2. Stripping extended attributes..."
-xattr -cr . 2>/dev/null
+xattr -cr . 2>/dev/null || true
 
 echo ""
 echo "3. Building JXProxy..."

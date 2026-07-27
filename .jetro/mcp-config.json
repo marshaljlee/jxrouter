@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "jetro": {
+      "command": "/Users/joshua/.jetro/runtime/node-darwin-arm64",
+      "args": [
+        "/Users/joshua/.jetro/mcp-server/index.js"
+      ],
+      "env": {
+        "JET_WORKSPACE": "/Users/joshua/Library/Mobile Documents/com~apple~CloudDocs/Git/jxrouter",
+        "JET_API_URL": "https://api.jetro.ai",
+        "JET_JWT": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjE2ZWUwMzFlODZhM2YwZmNkOWI2ZDcwMDJiMDJiMDg2ZDJmNTVkZTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3NlY3VyZXRva2VuLmdvb2dsZS5jb20vamV0cm8tY2RhZWYiLCJhdWQiOiJqZXRyby1jZGFlZiIsImF1dGhfdGltZSI6MTc4NDUwNDI3NSwidXNlcl9pZCI6IjZuT3VJbVE1UWpYbFE0RmJIalBTdmt2dUtoeDEiLCJzdWIiOiI2bk91SW1RNVFqWGxRNEZiSGpQU3ZrdnVLaHgxIiwiaWF0IjoxNzg1MDcwNzE3LCJleHAiOjE3ODUwNzQzMTcsImVtYWlsIjoiam9zaHVheHhAZHVjay5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiZmlyZWJhc2UiOnsiaWRlbnRpdGllcyI6eyJlbWFpbCI6WyJqb3NodWF4eEBkdWNrLmNvbSJdfSwic2lnbl9pbl9wcm92aWRlciI6InBhc3N3b3JkIn19.HrRvFe-wJIvwPg1dyA8KDG64TmDpnqB_U-KA3lFBAXKP8Sk-L2YtR63gFZhz23EAWdFKsRfBgvoUIea20rNw9UXujwpTOiev4s4lGgeSZShAOZMBMClq-z3UBMCa-JwmJyj7imrC6EqVZM2sRbPKYYbJsnQfsM19I6GpdOBLZqO0AiJY_q91cKS06oNdo1QFqOaTe1rzcDaA3dPfMtBn7eg3bieZTBkyblW6GGk_ZH305WZYzwjC5HiKTfOMMD_I26YDJ9QSeEB4OBH_8S80-iT7iQSb50CN1mA7r58C193a_vyewim_4C0dSmrECNIQGD5yvqSL2mNVF7eCBKLADw",
+        "PATH": "/Users/joshua/.jetro/runtime:/Users/joshua/.omnara/bin:/Users/joshua/.local/bin:/Users/joshua/.local/bin:/Users/joshua/.local/bin:/Users/joshua/Downloads/google-cloud-sdk/bin:/Users/joshua/.grok/bin:/Users/joshua/.bun/bin:/Users/joshua/Library/Python/3.9/bin:/opt/homebrew/bin:/opt/homebrew/opt/python@3.11/libexec/bin:/Users/joshua/bin:/Users/joshua/.local/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/Applications/Little Snitch.app/Contents/Components:/opt/homebrew/bin:/Users/joshua/.cargo/bin:/Users/joshua/.local/bin:/Users/joshua/go/bin"
+      }
+    }
+  }
+}

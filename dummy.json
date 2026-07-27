@@ -1,0 +1,11 @@
+{
+  "model": "opencode/big-pickle",
+  "max_tokens": 1024,
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! Say exactly: 1"
+    }
+  ]
+}

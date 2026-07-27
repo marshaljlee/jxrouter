@@ -24,3 +24,17 @@ DerivedData
 
 # CocoaPods
 Pods/
+.TerMinal/backlog/.next-id.lock
+.TerMinal/sessions/.next-id.lock
+.status.md
+
+# MCP / Credentials
+.mcp.json
+.jetro/daemon/credentials.json
+
+# IDE configs
+.cursor/
+.codex/
+.agents/
+.TerMinal/
+.claude/
