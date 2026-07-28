@@ -1,6 +1,20 @@
 import Foundation
 @preconcurrency import Network
 
+enum ProxyError: Error, LocalizedError {
+    case portInUse(port: Int, pids: String)
+    case listenerFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .portInUse(let port, let pids):
+            return "Port \(port) is in use by PID(s): \(pids). Click Restart to free it."
+        case .listenerFailed(let detail):
+            return "Listener failed: \(detail). Click Restart to try again."
+        }
+    }
+}
+
 struct ProxyStats: Sendable {
     var aiRouted: Int = 0
     var passthrough: Int = 0
@@ -84,7 +98,25 @@ final class ProxyServer: @unchecked Sendable {
         userInitiatedStop = false
         autoRestartCount = 0
 
-        // Start HTTP proxy listener first (always succeeds or throws immediately)
+        // Pre-flight check: make sure no other process is holding the port.
+        // NWListener won't throw on a busy port — it fails asynchronously,
+        // so we check synchronously here to give the caller an immediate error.
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        check.arguments = ["-ti", ":\(port)", "-sTCP:LISTEN"]
+        let checkPipe = Pipe()
+        check.standardOutput = checkPipe
+        check.standardError = Pipe()
+        try? check.run()
+        check.waitUntilExit()
+        let checkData = checkPipe.fileHandleForReading.readDataToEndOfFile()
+        let pids = String(data: checkData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !pids.isEmpty {
+            throw ProxyError.portInUse(port: Int(port), pids: pids)
+        }
+
+        // Start HTTP proxy listener — throws synchronously if params are invalid,
+        // async failure (port conflict) is caught by the state handler above.
         httpListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         httpListener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
@@ -156,6 +188,19 @@ final class ProxyServer: @unchecked Sendable {
         appConnectionCounts.removeAll()
 
         print("[ProxyServer] Stopped")
+    }
+
+    /// Reset internal state after a recovery / restart.
+    /// Clears error flags, restart counters, and any stale state.
+    func resetForRestart() {
+        lastError = nil
+        userInitiatedStop = false
+        autoRestartCount = 0
+        activeConnections.removeAll()
+        connectedApps.removeAll()
+        appConnectionCounts.removeAll()
+        stats = ProxyStats()
+        print("[ProxyServer] Reset for restart")
     }
 
     // MARK: - Direct TLS + DNS Management
@@ -359,18 +404,7 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     private func parseHeaders(from request: String) -> [String: String] {
-        var headers: [String: String] = [:]
-        let lines = request.components(separatedBy: "\r\n")
-        for line in lines.dropFirst() {
-            guard !line.isEmpty else { break }
-            let parts = line.split(separator: ":", maxSplits: 1)
-            if parts.count == 2 {
-                let key = parts[0].trimmingCharacters(in: CharacterSet.whitespaces).lowercased()
-                let value = parts[1].trimmingCharacters(in: CharacterSet.whitespaces)
-                headers[key] = value
-            }
-        }
-        return headers
+        HTTPUtils.parseHeaders(from: request)
     }
 
     // MARK: - HTTP Proxy Handler
@@ -429,6 +463,10 @@ final class ProxyServer: @unchecked Sendable {
         // Check if this is an internal JXProxy endpoint
         let hostWithoutPort = host.split(separator: ":").first.map(String.init) ?? host
         if hostWithoutPort == "127.0.0.1" || hostWithoutPort == "localhost" {
+            if path == "/admin" || path == "/admin/" {
+                handleAdminEndpoint(connection)
+                return
+            }
             if path == "/health" || path == "/" {
                 handleHealthEndpoint(connection)
                 return
@@ -477,6 +515,33 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     // MARK: - Internal Endpoints
+
+    private func handleAdminEndpoint(_ connection: NWConnection) {
+        let total = stats.aiRouted + stats.passthrough
+        let cfg = ConfigManager.shared
+        let body = """
+        <html><body style="background:#131517;color:#F3F4F6;font-family:system-ui;padding:2rem">
+        <h1>JXProxy</h1>
+        <p>Status: ✅ Running</p>
+        <p>Provider: \(cfg.provider)</p>
+        <p>Model: \(cfg.model)</p>
+        <p>Port: \(cfg.port)</p>
+        <p>Uptime: \(Int(stats.uptime))s</p>
+        <p>Requests: \(total)</p>
+        <p><a href="/health" style="color:#1A73E8">/health</a></p>
+        </body></html>
+        """
+        let response = """
+        HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: \(body.data(using: .utf8)?.count ?? 0)\r\nConnection: close\r\n\r\n\(body)
+        """
+        guard let data = response.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+        connection.send(content: data, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+    }
 
     private func handleHealthEndpoint(_ connection: NWConnection) {
         let provider = cachedProvider
@@ -616,22 +681,7 @@ final class ProxyServer: @unchecked Sendable {
         }
     }
 
-    private func statusText(_ code: Int) -> String {
-        switch code {
-        case 200: return "OK"
-        case 204: return "No Content"
-        case 400: return "Bad Request"
-        case 401: return "Unauthorized"
-        case 403: return "Forbidden"
-        case 404: return "Not Found"
-        case 408: return "Request Timeout"
-        case 429: return "Too Many Requests"
-        case 500: return "Internal Server Error"
-        case 502: return "Bad Gateway"
-        case 503: return "Service Unavailable"
-        default: return "Unknown"
-        }
-    }
+    private func statusText(_ code: Int) -> String { HTTPUtils.statusText(code) }
 
     // MARK: - Stats
 
@@ -824,15 +874,6 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     private func relayLoop(source: NWConnection, destination: NWConnection) {
-        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self, let data = data, !data.isEmpty, error == nil else {
-                source.cancel()
-                destination.cancel()
-                return
-            }
-            destination.send(content: data, completion: .contentProcessed({ _ in
-                self.relayLoop(source: source, destination: destination)
-            }))
-        }
+        NetworkRelay.relayLoop(source: source, destination: destination, on: queue)
     }
 }

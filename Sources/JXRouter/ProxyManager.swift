@@ -18,6 +18,9 @@ final class ProxyManager {
     var currentPort: Int {
         config.port
     }
+    var currentModel: String {
+        config.model
+    }
     var currentProvider: String = "opencode-zen"
     var activeModel: String = "big-pickle"
     var latency: Double {
@@ -289,6 +292,9 @@ final class ProxyManager {
             systemProxyManager.enable()
             systemProxyEnabled = true
 
+            // Install/reinstall launcher scripts with current provider+model
+            installLauncherScripts()
+
             // First-time Claude Code launch
             if !hasOpenedClaudeFirstTime {
                 checkAndLaunchClaude()
@@ -313,19 +319,153 @@ final class ProxyManager {
         systemProxyEnabled = false
     }
 
+    // MARK: - Comprehensive Recovery (Restart)
+
+    /// Full circuit-breaker recovery. Handles every failure mode that can prevent
+    /// the proxy from serving: port conflicts, stale PF rules, stuck DNS entries,
+    /// misconfigured system proxy, changed network interfaces, zombie processes,
+    /// corrupted certificate store, keychain lockups, and cached DNS poison.
     func restartProxy() async {
+        print("[Recovery] ═══ Starting full circuit-breaker recovery ═══")
+
+        // 1. Stop everything cleanly first
         stopProxy()
-        
-        // Free the port before starting to avoid conflicts
-        let portToFree = proxyServer.port
+        print("[Recovery] ✓ Proxy stopped")
+
+        // 2. Kill any process holding the proxy port
+        let port = Int(proxyServer.port)
+        recoverKillPort(port)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        // 3. Re-check and re-kill if still occupied
+        if recoverPortIsBusy(port) {
+            recoverKillPort(port)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        print("[Recovery] ✓ Port \(port) freed")
+
+        // 4. Flush any stale PF anchor from a previous crash/kill
+        recoverFlushPF()
+        print("[Recovery] ✓ PF rules flushed")
+
+        // 5. Clean up stale /etc/hosts entries
+        DNSRedirectionManager.shared.uninstall()
+        print("[Recovery] ✓ DNS entries cleaned")
+
+        // 6. Reset system proxy on ALL network interfaces (not just the cached one),
+        //    not just the selected interface. This handles the case where the
+        //    interface changed (Wi-Fi → Ethernet) between sessions.
+        systemProxyManager.discoverInterfaces()
+        systemProxyManager.disable()
+        print("[Recovery] ✓ System proxy disabled on all interfaces")
+
+        // 7. Flush macOS DNS cache (dscacheutil + mDNSResponder)
+        recoverFlushDNSCache()
+        print("[Recovery] ✓ DNS cache flushed")
+
+        // 8. Reset keychain unavailable flag (in case of previous timeout)
+        KeychainManager.resetUnavailable()
+        print("[Recovery] ✓ Keychain reset")
+
+        // 9. Regenerate CA if corrupted / missing
+        if !CertificateAuthority.shared.ensureCA() {
+            print("[Recovery] ⚠ Failed to regenerate CA")
+        } else {
+            print("[Recovery] ✓ CA ready")
+        }
+
+        // 10. Reset proxy server internals (clear error state, restart count, etc.)
+        proxyServer.resetForRestart()
+        print("[Recovery] ✓ Proxy server internals reset")
+
+        // 11. Fresh start — creates new NWListener, enables system proxy,
+        //     installs DNS redirection, regenerates launcher scripts
+        await startProxy()
+        print("[Recovery] ✓ Proxy started")
+
+        print("[Recovery] ═══ Recovery complete ═══")
+    }
+
+    /// Kill every process listening on the given port.
+    private func recoverKillPort(_ port: Int) {
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "lsof -ti :\(portToFree) | xargs -r kill -9"]
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-ti", ":\(port)", "-sTCP:LISTEN"]
+        let outPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let pids = String(data: data, encoding: .utf8)?
+                .components(separatedBy: .newlines)
+                .filter { !$0.isEmpty }
+            for pid in pids ?? [] {
+                let killTask = Process()
+                killTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+                killTask.arguments = ["-9", pid]
+                try? killTask.run()
+                killTask.waitUntilExit()
+                print("[Recovery] Killed PID \(pid) holding port \(port)")
+            }
+        } catch {
+            print("[Recovery] killPort error: \(error)")
+        }
+    }
+
+    /// Check whether something is already listening on the port.
+    private func recoverPortIsBusy(_ port: Int) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-ti", ":\(port)", "-sTCP:LISTEN"]
+        let outPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let pids = String(data: data, encoding: .utf8)?
+                .components(separatedBy: .newlines)
+                .filter { !$0.isEmpty }
+            return (pids ?? []).count > 0
+        } catch {
+            return false
+        }
+    }
+
+    /// Flush the JXProxy PF anchor if it exists. Ignores failures silently
+    /// (anchor may not exist if it was never installed).
+    private func recoverFlushPF() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/sbin/pfctl")
+        task.arguments = ["-a", "com.apple/250.jxproxy", "-F", "all"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            // Non-fatal — anchor might not exist
+        }
+    }
+
+    /// Flush macOS DNS cache (works on macOS 14+).
+    private func recoverFlushDNSCache() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/dscacheutil")
+        task.arguments = ["-flushcache"]
         try? task.run()
         task.waitUntilExit()
-        
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        await startProxy()
+
+        // Also signal mDNSResponder to flush
+        let mTask = Process()
+        mTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+        mTask.arguments = ["-HUP", "mDNSResponderHelper"]
+        try? mTask.run()
+        mTask.waitUntilExit()
     }
 
     private func checkAndLaunchClaude() {
@@ -355,10 +495,15 @@ final class ProxyManager {
     }
 
     private func launchClaudeInTerminal() {
+        let modelFlag: String
+        let modelName = config.model
+        if modelName.isEmpty { modelFlag = "" }
+        else { modelFlag = "-m \(modelName) " }
+        let cmd = "claude \(modelFlag)&& exec $SHELL"
         let appleScript = """
         tell application "Terminal"
             activate
-            do script "claude"
+            do script "\(cmd)"
         end tell
         """
         if let script = NSAppleScript(source: appleScript) {
@@ -488,6 +633,21 @@ final class ProxyManager {
             }
         }
         return env
+    }
+
+    // MARK: - Launcher Scripts
+
+    /// Regenerate launcher scripts (jxclaude, jxcodex, etc.) with the current
+    /// provider and model so `jxclaude` launches Claude Code with `-m <model>`.
+    func installLauncherScripts() {
+        let port = config.port
+        let modelName = config.model
+        let token = config.authToken
+        do {
+            try CustomLauncherService.installLaunchers(proxyPort: port, authToken: token, model: modelName)
+        } catch {
+            print("[ProxyManager] Failed to install launchers: \(error)")
+        }
     }
 
     // MARK: - Error Handling

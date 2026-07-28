@@ -13,12 +13,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Create the status-bar + window manager (replaces MenuBarExtra).
         statusItemManager = StatusItemManager(proxyManager: manager)
 
+        // If the app was force-killed last time, the system proxy settings
+        // may still point at a dead port. Clean up any stale state first.
+        manager.discoverNetworkInterfaces()
+        manager.querySystemProxyState()
+        if manager.systemProxyEnabled {
+            print("[AppDelegate] Stale system proxy detected from previous session — disabling")
+            manager.disableSystemProxy()
+            DNSRedirectionManager.shared.uninstall()
+        }
+
         // Auto-start the proxy on app launch if enabled in Settings.
         if UserDefaults.standard.bool(forKey: "autoStartProxy") {
             Task { @MainActor in
                 await manager.startProxy()
             }
         }
+    }
+
+    /// Clean up system proxy, DNS redirection, and PF rules before the process exits.
+    /// Without this, the system proxy keeps pointing at 127.0.0.1:<port> (dead)
+    /// and /etc/hosts + PF rules stay loaded — blocking all internet.
+    func applicationWillTerminate(_ notification: Notification) {
+        ProxyManager.shared.stopProxy()
     }
 }
 

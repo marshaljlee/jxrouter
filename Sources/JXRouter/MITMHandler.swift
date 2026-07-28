@@ -116,29 +116,12 @@ final class MITMHandler: @unchecked Sendable {
 
     /// Continuously relay data from source to destination.
     private func relayLoop(source: NWConnection, destination: NWConnection) {
-        source.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
-            guard let data = data, !data.isEmpty, error == nil else {
-                source.cancel()
-                destination.cancel()
-                return
-            }
-            destination.send(content: data, completion: .contentProcessed({ _ in
-                self.relayLoop(source: source, destination: destination)
-            }))
-        }
+        NetworkRelay.relayLoop(source: source, destination: destination, on: queue)
     }
 
     /// Check if a hostname is a known AI API host.
     private func isAIHost(_ host: String) -> Bool {
-        let lower = host.lowercased()
-        let aiPatterns = RequestClassifier().aiHostPatterns
-        let aiSuffixes = RequestClassifier().aiHostSuffixes
-
-        if aiPatterns.contains(lower) { return true }
-        for suffix in aiSuffixes {
-            if lower.hasSuffix(suffix) { return true }
-        }
-        return false
+        RequestClassifier().isKnownAiHost(host)
     }
 
     private let queue = DispatchQueue(label: "com.jxproxy.mitm", qos: .userInitiated)

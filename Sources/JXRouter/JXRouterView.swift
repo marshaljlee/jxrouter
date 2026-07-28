@@ -153,20 +153,51 @@ struct JXRouterView: View {
                 .foregroundStyle(Color.dsTextSecondary)
                 .padding(.horizontal, 20)
                 
-                // Footer Banner
-                VStack(spacing: 8) {
-                    Image(systemName: "point.3.connected.trianglepath.dotted")
-                        .font(.system(size: 20))
-                        .foregroundStyle(Color.dsTextSecondary)
-                    Text("Listening on port \(manager.currentPort)...")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color.dsTextSecondary)
+                // Detected app list
+                if manager.appDetector.detectedApps.isEmpty {
+                    // Empty state
+                    VStack(spacing: 8) {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .font(.system(size: 20))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Text("Listening on port \(manager.currentPort)...")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.dsTextSecondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+                    .background(Color.dsSurface)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 16)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(manager.appDetector.detectedApps, id: \.self) { appName in
+                            HStack(spacing: 8) {
+                                Image(systemName: "app.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.dsAccent)
+                                Text(appName)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Color.dsTextPrimary)
+                                Spacer()
+                                Image(systemName: "circle.fill")
+                                    .font(.system(size: 6))
+                                    .foregroundStyle(Color.dsGreen)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.dsSurface)
+                            Divider().background(Color.dsBorder)
+                        }
+                    }
+                    .background(Color.dsSurface)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.dsBorder, lineWidth: 1)
+                    )
+                    .padding(.horizontal, 16)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 20)
-                .background(Color.dsSurface)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 16)
             }
             
         }

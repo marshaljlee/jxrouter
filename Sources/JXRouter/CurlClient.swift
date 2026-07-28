@@ -21,7 +21,7 @@ final class CurlClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         
-        var args = ["-i", "-s", "-N", "-X", method]
+        var args = ["-i", "-s", "-N", "--max-time", "30", "-X", method]
         
         if let ip = resolveIP, let host = url.host {
             let port = url.port ?? (url.scheme == "https" ? 443 : 80)
@@ -34,45 +34,61 @@ final class CurlClient {
             args.append("\(key): \(value)")
         }
         
-        let tempFileURL: URL?
+        // Avoid temp files — pipe body in via stdin
         if let bodyData = body {
-            let tempDir = FileManager.default.temporaryDirectory
-            let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".json")
-            try bodyData.write(to: tempFile)
+            let stdinPipe = Pipe()
+            process.standardInput = stdinPipe
             args.append("--data-binary")
-            args.append("@\(tempFile.path)")
-            tempFileURL = tempFile
-        } else {
-            tempFileURL = nil
+            args.append("@-")
+            // Write body in background to avoid deadlock
+            DispatchQueue.global().async {
+                stdinPipe.fileHandleForWriting.write(bodyData)
+                stdinPipe.fileHandleForWriting.closeFile()
+            }
         }
         
         args.append(url.absoluteString)
         process.arguments = args
         
-        let pipe = Pipe()
-        process.standardOutput = pipe
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
         
         try process.run()
         
-        // Read headers
-        let fileHandle = pipe.fileHandleForReading
+        // Read headers with a reasonable buffer (avoid byte-by-byte)
+        let fileHandle = outPipe.fileHandleForReading
         var headerData = Data()
-        var statusCode = 200
-        var responseHeaders: [String: String] = [:]
-        
-        // Continue reading until we hit \r\n\r\n
-        while let byteData = try fileHandle.read(upToCount: 1), !byteData.isEmpty {
-            headerData.append(byteData)
-            if headerData.count >= 4 && headerData.suffix(4) == Data("\r\n\r\n".utf8) {
+        let headerTimeout = DispatchTime.now() + 10
+        while DispatchTime.now() < headerTimeout {
+            // Try to read up to 64KB at once
+            if let chunk = try fileHandle.read(upToCount: 65536) {
+                headerData.append(chunk)
+                if let str = String(data: headerData, encoding: .utf8),
+                   str.contains("\r\n\r\n") {
+                    break
+                }
+                if headerData.count > 65536 {
+                    break // safety valve: too much header data
+                }
+            } else {
                 break
             }
         }
         
+        // Extract just the headers (before \r\n\r\n), put back any body data that leaked in
         let headerString = String(data: headerData, encoding: .utf8) ?? ""
-        let lines = headerString.components(separatedBy: "\r\n")
+        let headerComponents = headerString.components(separatedBy: "\r\n\r\n")
+        let actualHeaderString = headerComponents.first ?? ""
+        var preReadBody = Data()
+        if headerComponents.count > 1 {
+            let rest = headerComponents.dropFirst().joined(separator: "\r\n\r\n")
+            preReadBody = rest.data(using: .utf8) ?? Data()
+        }
         
-        // Handle HTTP/2 or HTTP/1.1 response status line (can be multiple if 100 Continue)
-        var actualHeaders = lines
+        let lines = actualHeaderString.components(separatedBy: "\r\n")
+        var statusCode = 200
+        var responseHeaders: [String: String] = [:]
+        
         if let first = lines.first, first.starts(with: "HTTP/") {
             let parts = first.split(separator: " ")
             if parts.count >= 2, let code = Int(parts[1]) {
@@ -80,7 +96,7 @@ final class CurlClient {
             }
         }
         
-        for line in actualHeaders.dropFirst() {
+        for line in lines.dropFirst() {
             if line.isEmpty { continue }
             let parts = line.split(separator: ":", maxSplits: 1)
             if parts.count == 2 {
@@ -91,14 +107,16 @@ final class CurlClient {
         let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: responseHeaders)!
         
         let stream = AsyncStream<Data> { continuation in
+            // Yield any body data that was pre-read with headers
+            if !preReadBody.isEmpty {
+                continuation.yield(preReadBody)
+            }
+            
             fileHandle.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
                     fileHandle.readabilityHandler = nil
                     process.waitUntilExit()
-                    if let tempFile = tempFileURL {
-                        try? FileManager.default.removeItem(at: tempFile)
-                    }
                     continuation.finish()
                 } else {
                     continuation.yield(data)

@@ -38,6 +38,11 @@ enum KeychainManager {
     /// Set to true after the first timeout to skip Keychain reads in subsequent calls.
     private nonisolated(unsafe) static var unavailable = false
 
+    /// Reset the unavailable flag after a recovery cycle.
+    static func resetUnavailable() {
+        unavailable = false
+    }
+
     /// Store a secret value in the Keychain.
     static func store(key: String, value: String) throws {
         guard !value.isEmpty else {

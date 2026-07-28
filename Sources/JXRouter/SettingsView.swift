@@ -88,31 +88,23 @@ struct SettingsView: View {
         ("llamacpp", "llama.cpp"),
     ]
 
-    let knownModels = [
-        "opencode/big-pickle",
-        "opencode/small-pickle",
-        "claude-3-5-sonnet-20240620",
-        "claude-3-opus-20240229",
-        "claude-3-haiku-20240307",
-        "gpt-4o",
-        "gpt-4-turbo",
-        "gpt-3.5-turbo",
-        "ollama/qwen3:latest",
-        "ollama/qwythos-9b",
-        "ollama/llama3",
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "nvidia/llama3-70b-instruct",
-        "deepseek/deepseek-chat",
-        "deepseek/deepseek-reasoner",
-        "gemini/gemini-3.1-flash-lite",
-        "gemini/gemini-3.5-flash",
-        "mistral/mistral-small-latest",
-        "mistral/mistral-large-latest",
-        "groq/llama-3.3-70b-versatile",
-        "cohere/command-a-plus-05-2026",
-        "xai/grok-3",
-        "xai/grok-3-mini"
-    ]
+    /// Gather all known models from provider presets + user-visible models.
+    var knownModels: [String] {
+        let presets = ProviderPreset.all
+        var models = Set<String>()
+        for preset in presets {
+            for m in preset.models {
+                models.insert(m.hasPrefix("\(preset.id)/") ? m : "\(preset.id)/\(m)")
+            }
+        }
+        // Merge in user-visible models from the providers tab
+        for p in manager.providers {
+            for m in p.visibleModelIds {
+                models.insert(m.hasPrefix("\(p.id)/") ? m : "\(p.id)/\(m)")
+            }
+        }
+        return Array(models).sorted()
+    }
 
     enum SettingsTab: String, CaseIterable {
         case general = "General"
@@ -822,82 +814,6 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - App Rule Row
-
-private struct AppRuleRow: View {
-    @Binding var rule: AppRouteRule
-    let onDelete: () -> Void
-
-    var body: some View {
-        HStack(spacing: DesignToken.spacing8) {
-            // Enable toggle
-            Button {
-                rule.enabled.toggle()
-            } label: {
-                Image(systemName: rule.enabled ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(rule.enabled ? Color.dsGreen : Color.dsTextTertiary)
-                    .font(.system(size: DesignToken.captionSize))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(rule.enabled ? "Disable" : "Enable") rule for \(rule.appName)")
-
-            // App info
-            VStack(alignment: .leading, spacing: 1) {
-                Text(rule.appName)
-                    .font(.system(size: DesignToken.captionSize, weight: .medium))
-                    .foregroundStyle(Color.dsTextPrimary)
-                if let bundleId = rule.bundleIdentifier {
-                    Text(bundleId)
-                        .font(.system(size: DesignToken.caption2Size))
-                        .foregroundStyle(Color.dsTextTertiary)
-                }
-            }
-
-            Spacer()
-
-            // Action picker
-            Picker("", selection: $rule.action) {
-                Text("Route AI").tag(RouteAction.routeAI)
-                Text("Pass Through").tag(RouteAction.passthrough)
-                Text("Block").tag(RouteAction.block)
-            }
-            .pickerStyle(.menu)
-            .frame(width: 130)
-            .accessibilityLabel("Action for \(rule.appName)")
-
-            // Delete
-            Button(action: onDelete) {
-                Image(systemName: "minus.circle.fill")
-                    .foregroundStyle(Color.dsRed)
-                    .font(.system(size: DesignToken.captionSize))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Delete rule for \(rule.appName)")
-        }
-        .padding(.horizontal, DesignToken.spacing12)
-        .padding(.vertical, DesignToken.spacing8)
-    }
-}
-
-// MARK: - Info Row
-
-private struct InfoRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
-                .font(.system(size: DesignToken.captionSize))
-                .foregroundStyle(Color.dsTextSecondary)
-            Spacer()
-            Text(value)
-                .font(.system(size: DesignToken.captionSize, design: .monospaced))
-                .foregroundStyle(Color.dsTextPrimary)
-        }
-    }
-}
-
 // MARK: - Log Entry Row
 
 private struct LogEntryRow: View {
@@ -977,67 +893,4 @@ private struct LogEntryRow: View {
     }
 }
 
-// MARK: - ComboBox (Native Dropdown with Autocomplete)
-
-struct ComboBox: NSViewRepresentable {
-    @Binding var text: String
-    var options: [String]
-
-    func makeNSView(context: Context) -> NSComboBox {
-        let comboBox = NSComboBox()
-        comboBox.isEditable = true
-        comboBox.completes = true
-        comboBox.dataSource = context.coordinator
-        comboBox.delegate = context.coordinator
-        comboBox.controlSize = .regular
-        return comboBox
-    }
-
-    func updateNSView(_ nsView: NSComboBox, context: Context) {
-        if nsView.stringValue != text {
-            nsView.stringValue = text
-        }
-        if nsView.numberOfItems != options.count {
-            nsView.removeAllItems()
-            nsView.addItems(withObjectValues: options)
-        }
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-
-    class Coordinator: NSObject, NSComboBoxDataSource, NSComboBoxDelegate {
-        var parent: ComboBox
-
-        init(_ parent: ComboBox) {
-            self.parent = parent
-        }
-
-        func comboBox(_ comboBox: NSComboBox, objectValueForItemAt index: Int) -> Any? {
-            guard index >= 0 && index < parent.options.count else { return nil }
-            return parent.options[index]
-        }
-
-        func numberOfItems(in comboBox: NSComboBox) -> Int {
-            return parent.options.count
-        }
-
-        func comboBox(_ comboBox: NSComboBox, completedString string: String) -> String? {
-            return parent.options.first(where: { $0.lowercased().hasPrefix(string.lowercased()) })
-        }
-
-        func controlTextDidChange(_ obj: Notification) {
-            guard let comboBox = obj.object as? NSComboBox else { return }
-            parent.text = comboBox.stringValue
-        }
-        
-        func comboBoxSelectionDidChange(_ notification: Notification) {
-            guard let comboBox = notification.object as? NSComboBox else { return }
-            let index = comboBox.indexOfSelectedItem
-            if index >= 0 && index < parent.options.count {
-                parent.text = parent.options[index]
-            }
-        }
-    }
-}
+// ComboBox is in SettingsHelpers.swift

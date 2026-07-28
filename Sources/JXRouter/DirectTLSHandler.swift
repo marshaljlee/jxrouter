@@ -155,17 +155,7 @@ final class DirectTLSHandler: @unchecked Sendable {
     }
     
     private func parseHeaders(_ headerStr: String) -> [String: String] {
-        var headers: [String: String] = [:]
-        let lines = headerStr.components(separatedBy: "\r\n")
-        for line in lines.dropFirst() {
-            guard !line.isEmpty else { break }
-            let hParts = line.split(separator: ":", maxSplits: 1)
-            if hParts.count == 2 {
-                headers[String(hParts[0]).trimmingCharacters(in: .whitespaces).lowercased()] =
-                    String(hParts[1]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return headers
+        HTTPUtils.parseHeaders(from: headerStr)
     }
 
     private func routeHTTP(connection: NWConnection, requestData: Data) async {
@@ -267,21 +257,5 @@ final class DirectTLSHandler: @unchecked Sendable {
         connection.send(content: data, completion: .contentProcessed({ _ in connection.cancel() }))
     }
 
-    private func statusText(_ code: Int) -> String {
-        switch code {
-        case 200: return "OK"
-        case 201: return "Created"
-        case 204: return "No Content"
-        case 400: return "Bad Request"
-        case 401: return "Unauthorized"
-        case 403: return "Forbidden"
-        case 404: return "Not Found"
-        case 408: return "Request Timeout"
-        case 429: return "Too Many Requests"
-        case 500: return "Internal Server Error"
-        case 502: return "Bad Gateway"
-        case 503: return "Service Unavailable"
-        default: return "Unknown"
-        }
-    }
+    private func statusText(_ code: Int) -> String { HTTPUtils.statusText(code) }
 }

@@ -44,9 +44,6 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "/stop":
             return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: Data(#"{"status":"stopped"}"#.utf8))
         default:
-            // Silently return empty success for non-messages Anthropic calls.
-            // Tools like webfetch work locally — an error response would confuse
-            // the agent. An empty success lets local execution proceed cleanly.
             return ProviderResponse(statusCode: 200, headers: ["Content-Length": "0", "Connection": "close"], body: Data())
         }
     }
@@ -141,9 +138,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         
         let url = URL(string: "\(baseUrl)/v1/messages")!
         let host = url.host ?? "api.anthropic.com"
-        guard let ip = await DirectDNSResolver.shared.resolve(host) else {
-            return errorResponse(statusCode: 502, type: "dns_error", message: "Failed to resolve IP for \(host)")
-        }
+        let ip = await DirectDNSResolver.shared.resolve(host) ?? host
         
         let body = (try? JSONSerialization.data(withJSONObject: bodyDict)) ?? Data()
         var headers: [String: String] = [
@@ -163,13 +158,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     }
     
     private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool) async throws -> ProviderResponse {
-        let openaiBody = toOpenAIChat(request: request, model: model)
+        let openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model)
         
         let url = URL(string: "\(baseUrl)/chat/completions")!
         let host = url.host ?? "api.openai.com"
-        guard let ip = await DirectDNSResolver.shared.resolve(host) else {
-            return errorResponse(statusCode: 502, type: "dns_error", message: "Failed to resolve IP for \(host)")
-        }
+        let ip = await DirectDNSResolver.shared.resolve(host) ?? host
         
         let body = (try? JSONSerialization.data(withJSONObject: openaiBody)) ?? Data()
         var headers: [String: String] = [
@@ -191,7 +184,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             let (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: body, resolveIP: ip)
             let statusCode = response.statusCode
             guard statusCode == 200 else { return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: data) }
-            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: convertOpenAIResponseToAnthropic(data: data, model: request.model))
+            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: request.model))
         }
     }
     
@@ -239,11 +232,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                             continue
                         }
                         
-                        let events = openAIToAnthropicSSE(chunk: chunkDict, model: request.model, alreadyStarted: hasStarted)
+                        let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, alreadyStarted: hasStarted)
                         for event in events {
                             if event.contains("content_block_start") { hasStarted = true }
                             if event.contains("message_delta") {
-                                // When message_delta is emitted, the next logical event is message_stop
                                 continuation.yield(Data(event.utf8))
                                 if !hasFinished {
                                     let stopEvent = SSEFormatter.format(event: "message_stop", data: "{\"type\":\"message_stop\"}")
@@ -274,221 +266,6 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         )
     }
     
-    // MARK: - Translation
-    
-    private func toOpenAIChat(request: MessagesRequest, model: String) -> [String: Any] {
-        var messages: [[String: Any]] = []
-        
-        for msg in request.messages {
-            let role = msg["role"] ?? "user"
-            
-            if let str = msg["content"] as? String {
-                messages.append(["role": role, "content": str])
-            } else if let blocks = msg["content"] as? [[String: Any]] {
-                var contentArr: [[String: Any]] = []
-                for block in blocks {
-                    if let type = block["type"] as? String {
-                        if type == "text", let text = block["text"] as? String {
-                            contentArr.append(["type": "text", "text": text])
-                        } else if type == "image", let source = block["source"] as? [String: Any] {
-                            // Translate Anthropic image to OpenAI image_url
-                            if let mediaType = source["media_type"] as? String, let data = source["data"] as? String {
-                                contentArr.append([
-                                    "type": "image_url",
-                                    "image_url": ["url": "data:\(mediaType);base64,\(data)"]
-                                ])
-                            }
-                        }
-                    }
-                }
-                messages.append(["role": role, "content": contentArr])
-            }
-        }
-        
-        if let system = request.json["system"] {
-            var sysContent = ""
-            if let str = system as? String { sysContent = str }
-            else if let blocks = system as? [[String: Any]] {
-                sysContent = blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
-            }
-            if !sysContent.isEmpty {
-                messages.insert(["role": "system", "content": sysContent], at: 0)
-            }
-        }
-        
-        var body: [String: Any] = [
-            "model": model,
-            "messages": messages,
-            "max_tokens": request.json["max_tokens"] as? Int ?? 4096,
-            "stream": request.stream,
-            "temperature": request.json["temperature"] as? Double ?? 0.7,
-        ]
-        
-        if let stop = request.json["stop_sequences"] as? [String] { body["stop"] = stop }
-        
-        if let tools = request.json["tools"] as? [[String: Any]], !tools.isEmpty {
-            body["tools"] = tools.map { ["type": "function", "function": ["name": $0["name"] ?? "", "description": $0["description"] ?? "", "parameters": $0["input_schema"] ?? [:]]] }
-            if let toolChoice = request.json["tool_choice"] as? [String: Any] {
-                switch toolChoice["type"] as? String {
-                case "any": body["tool_choice"] = "required"
-                case "tool": body["tool_choice"] = ["type": "function", "function": ["name": toolChoice["name"]]]
-                default: body["tool_choice"] = "auto"
-                }
-            }
-        }
-        
-        if let thinking = request.json["thinking"] as? [String: Any], thinking["type"] as? String == "enabled" {
-            body["reasoning_effort"] = "high"
-        }
-        
-        return body
-    }
-    
-    // MARK: - Server-Sent Events (SSE) Formatting Helpers
-    
-    /// Helper struct to encapsulate SSE formatting logic and document spec mismatches.
-    /// Note on Spec Mismatches:
-    /// - OpenAI streams `choices[0].delta.content` continuously as simple strings.
-    /// - Anthropic requires a strict lifecycle: `message_start` -> `content_block_start` -> `content_block_delta` -> `content_block_stop` -> `message_delta` -> `message_stop`.
-    /// - OpenAI tools arrive as `tool_calls` array with incremental string chunks for JSON arguments.
-    /// - Anthropic expects `content_block_start` for `tool_use`, then `input_json_delta` for the JSON arguments.
-    private struct SSEFormatter {
-        static func format(event: String, data: String) -> String {
-            return "event: \(event)\ndata: \(data)\n\n"
-        }
-        
-        static func textDelta(text: String) -> String {
-            let str = String(data: (try? JSONEncoder().encode(text)) ?? Data(), encoding: .utf8) ?? "\"\""
-            return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\(str)}}")
-        }
-        
-        static func assistantMessageStart(model: String) -> [String] {
-            let msgId = "msg_\(UUID().uuidString.prefix(8))"
-            return [
-                format(event: "message_start", data: "{\"type\":\"message_start\",\"message\":{\"id\":\"\(msgId)\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"\(model)\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}"),
-                format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
-            ]
-        }
-        
-        static func toolUseStart(index: Int, id: String, name: String) -> String {
-            let nameStr = String(data: (try? JSONEncoder().encode(name)) ?? Data(), encoding: .utf8) ?? "\"\""
-            return format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":\(index),\"content_block\":{\"type\":\"tool_use\",\"id\":\"\(id)\",\"name\":\(nameStr),\"input\":{}}}")
-        }
-        
-        static func toolUseDelta(index: Int, args: String) -> String {
-            let argStr = String(data: (try? JSONEncoder().encode(args)) ?? Data(), encoding: .utf8) ?? "\"\""
-            return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(index),\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\(argStr)}}")
-        }
-        
-        static func messageStop(index: Int, stopReason: String, outputTokens: Int) -> [String] {
-            return [
-                format(event: "content_block_stop", data: "{\"type\":\"content_block_stop\",\"index\":\(index)}"),
-                format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(stopReason)\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":\(outputTokens)}}")
-            ]
-        }
-    }
-    
-    private func openAIToAnthropicSSE(chunk: [String: Any], model: String, alreadyStarted: Bool = false) -> [String] {
-        var events: [String] = []
-        guard let choices = chunk["choices"] as? [[String: Any]] else { return events }
-        
-        for choice in choices {
-            let delta = choice["delta"] as? [String: Any] ?? [:]
-            let index = choice["index"] as? Int ?? 0
-            
-            if delta["role"] as? String == "assistant", !alreadyStarted {
-                events.append(contentsOf: SSEFormatter.assistantMessageStart(model: model))
-            }
-            
-            if let content = delta["content"] as? String, !content.isEmpty {
-                events.append(SSEFormatter.textDelta(text: content))
-            }
-            
-            if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
-                for tc in toolCalls {
-                    let tcIdx = tc["index"] as? Int ?? 0
-                    if let fn = tc["function"] as? [String: Any] {
-                        if let name = fn["name"] as? String {
-                            events.append(SSEFormatter.toolUseStart(index: tcIdx, id: "\(name)_\(tcIdx)", name: name))
-                        }
-                        if let args = fn["arguments"] as? String {
-                            events.append(SSEFormatter.toolUseDelta(index: tcIdx, args: args))
-                        }
-                    }
-                }
-            }
-            
-            if let finishReason = choice["finish_reason"] as? String {
-                let stopReason: String
-                switch finishReason {
-                case "tool_calls": stopReason = "tool_use"
-                case "length": stopReason = "max_tokens"
-                default: stopReason = "end_turn"
-                }
-                
-                let usage = chunk["usage"] as? [String: Int] ?? [:]
-                let outputTokens = usage["completion_tokens"] ?? 0
-                events.append(contentsOf: SSEFormatter.messageStop(index: index, stopReason: stopReason, outputTokens: outputTokens))
-            }
-        }
-        
-        return events
-    }
-    
-    private func convertOpenAIResponseToAnthropic(data: Data, model: String) -> Data {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
-        
-        let choices = json["choices"] as? [[String: Any]] ?? []
-        let choice = choices.first?["message"] as? [String: Any]
-        let content = choice?["content"] as? String ?? ""
-        let finishReason = choice?["finish_reason"] as? String
-        let usage = json["usage"] as? [String: Int] ?? [:]
-        
-        let stopReason: String
-        switch finishReason {
-        case "tool_calls": stopReason = "tool_use"
-        case "length": stopReason = "max_tokens"
-        default: stopReason = "end_turn"
-        }
-        
-        var contentBlocks: [[String: Any]] = []
-        if !content.isEmpty {
-            contentBlocks.append(["type": "text", "text": content])
-        }
-        
-        if let toolCalls = choice?["tool_calls"] as? [[String: Any]] {
-            for tc in toolCalls {
-                if let fn = tc["function"] as? [String: Any],
-                   let name = fn["name"] as? String,
-                   let argsStr = fn["arguments"] as? String {
-                    let args = (try? JSONSerialization.jsonObject(with: Data(argsStr.utf8))) as? [String: Any] ?? ["raw_arguments": argsStr]
-                    contentBlocks.append([
-                        "type": "tool_use",
-                        "id": "\(name)_\(UUID().uuidString.prefix(8))",
-                        "name": name,
-                        "input": args
-                    ])
-                }
-            }
-        }
-        
-        let anthropicResponse: [String: Any] = [
-            "id": "msg_\(Int(Date().timeIntervalSince1970))",
-            "type": "message",
-            "role": "assistant",
-            "content": contentBlocks,
-            "model": model,
-            "stop_reason": stopReason,
-            "stop_sequence": nil as Any? as Any,
-            "usage": [
-                "input_tokens": usage["prompt_tokens"] ?? 0,
-                "output_tokens": usage["completion_tokens"] ?? 0,
-            ],
-        ]
-        
-        return (try? JSONSerialization.data(withJSONObject: anthropicResponse)) ?? data
-    }
-    
     // MARK: - Helpers
     
     private func resolveModel(_ incomingModel: String) -> String {
@@ -513,7 +290,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 }
             }
         }
-        let result = ["input_tokens": Int(ceil(Double(totalChars) / 4.0)), "estimated": true] as [String: Any]
+        let result: [String: Any] = ["input_tokens": Int(ceil(Double(totalChars) / 4.0)), "estimated": true]
         return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: result)) ?? Data())
     }
     
@@ -525,15 +302,13 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             ["id": config.modelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
         ]
         
-        // Add models from all configured providers
-        // (models already include their provider prefix, e.g. "deepseek/deepseek-chat")
         for preset in ProviderPreset.all {
             for modelId in preset.models {
                 models.append(["id": modelId, "object": "model", "created": now, "owned_by": preset.id])
             }
         }
         
-        let result = ["data": models]
+        let result: [String: Any] = ["data": models]
         return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: result)) ?? Data())
     }
     
@@ -545,199 +320,5 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     private func errorResponse(statusCode: Int, type: String, message: String) -> ProviderResponse {
         let body: [String: Any] = ["type": "error", "error": ["type": type, "message": message]]
         return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: body)) ?? Data())
-    }
-
-    private func blockedEndpoint(path: String) -> ProviderResponse {
-        let message = "The endpoint '\(path)' is blocked by JXProxy. This Anthropic-specific call cannot be forwarded to a third-party provider. The tool can work locally without reaching the API."
-        let body: [String: Any] = [
-            "type": "error",
-            "error": [
-                "type": "api_error",
-                "message": message,
-            ]
-        ]
-        return ProviderResponse(statusCode: 400, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: body)) ?? Data())
-    }
-}
-
-// MARK: - Supporting Types
-
-struct ProviderResponse {
-    let statusCode: Int
-    let headers: [String: String]
-    let body: Data
-    var stream: AsyncStream<Data>? = nil
-}
-
-struct MessagesRequest {
-    let json: [String: Any]
-    var model: String { json["model"] as? String ?? "" }
-    var stream: Bool { json["stream"] as? Bool ?? true }
-    var messages: [[String: Any]] { json["messages"] as? [[String: Any]] ?? [] }
-}
-
-enum ProviderError: LocalizedError {
-    case providerUnavailable(providerId: String, statusCode: Int)
-    case noProvidersAvailable
-    case invalidResponse
-    
-    var errorDescription: String? {
-        switch self {
-        case .providerUnavailable(let id, let code): return "Provider '\(id)' returned \(code)"
-        case .noProvidersAvailable: return "No providers available"
-        case .invalidResponse: return "Invalid response from provider"
-        }
-    }
-}
-import Foundation
-
-final class DirectDNSResolver {
-    static let shared = DirectDNSResolver()
-    
-    private var cache: [String: String] = [
-        "api.anthropic.com": "160.79.104.10",
-        "api.openai.com": "104.18.2.161",
-        "api.openrouter.ai": "104.21.36.195"
-    ]
-    
-    func resolve(_ hostname: String) async -> String? {
-        if let cached = cache[hostname] { return cached }
-        
-        let url = URL(string: "https://cloudflare-dns.com/dns-query?name=\(hostname)&type=A")!
-        var request = URLRequest(url: url)
-        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        
-        do {
-            let sessionConfig = URLSessionConfiguration.default
-            sessionConfig.timeoutIntervalForRequest = 5.0
-            let session = URLSession(configuration: sessionConfig)
-            
-            let (data, _) = try await session.data(for: request)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let answer = json["Answer"] as? [[String: Any]] else {
-                return nil
-            }
-            
-            for record in answer {
-                if let type = record["type"] as? Int, type == 1, let data = record["data"] as? String {
-                    cache[hostname] = data
-                    return data
-                }
-            }
-        } catch {
-            print("[DirectDNSResolver] Failed to resolve \(hostname): \(error)")
-        }
-        return nil
-    }
-}
-import Foundation
-
-enum CurlError: Error {
-    case invalidResponse
-    case processFailed(Int32)
-}
-
-final class CurlClient {
-    static func request(url: URL, method: String, headers: [String: String], body: Data?, resolveIP: String? = nil) async throws -> (Data, HTTPURLResponse) {
-        let (response, stream) = try await self.stream(url: url, method: method, headers: headers, body: body, resolveIP: resolveIP)
-        
-        var fullData = Data()
-        for await chunk in stream {
-            fullData.append(chunk)
-        }
-        
-        return (fullData, response)
-    }
-    
-    static func stream(url: URL, method: String, headers: [String: String], body: Data?, resolveIP: String? = nil) async throws -> (HTTPURLResponse, AsyncStream<Data>) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        
-        var args = ["-i", "-s", "-N", "-X", method]
-        
-        if let ip = resolveIP, let host = url.host {
-            let port = url.port ?? (url.scheme == "https" ? 443 : 80)
-            args.append("--resolve")
-            args.append("\(host):\(port):\(ip)")
-        }
-        
-        for (key, value) in headers {
-            args.append("-H")
-            args.append("\(key): \(value)")
-        }
-        
-        let tempFileURL: URL?
-        if let bodyData = body {
-            let tempDir = FileManager.default.temporaryDirectory
-            let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".json")
-            try bodyData.write(to: tempFile)
-            args.append("--data-binary")
-            args.append("@\(tempFile.path)")
-            tempFileURL = tempFile
-        } else {
-            tempFileURL = nil
-        }
-        
-        args.append(url.absoluteString)
-        process.arguments = args
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        
-        try process.run()
-        
-        // Read headers
-        let fileHandle = pipe.fileHandleForReading
-        var headerData = Data()
-        var statusCode = 200
-        var responseHeaders: [String: String] = [:]
-        
-        // Continue reading until we hit \r\n\r\n
-        while let byteData = try fileHandle.read(upToCount: 1), !byteData.isEmpty {
-            headerData.append(byteData)
-            if headerData.count >= 4 && headerData.suffix(4) == Data("\r\n\r\n".utf8) {
-                break
-            }
-        }
-        
-        let headerString = String(data: headerData, encoding: .utf8) ?? ""
-        let lines = headerString.components(separatedBy: "\r\n")
-        
-        // Handle HTTP/2 or HTTP/1.1 response status line (can be multiple if 100 Continue)
-        var actualHeaders = lines
-        if let first = lines.first, first.starts(with: "HTTP/") {
-            let parts = first.split(separator: " ")
-            if parts.count >= 2, let code = Int(parts[1]) {
-                statusCode = code
-            }
-        }
-        
-        for line in actualHeaders.dropFirst() {
-            if line.isEmpty { continue }
-            let parts = line.split(separator: ":", maxSplits: 1)
-            if parts.count == 2 {
-                responseHeaders[String(parts[0]).trimmingCharacters(in: .whitespaces)] = String(parts[1]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        
-        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: responseHeaders)!
-        
-        let stream = AsyncStream<Data> { continuation in
-            fileHandle.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    fileHandle.readabilityHandler = nil
-                    process.waitUntilExit()
-                    if let tempFile = tempFileURL {
-                        try? FileManager.default.removeItem(at: tempFile)
-                    }
-                    continuation.finish()
-                } else {
-                    continuation.yield(data)
-                }
-            }
-        }
-        
-        return (response, stream)
     }
 }
