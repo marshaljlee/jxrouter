@@ -98,13 +98,13 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Model override for sonnet-tier.
     var modelSonnet: String {
-        get { defaults.string(forKey: UDKey.modelSonnet) ?? "nvidia/nemotron-3-ultra-550b-a55b" }
+        get { defaults.string(forKey: UDKey.modelSonnet) ?? "opencode/big-pickle-reasoning" }
         set { defaults.set(newValue, forKey: UDKey.modelSonnet); publish() }
     }
 
     /// Model override for haiku-tier.
     var modelHaiku: String {
-        get { defaults.string(forKey: UDKey.modelHaiku) ?? "ollama/qwen3:latest" }
+        get { defaults.string(forKey: UDKey.modelHaiku) ?? "opencode/big-pickle-turbo" }
         set { defaults.set(newValue, forKey: UDKey.modelHaiku); publish() }
     }
 
@@ -122,7 +122,7 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Base URL for OpenAI-compatible providers.
     var openaiBaseUrl: String {
-        get { defaults.string(forKey: UDKey.openaiBaseUrl) ?? "https://integrate.api.nvidia.com/v1" }
+        get { defaults.string(forKey: UDKey.openaiBaseUrl) ?? "https://api.openai.com/v1" }
         set { defaults.set(newValue, forKey: UDKey.openaiBaseUrl); publish() }
     }
 
@@ -394,9 +394,10 @@ final class ConfigManager: @unchecked Sendable {
         switch providerId {
         case "direct": return "https://api.anthropic.com"
         case "openrouter": return "https://openrouter.ai/api/v1"
-        case "opencode-zen": return "https://opencode.ai/zen/v1"
-        case "opencode-go": return "https://opencode.ai/zen/go/v1"
-        case "openai", "nvidia-nim": return openaiBaseUrl
+        case "opencode-zen": return "https://zen.opencode.ai/v1"
+        case "opencode-go": return "https://oai.opencode.ai/v1"
+        case "openai": return openaiBaseUrl
+        case "nvidia-nim": return "https://integrate.api.nvidia.com/v1"
         case "deepseek": return "https://api.deepseek.com/v1"
         case "gemini": return "https://generativelanguage.googleapis.com/v1beta"
         case "mistral": return "https://api.mistral.ai/v1"

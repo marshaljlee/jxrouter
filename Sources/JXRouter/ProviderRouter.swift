@@ -119,7 +119,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "opencode-zen", "opencode-go", "openai":
             return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "nvidia-nim":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: config.openaiBaseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "deepseek", "gemini", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway":
             return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "local", "ollama":
@@ -249,7 +249,16 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     }
                 }
                 
-                if !hasStarted && !hasFinished {
+                if !hasFinished {
+                    // If content blocks were started but we never got a finish_reason,
+                    // emit content_block_stop + message_delta + message_stop so the
+                    // client doesn't hang waiting for the stream to end.
+                    if hasStarted {
+                        let cbStop = SSEFormatter.format(event: "content_block_stop", data: "{\"type\":\"content_block_stop\",\"index\":0}")
+                        continuation.yield(Data(cbStop.utf8))
+                        let msgDelta = SSEFormatter.format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}")
+                        continuation.yield(Data(msgDelta.utf8))
+                    }
                     let stopEvent = SSEFormatter.format(event: "message_stop", data: "{\"type\":\"message_stop\"}")
                     continuation.yield(Data(stopEvent.utf8))
                     hasFinished = true

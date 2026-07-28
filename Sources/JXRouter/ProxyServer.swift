@@ -562,15 +562,18 @@ final class ProxyServer: @unchecked Sendable {
 
     private func handleModelListEndpoint(_ connection: NWConnection) {
         let now = Int(Date().timeIntervalSince1970)
-        let models: [[String: Any]] = [
-            ["id": "claude-opus-4-8-20250701", "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": "claude-sonnet-5-20251001", "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": "claude-haiku-4-5-20251001", "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": cachedModelOpus, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": cachedModelSonnet, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": cachedModelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
+        let cfg = ConfigManager.shared
+        var models: [[String: Any]] = [
+            ["id": cfg.modelOpus, "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": cfg.modelSonnet, "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": cfg.modelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
         ]
-        let data = try! JSONSerialization.data(withJSONObject: ["data": models])
+        for preset in ProviderPreset.all {
+            for modelId in preset.models {
+                models.append(["id": modelId, "object": "model", "created": now, "owned_by": preset.id])
+            }
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: ["data": models])) ?? Data()
         let body = String(data: data, encoding: .utf8) ?? "[]"
         let response = """
         HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
