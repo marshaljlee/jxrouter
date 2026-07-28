@@ -15,6 +15,13 @@ enum ProxyError: Error, LocalizedError {
     }
 }
 
+/// A simple timeout error with a human-readable message.
+struct TimeoutError: Error, LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
 struct ProxyStats: Sendable {
     var aiRouted: Int = 0
     var passthrough: Int = 0
@@ -462,20 +469,30 @@ final class ProxyServer: @unchecked Sendable {
 
         // Check if this is an internal JXProxy endpoint
         let hostWithoutPort = host.split(separator: ":").first.map(String.init) ?? host
+        // Strip query string from path for endpoint matching
+        let basePath = path.components(separatedBy: "?").first ?? path
         if hostWithoutPort == "127.0.0.1" || hostWithoutPort == "localhost" {
-            if path == "/admin" || path == "/admin/" {
+            if basePath == "/admin" || basePath == "/admin/" {
                 handleAdminEndpoint(connection)
                 return
             }
-            if path == "/health" || path == "/" {
+            if basePath == "/health" || basePath == "/" {
                 handleHealthEndpoint(connection)
                 return
             }
-            if path == "/v1/models" {
+            if basePath == "/api/hello" {
+                handleHelloEndpoint(connection)
+                return
+            }
+            if basePath == "/v1/models" {
                 handleModelListEndpoint(connection)
                 return
             }
-            if path == "/v1/messages" || path == "/v1/v1/messages" || path == "/messages" {
+            if basePath.hasPrefix("/v1/models/") {
+                handleModelDetailEndpoint(connection, path: basePath)
+                return
+            }
+            if basePath == "/v1/messages" || basePath == "/v1/v1/messages" || basePath == "/messages" {
                 handleAIMessages(connection, method: method, initialData: initialData)
                 return
             }
@@ -543,6 +560,22 @@ final class ProxyServer: @unchecked Sendable {
         }))
     }
 
+    private func handleHelloEndpoint(_ connection: NWConnection) {
+        let body = """
+        {"status":"ok","provider":"\(cachedProvider)","version":"1.0.0"}
+        """
+        let response = """
+        HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
+        """
+        guard let data = response.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+        connection.send(content: data, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+    }
+
     private func handleHealthEndpoint(_ connection: NWConnection) {
         let provider = cachedProvider
         let body = """
@@ -563,14 +596,18 @@ final class ProxyServer: @unchecked Sendable {
     private func handleModelListEndpoint(_ connection: NWConnection) {
         let now = Int(Date().timeIntervalSince1970)
         let cfg = ConfigManager.shared
+        
+        // Sanitize model IDs to remove newlines and excess whitespace.
+        let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
+        
         var models: [[String: Any]] = [
-            ["id": cfg.modelOpus, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": cfg.modelSonnet, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": cfg.modelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": sanitize(cfg.modelOpus), "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": sanitize(cfg.modelSonnet), "object": "model", "created": now, "owned_by": "jxproxy"],
+            ["id": sanitize(cfg.modelHaiku), "object": "model", "created": now, "owned_by": "jxproxy"],
         ]
         for preset in ProviderPreset.all {
             for modelId in preset.models {
-                models.append(["id": modelId, "object": "model", "created": now, "owned_by": preset.id])
+                models.append(["id": sanitize(modelId), "object": "model", "created": now, "owned_by": preset.id])
             }
         }
         let data = (try? JSONSerialization.data(withJSONObject: ["data": models])) ?? Data()
@@ -578,6 +615,45 @@ final class ProxyServer: @unchecked Sendable {
         let response = """
         HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
         """
+        guard let respData = response.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+        connection.send(content: respData, completion: .contentProcessed({ _ in connection.cancel() }))
+    }
+
+    /// Handle GET /v1/models/{model_id} — return model details with context window.
+    /// Claude Code queries this to determine token limits before sending prompts.
+    private func handleModelDetailEndpoint(_ connection: NWConnection, path: String) {
+        let modelId = path.replacingOccurrences(of: "/v1/models/", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = Int(Date().timeIntervalSince1970)
+        
+        // Return model details with a generous context window (200K tokens)
+        // so Claude Code doesn't reject prompts as "too long"
+        let modelInfo: [String: Any] = [
+            "id": modelId,
+            "object": "model",
+            "created": now,
+            "owned_by": "jxproxy",
+            "capabilities": [
+                "context_window": 200000,
+                "max_output_tokens": 4096,
+                "supports_vision": true,
+                "supports_streaming": true
+            ],
+            "permission": [
+                "allow_create_engine": false,
+                "allow_sampling": true,
+                "allow_logprobs": true,
+                "allow_search_indices": false,
+                "allow_view": true,
+                "allow_fine_tuning": false
+            ]
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: modelInfo)) ?? Data()
+        let body = String(data: data, encoding: .utf8) ?? "{}"
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
         guard let respData = response.data(using: .utf8) else {
             connection.cancel()
             return
@@ -612,28 +688,45 @@ final class ProxyServer: @unchecked Sendable {
         let remainingBytes = contentLength - initialBodyData.count
 
         let router = self.providerRouter
-        Task {
+
+        // Create the main request task so we can cancel it on timeout.
+        let requestTask = Task { [connection] in
             do {
-                // Accumulate full body if it was truncated
                 var bodyData = Data(initialBodyData)
+
+                // FIX #1: Body accumulation with 30-second timeout.
+                // Previously this loop had NO timeout — a Content-Length mismatch
+                // by even 1 byte caused an indefinite block.
                 if remainingBytes > 0 {
                     var bytesLeft = remainingBytes
+                    let readDeadline = DispatchTime.now() + 30
                     while bytesLeft > 0 {
+                        try Task.checkCancellation()
                         let chunkSize = min(bytesLeft, 65536)
-                        let chunk: Data = try await withCheckedThrowingContinuation { cont in
-                            connection.receive(minimumIncompleteLength: 1, maximumLength: chunkSize) { data, _, isComplete, error in
-                                if let error = error {
-                                    cont.resume(throwing: error)
-                                } else {
-                                    cont.resume(returning: data ?? Data())
-                                }
-                            }
+                        let semaphore = DispatchSemaphore(value: 0)
+                        var chunkData = Data()
+                        var chunkError: Error?
+
+                        connection.receive(minimumIncompleteLength: 1, maximumLength: chunkSize) { data, _, _, error in
+                            if let d = data { chunkData = d }
+                            if let e = error { chunkError = e }
+                            semaphore.signal()
                         }
-                        bodyData.append(chunk)
-                        bytesLeft -= chunk.count
-                        if chunk.isEmpty { break }
+
+                        if semaphore.wait(timeout: readDeadline) == .timedOut {
+                            connection.cancel()
+                            throw TimeoutError("Body read timed out after 30s")
+                        }
+
+                        if let err = chunkError { throw err }
+                        bodyData.append(chunkData)
+                        bytesLeft -= chunkData.count
+                        if chunkData.isEmpty { break }
                     }
                 }
+
+                try Task.checkCancellation()
+
                 let response = try await router?.route(
                     method: method,
                     path: "/v1/messages",
@@ -678,9 +771,21 @@ final class ProxyServer: @unchecked Sendable {
                         }))
                     }
                 }))
+            } catch is CancellationError {
+                // Task was cancelled by the 90-second timeout
+                sendHttpResponse(connection, statusCode: 504, message: "Request timed out")
+            } catch let error as TimeoutError {
+                sendHttpResponse(connection, statusCode: 504, message: error.message)
             } catch {
                 sendHttpResponse(connection, statusCode: 502, message: "Upstream error")
             }
+        }
+
+        // FIX #2: 90-second total request timeout.
+        // Ensures every request terminates even if all other safeguards fail.
+        Task {
+            try? await Task.sleep(nanoseconds: 90_000_000_000)
+            requestTask.cancel()
         }
     }
 

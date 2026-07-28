@@ -390,11 +390,19 @@ final class ConfigManager: @unchecked Sendable {
     // MARK: - Public API
 
     /// Get the resolved base URL for a given provider identifier.
+    /// Checks providerBackendUrls first (user-configured override), then falls back
+    /// to built-in defaults so every provider's URL is editable from the UI.
     func baseUrl(for providerId: String) -> String {
+        // User-configured override takes priority
+        let overrides = providerBackendUrls
+        if let custom = overrides[providerId], !custom.isEmpty {
+            return custom
+        }
+        
         switch providerId {
         case "direct": return "https://api.anthropic.com"
         case "openrouter": return "https://openrouter.ai/api/v1"
-        case "opencode-zen": return "https://zen.opencode.ai/v1"
+        case "opencode-zen": return "https://opencode.ai/zen/v1"
         case "opencode-go": return "https://oai.opencode.ai/v1"
         case "openai": return openaiBaseUrl
         case "nvidia-nim": return "https://integrate.api.nvidia.com/v1"
@@ -422,6 +430,25 @@ final class ConfigManager: @unchecked Sendable {
         case "lmstudio": return "http://127.0.0.1:1234/v1"
         case "llamacpp": return "http://127.0.0.1:8080/v1"
         default: return ""
+        }
+    }
+
+    /// User-customised backend URLs per provider (stored as JSON dict).
+    /// Keyed by provider ID, value is the custom base URL.
+    var providerBackendUrls: [String: String] {
+        get {
+            let raw = defaults.string(forKey: UDKey.providerBackendUrls) ?? "{}"
+            guard let data = raw.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+                return [:]
+            }
+            return dict
+        }
+        set {
+            if let data = try? JSONSerialization.data(withJSONObject: newValue),
+               let json = String(data: data, encoding: .utf8) {
+                defaults.set(json, forKey: UDKey.providerBackendUrls)
+            }
         }
     }
 

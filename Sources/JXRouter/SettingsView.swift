@@ -18,7 +18,7 @@ struct SettingsView: View {
     @State private var model: String = "big-pickle"
     @State private var enableThinking: Bool = true
     @State private var provider: String = "opencode-zen"
-    @State private var fallbackProviders: String = "deepseek,groq"
+    @State private var fallbackProviders: String = "nvidia,local"
     // Model Overrides
     @State private var modelOpus: String = ""
     @State private var modelSonnet: String = ""
@@ -27,6 +27,9 @@ struct SettingsView: View {
     @State private var openaiBaseUrl: String = ""
     @State private var localBaseUrl: String = ""
     @State private var localModel: String = ""
+    // Custom backend URLs per provider (stored as JSON dict in ConfigManager)
+    @State private var providerUrlOverrides: [String: String] = [:]
+    // API keys
     @State private var openaiKey: String = ""
     @State private var openrouterKey: String = ""
     @State private var opencodeKey: String = ""
@@ -43,6 +46,8 @@ struct SettingsView: View {
     @State private var cerebrasKey: String = ""
     @State private var huggingfaceKey: String = ""
     @State private var xaiKey: String = ""
+    
+    @State private var showSaveConfirmation: Bool = false
     
     @AppStorage("autoStartProxy") private var autoStartProxy = false
     
@@ -324,19 +329,6 @@ struct SettingsView: View {
         .onChange(of: provider) { _, newProvider in
             Task { await fetchLiveModels(for: newProvider) }
         }
-        .onChange(of: settingsHash) { _, newHash in 
-            if !initialSettingsHash.isEmpty && newHash != initialSettingsHash {
-                hasUnsavedChanges = true
-            }
-            saveConfig()
-            // If the current provider's key was cleared, fall back to the first
-            // available provider so the selection doesn't go stale.
-            if !availableProviders.contains(where: { $0.id == provider }) {
-                if let first = availableProviders.first {
-                    provider = first.id
-                }
-            }
-        }
     }
 
     // MARK: - Tab Bar
@@ -506,6 +498,27 @@ struct SettingsView: View {
                 labeledField("Local LLM Model") {
                     TextField("ollama/qwen", text: $localModel)
                         .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            Divider().padding(.vertical, DesignToken.spacing4)
+
+            sectionGroup("Provider Backend URLs") {
+                Text("Override the default API endpoint for any provider.")
+                    .font(.system(size: DesignToken.captionSize))
+                    .foregroundStyle(Color.dsTextTertiary)
+                ForEach(ProviderPreset.all.filter { $0.id != "local" && $0.id != "ollama" && $0.id != "lmstudio" && $0.id != "llamacpp" }) { preset in
+                    labeledField(preset.name) {
+                        TextField(
+                            preset.defaultUrl,
+                            text: Binding(
+                                get: { providerUrlOverrides[preset.id] ?? "" },
+                                set: { providerUrlOverrides[preset.id] = $0 }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: DesignToken.caption2Size, design: .monospaced))
+                    }
                 }
             }
         }
@@ -813,8 +826,24 @@ struct SettingsView: View {
 
             Spacer()
 
-            if hasUnsavedChanges {
-                Text("Restart proxy to apply network changes.")
+            Button("Save") {
+                saveConfig()
+                showSaveConfirmation = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    showSaveConfirmation = false
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .keyboardShortcut("s", modifiers: .command)
+
+            if showSaveConfirmation {
+                Text("Saved ✓")
+                    .font(.system(size: DesignToken.captionSize))
+                    .foregroundStyle(Color.dsGreen)
+                    .transition(.opacity)
+            } else if hasUnsavedChanges {
+                Text("Unsaved changes")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
             }
@@ -872,13 +901,15 @@ struct SettingsView: View {
 
     // MARK: - Helpers
 
-    /// Composite hash of all editable settings – observed by a single `.onChange` to auto-save.
+    /// Composite hash of all editable settings – observed to detect unsaved changes.
     private var settingsHash: String {
-        [
+        let urlOverridesStr = providerUrlOverrides.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+        return [
             port, authToken, model, String(enableThinking),
             provider, fallbackProviders,
             modelOpus, modelSonnet, modelHaiku,
             openaiBaseUrl, localBaseUrl, localModel,
+            urlOverridesStr,
             anthropicKey, openaiKey, openrouterKey, opencodeKey, nvidiaKey,
             deepseekKey, geminiKey, mistralKey, codestralKey, cohereKey,
             groqKey, fireworksKey, sambanovaKey, cerebrasKey, huggingfaceKey, xaiKey,
@@ -900,6 +931,7 @@ struct SettingsView: View {
         openaiBaseUrl = config.openaiBaseUrl
         localBaseUrl = config.localLlmBaseUrl
         localModel = config.localLlmModel
+        providerUrlOverrides = config.providerBackendUrls
         anthropicKey = config.apiKey(for: "direct")
         openaiKey = config.apiKey(for: "openai")
         openrouterKey = config.apiKey(for: "openrouter")
@@ -922,6 +954,7 @@ struct SettingsView: View {
         adminPassword = config.getApiKey(chainKey: ConfigManager.KeychainKey.adminPassword)
         loadAppRoutesFromConfig()
         initialSettingsHash = settingsHash
+        hasUnsavedChanges = false
     }
 
     private func loadAppRoutesFromConfig() {
@@ -947,6 +980,7 @@ struct SettingsView: View {
         config.openaiBaseUrl = openaiBaseUrl
         config.localLlmBaseUrl = localBaseUrl
         config.localLlmModel = localModel
+        config.providerBackendUrls = providerUrlOverrides.filter { !$0.value.isEmpty }
 
         config.setApiKey(chainKey: ConfigManager.KeychainKey.anthropic, value: anthropicKey)
         config.setApiKey(chainKey: ConfigManager.KeychainKey.openai, value: openaiKey)
@@ -970,6 +1004,7 @@ struct SettingsView: View {
 
         saveAppRoutesToConfig()
         manager.loadAllFromConfig()
+        hasUnsavedChanges = false
     }
 
     private func saveAppRoutesToConfig() {
@@ -984,13 +1019,14 @@ struct SettingsView: View {
         model = "big-pickle"
         enableThinking = true
         provider = "opencode-zen"
-        fallbackProviders = "deepseek,groq"
+        fallbackProviders = "nvidia,local"
         modelOpus = "opencode/big-pickle"
         modelSonnet = "opencode/big-pickle-reasoning"
         modelHaiku = "opencode/big-pickle-turbo"
-        openaiBaseUrl = "https://integrate.api.nvidia.com/v1"
+        openaiBaseUrl = "https://api.openai.com/v1"
         localBaseUrl = "http://127.0.0.1:11434/v1"
-        localModel = "ollama/qwen"
+        localModel = "ollama/qwen3:latest"
+        providerUrlOverrides = [:]
         anthropicKey = ""
         openaiKey = ""
         openrouterKey = ""
@@ -1014,6 +1050,7 @@ struct SettingsView: View {
         adminPassword = ""
         
         initialSettingsHash = settingsHash
+        hasUnsavedChanges = false
     }
 
     private func addNewAppRule() {

@@ -70,8 +70,24 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         
         let providerChain = [primaryProvider] + fallbackNames
         var lastError: Error?
+        let chainStart = CFAbsoluteTimeGetCurrent()
+        let maxChainDuration: TimeInterval = 120.0 // Total fallback chain cap
         
-        for providerId in providerChain {
+        for (index, providerId) in providerChain.enumerated() {
+            let elapsed = CFAbsoluteTimeGetCurrent() - chainStart
+            guard elapsed < maxChainDuration else {
+                lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: 504)
+                break
+            }
+            
+            if index > 0 {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                guard CFAbsoluteTimeGetCurrent() - chainStart < maxChainDuration else {
+                    lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: 504)
+                    break
+                }
+            }
+            
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
                 let response = try await routeToProvider(providerId: providerId, request: messagesRequest)
@@ -192,7 +208,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     private func handleOpenAIStreaming(response: HTTPURLResponse, stream inputStream: AsyncStream<Data>, request: MessagesRequest) async throws -> ProviderResponse {
         let statusCode = response.statusCode
-        
+
         if statusCode != 200 {
             var fullData = Data()
             for await chunk in inputStream {
@@ -200,38 +216,42 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             }
             return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: fullData)
         }
-        
+
         var hasStarted = false
         var hasFinished = false
         let (stream, continuation) = AsyncStream.makeStream(of: Data.self)
-        
+
         Task {
             do {
                 var buffer = Data()
-                for await chunk in inputStream {
+                // FIX #3: Label the outer for-await loop so we can break out of it on [DONE].
+                streamLoop: for await chunk in inputStream {
                     buffer.append(chunk)
-                    
+
                     while let newlineRange = buffer.range(of: Data("\n".utf8)) {
                         let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
                         buffer.removeSubrange(buffer.startIndex..<newlineRange.upperBound)
-                        
+
                         guard let line = String(data: lineData, encoding: .utf8), line.hasPrefix("data: ") else { continue }
                         let dataString = String(line.dropFirst(6))
-                        
+
                         if dataString == "[DONE]" {
                             if !hasFinished {
                                 let stopEvent = SSEFormatter.format(event: "message_stop", data: "{\"type\":\"message_stop\"}")
                                 continuation.yield(Data(stopEvent.utf8))
                                 hasFinished = true
                             }
-                            break
+                            // Break the outer for-await loop — the stream is done.
+                            // Previously this only broke the inner while loop, causing
+                            // the output stream to stay open for another 30s (--max-time).
+                            break streamLoop
                         }
-                        
+
                         guard let chunkData = dataString.data(using: .utf8),
                               let chunkDict = try? JSONSerialization.jsonObject(with: chunkData) as? [String: Any] else {
                             continue
                         }
-                        
+
                         let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, alreadyStarted: hasStarted)
                         for event in events {
                             if event.contains("content_block_start") { hasStarted = true }
@@ -246,9 +266,13 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                             }
                             continuation.yield(Data(event.utf8))
                         }
+                        // If message_delta already set hasFinished, the stream is done
+                        // even if upstream doesn't send [DONE]. Break to avoid waiting
+                        // for curl --max-time (30s) unnecessarily.
+                        if hasFinished { break streamLoop }
                     }
                 }
-                
+
                 if !hasFinished {
                     // If content blocks were started but we never got a finish_reason,
                     // emit content_block_stop + message_delta + message_stop so the
@@ -264,9 +288,21 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     hasFinished = true
                 }
                 continuation.finish()
+            } catch {
+                // FIX #4: Catch any error in the streaming Task.
+                // Previously the Task had no catch clause — if anything threw,
+                // the task silently died and continuation.finish() was never called,
+                // causing the output stream to hang open forever.
+                print("[ProviderRouter] Streaming error: \(error)")
+                if !hasFinished {
+                    let stopEvent = SSEFormatter.format(event: "message_stop", data: "{\"type\":\"message_stop\"}")
+                    continuation.yield(Data(stopEvent.utf8))
+                    hasFinished = true
+                }
+                continuation.finish()
             }
         }
-        
+
         return ProviderResponse(
             statusCode: 200,
             headers: ["Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"],
@@ -281,17 +317,30 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     /// For local providers (llamacpp, ollama, lmstudio, local) the tier mapping
     /// (opus → modelOpus, sonnet → modelSonnet) is skipped — the default model
     /// is used directly since the user is expected to configure it in Settings.
+    /// For well-known model names (starting with "claude-", "gpt-", "gemini-", etc.),
+    /// passes through directly instead of applying tier mapping.
+    /// Tier mapping only applies when the incoming model is exactly "opus", "sonnet",
+    /// or "haiku" — NOT when it's part of a longer model name.
     private func resolveModel(_ incomingModel: String, for providerId: String? = nil) -> String {
         let localProviders = ["llamacpp", "lmstudio", "local", "ollama"]
         if let pid = providerId, localProviders.contains(pid) {
             return config.model
         }
-        let lower = incomingModel.lowercased()
         if incomingModel.contains("/") { return incomingModel }
-        if lower.contains("opus"), !config.modelOpus.isEmpty { return config.modelOpus }
-        if lower.contains("sonnet"), !config.modelSonnet.isEmpty { return config.modelSonnet }
-        if lower.contains("haiku"), !config.modelHaiku.isEmpty { return config.modelHaiku }
-        return config.model
+        
+        // Pass through well-known Anthropic model names directly
+        let lower = incomingModel.lowercased()
+        if lower.hasPrefix("claude-") || lower.hasPrefix("gpt-") || lower.hasPrefix("gemini-") {
+            return incomingModel
+        }
+        
+        // Tier mapping: ONLY for exact single-word tier names
+        if lower == "opus", !config.modelOpus.isEmpty { return config.modelOpus }
+        if lower == "sonnet", !config.modelSonnet.isEmpty { return config.modelSonnet }
+        if lower == "haiku", !config.modelHaiku.isEmpty { return config.modelHaiku }
+        
+        // For any other model name, pass through as-is (no tier substring matching)
+        return incomingModel
     }
     
     private func handleTokenCount(body: Data) -> ProviderResponse {

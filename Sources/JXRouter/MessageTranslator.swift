@@ -86,8 +86,15 @@ enum MessageTranslator {
                 events.append(contentsOf: SSEFormatter.assistantMessageStart(model: model))
             }
 
+            // Handle standard text content
             if let content = delta["content"] as? String, !content.isEmpty {
                 events.append(SSEFormatter.textDelta(text: content))
+            }
+
+            // Handle reasoning_content (used by DeepSeek, OpenCode, etc.)
+            // Treat as regular text content so the response is not silently lost.
+            if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
+                events.append(SSEFormatter.textDelta(text: reasoning))
             }
 
             if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
@@ -128,7 +135,12 @@ enum MessageTranslator {
 
         let choices = json["choices"] as? [[String: Any]] ?? []
         let choice = choices.first?["message"] as? [String: Any]
-        let content = choice?["content"] as? String ?? ""
+        var content = choice?["content"] as? String ?? ""
+        // Some providers (OpenCode, DeepSeek) put the response in reasoning_content
+        // with content being empty. Fall back to reasoning_content if content is empty.
+        if content.isEmpty, let reasoning = choice?["reasoning_content"] as? String {
+            content = reasoning
+        }
         let finishReason = choice?["finish_reason"] as? String
         let usage = json["usage"] as? [String: Int] ?? [:]
 

@@ -66,28 +66,46 @@ final class DirectDNSResolver {
         return nil
     }
 
+    // FIX #8: Run getaddrinfo on a background thread with a 10-second timeout.
+    // Previously there was no timeout — getaddrinfo can block for 30+ seconds
+    // depending on system DNS configuration (multi-DNS, VPN, mDNSResponder issues).
     private func resolveViaSystem(_ hostname: String) -> String? {
-        var hints = addrinfo(
-            ai_flags: 0,
-            ai_family: AF_INET,
-            ai_socktype: SOCK_STREAM,
-            ai_protocol: 0,
-            ai_addrlen: 0,
-            ai_canonname: nil,
-            ai_addr: nil,
-            ai_next: nil
-        )
-        var addrInfo: UnsafeMutablePointer<addrinfo>? = nil
-        let result = getaddrinfo(hostname, nil, &hints, &addrInfo)
-        guard result == 0, let info = addrInfo else {
-            print("[DirectDNSResolver] getaddrinfo failed for \(hostname): \(result)")
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultIP: String?
+
+        DispatchQueue.global().async {
+            var hints = addrinfo(
+                ai_flags: 0,
+                ai_family: AF_INET,
+                ai_socktype: SOCK_STREAM,
+                ai_protocol: 0,
+                ai_addrlen: 0,
+                ai_canonname: nil,
+                ai_addr: nil,
+                ai_next: nil
+            )
+            var addrInfo: UnsafeMutablePointer<addrinfo>? = nil
+            let result = getaddrinfo(hostname, nil, &hints, &addrInfo)
+            guard result == 0, let info = addrInfo else {
+                print("[DirectDNSResolver] getaddrinfo failed for \(hostname): \(result)")
+                semaphore.signal()
+                return
+            }
+            defer { freeaddrinfo(addrInfo) }
+
+            let addr = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            let ipBytes = addr.sin_addr
+            let ipStr = String(cString: inet_ntoa(ipBytes))
+            resultIP = ipStr
+            semaphore.signal()
+        }
+
+        // Wait up to 10 seconds for system DNS resolution
+        guard semaphore.wait(timeout: .now() + 10) == .success else {
+            print("[DirectDNSResolver] getaddrinfo timed out for \(hostname)")
             return nil
         }
-        defer { freeaddrinfo(addrInfo) }
 
-        let addr = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-        let ipBytes = addr.sin_addr
-        let ipStr = String(cString: inet_ntoa(ipBytes))
-        return ipStr
+        return resultIP
     }
 }
