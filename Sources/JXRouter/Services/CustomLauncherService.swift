@@ -102,9 +102,12 @@ struct CustomLauncherService {
                 echo "🚀 Starting llama-server with model: $(basename "$MODEL_PATH")"
                 echo "   Port: 8080"
                 echo "   Context: 8192 tokens"
+                echo "   Chat template: ChatML (overrides GGUF built-in)"
                 echo ""
                 
-                nohup llama-server --host 127.0.0.1 --port 8080 --model "$MODEL_PATH" --ctx-size 8192 > /tmp/llama-server.log 2>&1 &
+                # Write ChatML template to temp file (avoids shell escaping issues inline)
+                # llama-server --chat-template accepts a file path with the Jinja2 template
+                nohup llama-server --host 127.0.0.1 --port 8080 --model "$MODEL_PATH" --ctx-size 8192 --chat-template "$(dirname "$0")/llama-chat-template.txt" > /tmp/llama-server.log 2>&1 &
                 PID=$!
                 echo "📡 Server PID: $PID"
                 echo ""
@@ -156,5 +159,21 @@ struct CustomLauncherService {
             attributes[.posixPermissions] = NSNumber(value: currentPermissions.intValue | 0o111)
             try fileManager.setAttributes(attributes, ofItemAtPath: path)
         }
+        
+        // Write ChatML chat template for llama-server --chat-template
+        // Overrides GGUF built-in template to fix raise_exception on non-standard formats
+        let chatTemplatePath = "\(localBinPath)/llama-chat-template.txt"
+        let chatTemplate = """
+        {%- for message in messages %}
+          {%- if message.role == "system" %}
+            {{- "<|im_start|>system\\n" + message.content + "<|im_end|>\\n" }}
+          {%- elif message.role == "user" %}
+            {{- "<|im_start|>user\\n" + message.content + "<|im_end|>\\n" }}
+          {%- elif message.role == "assistant" %}
+            {{- "<|im_start|>assistant\\n" + message.content + "<|im_end|>\\n" }}
+          {%- endif %}
+        {%- endfor %}
+        """
+        try chatTemplate.write(toFile: chatTemplatePath, atomically: true, encoding: .utf8)
     }
 }
