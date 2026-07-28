@@ -98,7 +98,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     // MARK: - Routing
     
     private func routeToProvider(providerId: String, request: MessagesRequest) async throws -> ProviderResponse {
-        let resolvedModel = resolveModel(request.model)
+        let resolvedModel = resolveModel(request.model, for: providerId)
         let apiKey = config.apiKey(for: providerId)
         let baseUrl = config.baseUrl(for: providerId)
         
@@ -268,7 +268,15 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     // MARK: - Helpers
     
-    private func resolveModel(_ incomingModel: String) -> String {
+    /// Resolve the incoming model name to the actual model to send to the provider.
+    /// For local providers (llamacpp, ollama, lmstudio, local) the tier mapping
+    /// (opus → modelOpus, sonnet → modelSonnet) is skipped — the default model
+    /// is used directly since the user is expected to configure it in Settings.
+    private func resolveModel(_ incomingModel: String, for providerId: String? = nil) -> String {
+        let localProviders = ["llamacpp", "lmstudio", "local", "ollama"]
+        if let pid = providerId, localProviders.contains(pid) {
+            return config.model
+        }
         let lower = incomingModel.lowercased()
         if incomingModel.contains("/") { return incomingModel }
         if lower.contains("opus"), !config.modelOpus.isEmpty { return config.modelOpus }

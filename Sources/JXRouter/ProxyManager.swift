@@ -386,8 +386,11 @@ final class ProxyManager {
         print("[Recovery] ═══ Recovery complete ═══")
     }
 
-    /// Kill every process listening on the given port.
+    /// Kill every process listening on the given port, EXCEPT the current process.
+    /// Without this filter, killing the port AFTER stopping the listener would
+    /// find our own PID and `kill -9` the app itself.
     private func recoverKillPort(_ port: Int) {
+        let selfPID = String(ProcessInfo.processInfo.processIdentifier)
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         task.arguments = ["-ti", ":\(port)", "-sTCP:LISTEN"]
@@ -402,6 +405,10 @@ final class ProxyManager {
                 .components(separatedBy: .newlines)
                 .filter { !$0.isEmpty }
             for pid in pids ?? [] {
+                guard pid != selfPID else {
+                    print("[Recovery] Skipping self PID \(pid)")
+                    continue
+                }
                 let killTask = Process()
                 killTask.executableURL = URL(fileURLWithPath: "/bin/kill")
                 killTask.arguments = ["-9", pid]

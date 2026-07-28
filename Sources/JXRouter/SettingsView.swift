@@ -53,43 +53,194 @@ struct SettingsView: View {
     @State private var availableInterfaces: [String] = []
     @State private var adminPassword: String = ""
     
+    // Local model server
+    @State private var lmProvider: String = "llamacpp"
+    @State private var lmModelPath: String = ""
+    @State private var lmPort: String = "8080"
+    @State private var lmBinaryPath: String = ""
+    @State private var lmStatus: String = "stopped"
+    private var lmStatusText: String {
+        switch lmStatus {
+        case "stopped": return "Stopped"
+        case "starting": return "Starting..."
+        case "running": return "Running"
+        case "failed": return "Failed"
+        default: return lmStatus
+        }
+    }
+    private var lmStatusColor: Color {
+        switch lmStatus {
+        case "stopped": return Color.dsTextTertiary
+        case "starting": return Color.orange
+        case "running": return Color.dsGreen
+        case "failed": return Color.dsRed
+        default: return Color.dsTextTertiary
+        }
+    }
+
     // Bot
     @State private var botIntegrationEnabled: Bool = false
     @State private var telegramBotToken: String = ""
 
-    let providerOptions = [
-        ("direct", "Direct (Anthropic)"),
-        ("opencode-zen", "OpenCode Zen"),
-        ("opencode-go", "OpenCode Go"),
-        ("openrouter", "OpenRouter"),
-        ("openai", "OpenAI / Codex"),
-        ("nvidia-nim", "NVIDIA NIM"),
-        ("deepseek", "DeepSeek"),
-        ("gemini", "Google Gemini"),
-        ("mistral", "Mistral"),
-        ("codestral", "Mistral Codestral"),
-        ("cohere", "Cohere"),
-        ("groq", "Groq"),
-        ("fireworks", "Fireworks AI"),
-        ("sambanova", "SambaNova"),
-        ("cerebras", "Cerebras"),
-        ("huggingface", "HuggingFace"),
-        ("xai", "xAI Grok"),
-        ("wafer", "Wafer"),
-        ("kimi", "Kimi API"),
-        ("kimi-code", "Kimi Code"),
-        ("minimax", "MiniMax"),
-        ("zai", "Z.ai"),
-        ("ollama-cloud", "Ollama Cloud"),
-        ("github-models", "GitHub Models"),
-        ("ai-gateway", "Vercel AI Gateway"),
-        ("local", "Local (Ollama)"),
-        ("lmstudio", "LM Studio"),
-        ("llamacpp", "llama.cpp"),
-    ]
+    /// Live models fetched from the provider's /v1/models API (e.g., llama.cpp
+    /// only exposes its loaded models when the server is actually running).
+    @State private var liveModels: [String] = []
 
-    /// Gather all known models from provider presets + user-visible models.
-    var knownModels: [String] {
+    /// Providers the user has actually configured — local-only providers are always
+    /// available; remote providers require a non-empty API key.
+    private var availableProviders: [ProviderPreset] {
+        ProviderPreset.all.filter { preset in
+            guard preset.requiresKey else { return true }
+            return !apiKeyForProvider(preset.id).isEmpty
+        }
+    }
+
+    /// Return the reactive @State key value for a provider, falling back to the
+    /// Keychain for providers without a dedicated secure field in the UI.
+    private func apiKeyForProvider(_ id: String) -> String {
+        switch id {
+        case "direct":       return anthropicKey
+        case "openrouter":   return openrouterKey
+        case "opencode-zen", "opencode-go": return opencodeKey
+        case "openai":       return openaiKey
+        case "nvidia-nim":   return nvidiaKey
+        case "deepseek":     return deepseekKey
+        case "gemini":       return geminiKey
+        case "mistral":      return mistralKey
+        case "codestral":    return codestralKey
+        case "cohere":       return cohereKey
+        case "groq":         return groqKey
+        case "fireworks":    return fireworksKey
+        case "sambanova":    return sambanovaKey
+        case "cerebras":     return cerebrasKey
+        case "huggingface":  return huggingfaceKey
+        case "xai":          return xaiKey
+        default:
+            // Providers without a @State binding — check Keychain directly
+            return config.apiKey(for: id)
+        }
+    }
+
+    /// Models for the currently selected provider — used in the Default Model and
+    /// Model Override dropdowns so they only show relevant options.
+    /// Merges preset models with live models from the provider's API.
+    var modelsForProvider: [String] {
+        var models = Set<String>()
+
+        // Preset models (always available)
+        let matchingPreset = ProviderPreset.all.first(where: {
+            $0.id == provider || $0.name.lowercased().contains(provider.lowercased())
+        })
+        if let preset = matchingPreset {
+            for m in preset.models { models.insert(m) }
+        }
+        // User-configured visible models
+        if let p = manager.providers.first(where: { $0.id == provider }) {
+            for m in p.visibleModelIds { models.insert(m) }
+        }
+        // Live models fetched from the provider's API
+        for m in liveModels { models.insert(m) }
+
+        return Array(models).sorted()
+    }
+
+    /// Models available across the entire provider chain (primary + fallbacks).
+    /// This ensures the default model you pick is a model that exists on every
+    /// provider in the chain, not just the primary.
+    /// Live models fetched from the provider's API are also included so that
+    /// local providers (llamacpp, ollama, lmstudio) show their running models.
+    var modelsForProviderChain: [String] {
+        let chainIds = providerChainIds
+        guard chainIds.count > 1 else { return modelsForProvider }
+
+        // Gather model sets for each provider in the chain
+        let chainSets: [Set<String>] = chainIds.compactMap { pid in
+            let preset = ProviderPreset.all.first(where: {
+                $0.id == pid || $0.name.lowercased().contains(pid.lowercased())
+            })
+            // Return the set of bare model names (strip any provider/ prefix)
+            guard let p = preset else { return nil }
+            let names = p.models.map { $0.contains("/") ? String($0.split(separator: "/").last!) : $0 }
+            return Set(names)
+        }
+        guard chainSets.count == chainIds.count else { return modelsForProvider }
+
+        // Intersect all sets — only models available on EVERY provider in the chain
+        var intersection = chainSets[0]
+        for s in chainSets.dropFirst() {
+            intersection = intersection.intersection(s)
+        }
+        // Also include live models so dynamically-discovered models (e.g. from
+        // a running local server) appear in the dropdown alongside chain models.
+        let live = Set(liveModels.map { $0.contains("/") ? String($0.split(separator: "/").last!) : $0 })
+        intersection.formUnion(live)
+        if !intersection.isEmpty {
+            return intersection.sorted()
+        }
+
+        // Fall back: show models from all providers in the chain merged
+        var merged = Set<String>()
+        for pid in chainIds {
+            if let preset = ProviderPreset.all.first(where: {
+                $0.id == pid || $0.name.lowercased().contains(pid.lowercased())
+            }) {
+                for m in preset.models { merged.insert(m) }
+            }
+        }
+        merged.formUnion(live)
+        return merged.sorted()
+    }
+
+    /// Resolved provider IDs for the full chain (primary + fallbacks).
+    private var providerChainIds: [String] {
+        let primary = provider
+        let fallbacks = fallbackProviders
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { !$0.isEmpty }
+            .map { ConfigManager.resolveProviderName($0) }
+        return [primary] + fallbacks
+    }
+
+    /// Fetch available models from a provider's /v1/models API.
+    /// For local providers (llamacpp, ollama, lmstudio) this discovers models
+    /// loaded by the running server. For remote providers (e.g. NVIDIA) the
+    /// API key is included in the request when available. Non-fatal on failure.
+    private func fetchLiveModels(for providerId: String? = nil) async {
+        let pid = providerId ?? provider
+        var baseUrl = config.baseUrl(for: pid).replacingOccurrences(of: "/v1", with: "")
+        // For llamacpp, honour the port configured in LocalModelManager so that
+        // a server started with a custom port is still discovered.
+        if pid == "llamacpp" {
+            let mgr = LocalModelManager.shared
+            if mgr.port != 8080 {
+                baseUrl = "http://\(mgr.host):\(mgr.port)"
+            }
+        }
+        guard let url = URL(string: "\(baseUrl)/v1/models") else { return }
+        do {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 5
+            // Include API key for providers that require auth on the models endpoint
+            let key = config.apiKey(for: pid)
+            if !key.isEmpty {
+                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            }
+            let (data, _) = try await URLSession.shared.data(for: req)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let modelList = json["data"] as? [[String: Any]] else { return }
+            let names = modelList.compactMap { $0["id"] as? String }
+            if !names.isEmpty {
+                await MainActor.run { liveModels = names }
+            }
+        } catch {
+            print("[SettingsView] Failed to fetch models from \(url): \(error)")
+        }
+    }
+
+    /// All known models across all providers (used for the broader "knownModels"
+    /// variable that was previously hardcoded).
+    var allModels: [String] {
         let presets = ProviderPreset.all
         var models = Set<String>()
         for preset in presets {
@@ -97,7 +248,6 @@ struct SettingsView: View {
                 models.insert(m.hasPrefix("\(preset.id)/") ? m : "\(preset.id)/\(m)")
             }
         }
-        // Merge in user-visible models from the providers tab
         for p in manager.providers {
             for m in p.visibleModelIds {
                 models.insert(m.hasPrefix("\(p.id)/") ? m : "\(p.id)/\(m)")
@@ -158,16 +308,34 @@ struct SettingsView: View {
         .background(Color.dsBackground)
         .onAppear {
             loadFromConfig()
+            // Ensure the saved provider is still configured; fall back to the
+            // first available one if its key was cleared outside this session.
+            if !availableProviders.contains(where: { $0.id == provider }) {
+                if let first = availableProviders.first {
+                    provider = first.id
+                }
+            }
             detectNetworkInterfaces()
+            Task { await fetchLiveModels() }
         }
         .onDisappear {
             saveConfig()
+        }
+        .onChange(of: provider) { _, newProvider in
+            Task { await fetchLiveModels(for: newProvider) }
         }
         .onChange(of: settingsHash) { _, newHash in 
             if !initialSettingsHash.isEmpty && newHash != initialSettingsHash {
                 hasUnsavedChanges = true
             }
-            saveConfig() 
+            saveConfig()
+            // If the current provider's key was cleared, fall back to the first
+            // available provider so the selection doesn't go stale.
+            if !availableProviders.contains(where: { $0.id == provider }) {
+                if let first = availableProviders.first {
+                    provider = first.id
+                }
+            }
         }
     }
 
@@ -219,7 +387,7 @@ struct SettingsView: View {
 
             sectionGroup("Model") {
                 labeledField("Default Model") {
-                    ComboBox(text: $model, options: knownModels)
+                    ComboBox(text: $model, options: modelsForProviderChain.isEmpty ? allModels : modelsForProviderChain)
                         .frame(height: 22)
                 }
                 Toggle(isOn: $enableThinking) {
@@ -230,14 +398,43 @@ struct SettingsView: View {
             }
 
             sectionGroup("Provider") {
-                Picker("Primary Provider", selection: $provider) {
-                    ForEach(providerOptions, id: \.0) { id, name in
-                        Text(name).tag(id)
+                HStack(spacing: 6) {
+                    // Selected provider icon — fills the full 22pt space, no boxing/cropping
+                    if let p = ProviderPreset.preset(for: provider) {
+                        Image(systemName: p.symbol)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 22, height: 22)
+                            .foregroundStyle(Color.dsAccent)
+                    }
+                    Menu {
+                        ForEach(availableProviders) { preset in
+                            Button {
+                                provider = preset.id
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: preset.symbol)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 16, height: 16)
+                                    Text(preset.name)
+                                }
+                            }
+                        }
+                    } label: {
+                        Text(ProviderPreset.preset(for: provider)?.name ?? provider)
+                            .font(.system(size: DesignToken.captionSize))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .frame(width: 240)
+                    .accessibilityLabel("Primary provider")
+                }
+                .onChange(of: provider) { _, newProvider in
+                    if let preset = ProviderPreset.all.first(where: { $0.id == newProvider || $0.name.lowercased().contains(newProvider.lowercased()) }) {
+                        model = preset.models.first ?? model
                     }
                 }
-                .pickerStyle(.menu)
-                .frame(width: 260)
-                .accessibilityLabel("Primary provider")
 
                 labeledField("Fallback Providers", caption: "Comma-separated") {
                     TextField("nvidia,local", text: $fallbackProviders)
@@ -248,16 +445,16 @@ struct SettingsView: View {
             sectionGroup("Model Overrides") {
                 HStack(spacing: DesignToken.spacing12) {
                     labeledField("model_opus") {
-                        ComboBox(text: $modelOpus, options: knownModels)
+                        ComboBox(text: $modelOpus, options: modelsForProviderChain.isEmpty ? allModels : modelsForProviderChain)
                             .frame(height: 22)
                     }
                     labeledField("model_sonnet") {
-                        ComboBox(text: $modelSonnet, options: knownModels)
+                        ComboBox(text: $modelSonnet, options: modelsForProviderChain.isEmpty ? allModels : modelsForProviderChain)
                             .frame(height: 22)
                     }
                 }
                 labeledField("model_haiku") {
-                    ComboBox(text: $modelHaiku, options: knownModels)
+                    ComboBox(text: $modelHaiku, options: modelsForProviderChain.isEmpty ? allModels : modelsForProviderChain)
                         .frame(height: 22)
                 }
             }
@@ -426,6 +623,99 @@ struct SettingsView: View {
                 if botIntegrationEnabled {
                     secureField("Telegram Bot Token", text: $telegramBotToken)
                 }
+            }
+
+            sectionGroup("Local Model Server") {
+                VStack(alignment: .leading, spacing: 8) {
+                    // Provider picker
+                    HStack {
+                        Text("Provider")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                        Spacer()
+                        Picker("", selection: $lmProvider) {
+                            Text("llama.cpp").tag("llamacpp")
+                            Text("Ollama").tag("ollama")
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+                    }
+
+                    // Model file path
+                    HStack {
+                        Text("Model File")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                        Spacer()
+                        Text(lmModelPath.isEmpty ? "None selected" : (lmModelPath as NSString).lastPathComponent)
+                            .font(.system(size: DesignToken.captionSize, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .foregroundStyle(lmModelPath.isEmpty ? Color.dsTextTertiary : Color.dsTextPrimary)
+                        Button("Browse") {
+                            browseForModel()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
+                    // Port (for llama.cpp)
+                    if lmProvider == "llamacpp" {
+                        HStack {
+                            Text("Port")
+                                .font(.system(size: DesignToken.captionSize, weight: .medium))
+                            Spacer()
+                            TextField("8080", text: $lmPort)
+                                .frame(width: 80)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: DesignToken.captionSize, design: .monospaced))
+                        }
+                    }
+
+                    // Binary path override
+                    HStack {
+                        Text("Binary Path")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                        Spacer()
+                        TextField("(auto-detect)", text: $lmBinaryPath)
+                            .frame(width: 200)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: DesignToken.captionSize, design: .monospaced))
+                            .help("Leave empty to auto-detect in PATH and common install locations")
+                    }
+
+                    // Status + Run/Stop
+                    HStack {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(lmStatusColor)
+                                .frame(width: 8, height: 8)
+                            Text(lmStatusText)
+                                .font(.system(size: DesignToken.captionSize, weight: .medium))
+                                .foregroundStyle(lmStatusColor)
+                        }
+
+                        Spacer()
+
+                        if lmStatus == "running" {
+                            Button("Stop", role: .destructive) {
+                                stopLocalModel()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        } else if lmStatus == "stopped" || lmStatus == "failed" {
+                            Button("Run") {
+                                startLocalModel()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(lmModelPath.isEmpty || lmStatus == "starting")
+                        } else if lmStatus == "starting" {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                        }
+                    }
+                }
+                .padding(.horizontal, DesignToken.spacing12)
+                .padding(.vertical, DesignToken.spacing8)
             }
 
             sectionGroup("Privilege Elevation") {
@@ -810,6 +1100,61 @@ struct SettingsView: View {
             return "\(minutes)m \(seconds)s"
         } else {
             return "\(seconds)s"
+        }
+    }
+
+    // MARK: - Local Model Server
+
+    private func browseForModel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.data]
+        panel.message = "Select a GGUF model file"
+        panel.directoryURL = URL(fileURLWithPath: NSString(string: LocalModelManager.shared.modelDirectory).expandingTildeInPath)
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let path = url.path
+        lmModelPath = path
+        LocalModelManager.shared.setModelPathFromFile(path)
+        LocalModelManager.shared.port = Int(lmPort) ?? 8080
+    }
+
+    private func startLocalModel() {
+        let manager = LocalModelManager.shared
+        manager.modelPath = lmModelPath
+        manager.port = Int(lmPort) ?? 8080
+        manager.customBinaryPath = lmBinaryPath
+        manager.provider = LocalModelManager.LocalProvider(rawValue: lmProvider) ?? .llamacpp
+
+        lmStatus = "starting"
+        Task {
+            await manager.start()
+            updateLMStatus()
+        }
+    }
+
+    private func stopLocalModel() {
+        LocalModelManager.shared.stop()
+        lmStatus = "stopped"
+    }
+
+    private func refreshLocalModelStatus() {
+        updateLMStatus()
+    }
+
+    private func syncBinaryPathToManager() {
+        LocalModelManager.shared.customBinaryPath = lmBinaryPath
+    }
+
+    private func updateLMStatus() {
+        let mgr = LocalModelManager.shared
+        switch mgr.status {
+        case .stopped: lmStatus = "stopped"
+        case .starting: lmStatus = "starting"
+        case .running: lmStatus = "running"
+        case .failed(let msg): lmStatus = "failed: \(msg)"
         }
     }
 }

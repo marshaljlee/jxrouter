@@ -13,7 +13,21 @@ struct ProviderPreset: Identifiable, Hashable {
         ProviderPreset(id: "opencode-zen", name: "OpenCode Zen", symbol: "sparkle.magnifyingglass", defaultUrl: "https://zen.opencode.ai/v1", models: ["big-pickle", "big-pickle-turbo", "big-pickle-reasoning", "opus-4.5", "sonnet-4.5", "haiku-3.5"], requiresKey: false),
         ProviderPreset(id: "opencode-go", name: "OpenCode Go", symbol: "sparkle.magnifyingglass", defaultUrl: "https://oai.opencode.ai/v1", models: ["opencode/big-pickle", "opencode/big-pickle-reasoning"], requiresKey: false),
         ProviderPreset(id: "direct", name: "Anthropic Direct", symbol: "person.fill", defaultUrl: "https://api.anthropic.com/v1", models: ["claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-3-5"], requiresKey: true),
-        ProviderPreset(id: "nvidia-nim", name: "NVIDIA NIM", symbol: "cube.fill", defaultUrl: "https://integrate.api.nvidia.com/v1", models: ["nvidia/llama-3.1-nemotron-ultra-513b-v1", "nvidia/nemotron-3-ultra-550b-a55b", "meta/llama-4-maverick", "meta/llama-4-scout"], requiresKey: true),
+        ProviderPreset(id: "nvidia-nim", name: "NVIDIA NIM", symbol: "cube.fill", defaultUrl: "https://integrate.api.nvidia.com/v1", models: [
+            "nvidia/llama-3.1-nemotron-ultra-513b-v1",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "meta/llama-4-maverick",
+            "meta/llama-4-scout",
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-405b-instruct",
+            "mistralai/mistral-large-24-11",
+            "google/gemma-2-27b-it",
+            "microsoft/phi-3.5-mini-instruct",
+            "deepseek-ai/deepseek-r1",
+            "qwen/qwen2.5-72b-instruct",
+            "qwen/qwen2.5-coder-32b-instruct",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+        ], requiresKey: true),
         ProviderPreset(id: "openrouter", name: "OpenRouter", symbol: "arrow.triangle.branch", defaultUrl: "https://openrouter.ai/api/v1", models: ["openrouter/auto", "anthropic/claude-opus-4.5", "openai/gpt-4o"], requiresKey: true),
         ProviderPreset(id: "openai", name: "OpenAI / Codex", symbol: "brain", defaultUrl: "https://api.openai.com/v1", models: ["gpt-4o", "gpt-4o-mini", "o3"], requiresKey: true),
         ProviderPreset(id: "deepseek", name: "DeepSeek", symbol: "fleuron", defaultUrl: "https://api.deepseek.com/v1", models: ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"], requiresKey: true),
@@ -37,7 +51,7 @@ struct ProviderPreset: Identifiable, Hashable {
         ProviderPreset(id: "ai-gateway", name: "Vercel AI Gateway", symbol: "arrow.triangle.branch", defaultUrl: "https://gateway.ai.vercel.ai/v1", models: ["vercel/openai/gpt-5.5"], requiresKey: true),
         ProviderPreset(id: "ollama", name: "Ollama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:11434/v1", models: ["qwen3:latest", "qwen2.5:latest", "llama3.2:latest", "mistral:latest"], requiresKey: false),
         ProviderPreset(id: "lmstudio", name: "LM Studio (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1234/v1", models: ["lmstudio/<model-id>"], requiresKey: false),
-        ProviderPreset(id: "llamacpp", name: "llama.cpp (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: ["llamacpp/<model-id>"], requiresKey: false),
+        ProviderPreset(id: "llamacpp", name: "llama.cpp (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: [], requiresKey: false),
     ]
 
     static func preset(for id: String) -> ProviderPreset? {

@@ -21,12 +21,19 @@ final class CurlClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         
-        var args = ["-i", "-s", "-N", "--max-time", "30", "-X", method]
+        var args = ["-i", "-s", "-N", "--max-time", "30", "--connect-timeout", "10", "-X", method]
         
         if let ip = resolveIP, let host = url.host {
-            let port = url.port ?? (url.scheme == "https" ? 443 : 80)
-            args.append("--resolve")
-            args.append("\(host):\(port):\(ip)")
+            // Only use --resolve when the host is a named host, not a raw IP.
+            // curl's --resolve expects <hostname>:<port>:<ip> — passing an IP
+            // as the hostname causes a silent failure.
+            let isIP = host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0"
+                || host.allSatisfy({ $0.isASCII && ($0.isNumber || $0 == "." || $0 == ":") })
+            if !isIP {
+                let port = url.port ?? (url.scheme == "https" ? 443 : 80)
+                args.append("--resolve")
+                args.append("\(host):\(port):\(ip)")
+            }
         }
         
         for (key, value) in headers {
