@@ -1,6 +1,9 @@
 # JXProxy
 
-A lightweight, system-wide proxy and DNS redirector for macOS that transparently routes AI API requests (Anthropic, OpenAI, etc.) to your preferred LLM provider. Powered by the **JXProxy** native macOS app.
+A lightweight, cross-platform proxy that transparently routes AI API requests (Anthropic, OpenAI, etc.) to your preferred LLM provider.
+
+- **macOS** — Native SwiftUI menu-bar app with dashboard, settings, live traffic logs, system proxy, and DNS hijacking
+- **Android/Termux** — Python-based CLI proxy with the same provider routing engine, 20+ providers, SSE streaming, and fallback chains
 
 Run **Claude Code**, **Codex**, or any AI coding agent through your own provider-backed proxy with a native macOS UI — no web admin required.
 
@@ -21,7 +24,15 @@ Run **Claude Code**, **Codex**, or any AI coding agent through your own provider
 
 ## Quick Start
 
-### 1. Install
+### macOS
+
+#### 1. Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marshaljlee/jxrouter/main/install.sh | bash
+```
+
+Or from a local clone:
 
 ```bash
 ./install.sh
@@ -29,7 +40,7 @@ Run **Claude Code**, **Codex**, or any AI coding agent through your own provider
 
 This builds the app, installs it to `/Applications`, creates CLI launcher scripts in `~/.local/bin/`, and configures your shell PATH.
 
-### 2. Start JXProxy
+#### 2. Start JXProxy
 
 Open **JXProxy** from your Applications folder or the desktop shortcut:
 
@@ -49,6 +60,49 @@ Default settings:
 - **Port:** 5255
 - **Auth Token:** jxproxy
 - **Default Provider:** OpenCode Zen
+
+---
+
+### Android (Termux)
+
+#### 1. Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marshaljlee/jxrouter/main/install-termux.sh | bash
+```
+
+The install script validates the ARM64 environment, installs Python dependencies via `pkg`, creates all CLI launchers, configures shell exports, and runs a functional test.
+
+#### 2. Start JXProxy
+
+```bash
+jxserver
+```
+
+#### 3. Set an API Key
+
+```bash
+export OPENCODE_API_KEY="your-key-here"
+# Or persist it:
+jxproxy config set api_key_opencode=your-key-here
+```
+
+#### 4. Run Your Coding Agent
+
+**Claude Code:**
+```bash
+jxclaude
+```
+
+**Codex:**
+```bash
+jxcodex
+```
+
+**Pi Coding Agent:**
+```bash
+jxpi
+```
 
 ### 3. Configure a Provider
 
@@ -205,12 +259,23 @@ JXProxy acts as a local gateway:
 
 ## Requirements
 
+### macOS
 - macOS 14.0+
 - Xcode Command Line Tools (`xcode-select --install`)
+
+### Android
+- Android 8.0+ (ARM64 recommended)
+- [Termux](https://f-droid.org/packages/com.termux/) installed from F-Droid
+- Optional: [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) for auto-start
+
+### AI Coding Agents (optional — any platform)
 - Claude Code: `npm install -g @anthropic-ai/claude-code`
-- Codex: Install from [chatgpt.com/codex](https://chatgpt.com/codex)
+- Codex CLI: Install from [chatgpt.com/codex](https://chatgpt.com/codex)
+- Pi Coding Agent: `curl -fsSL https://pi.dev/install.sh | sh`
 
 ## Uninstall
+
+### macOS
 
 ```bash
 ./uninstall.sh
@@ -221,6 +286,15 @@ Or manually:
 2. Delete `/Applications/JXRouter.app`
 3. Remove `~/.local/bin/jxproxy-*`
 4. Clean up shell config
+
+### Android (Termux)
+
+```bash
+jxproxy stop
+rm -f ~/.local/bin/jxproxy*
+rm -rf ~/.config/jxproxy
+# Remove shell config from ~/.zshrc or ~/.bashrc
+```
 
 ## Credits
 
