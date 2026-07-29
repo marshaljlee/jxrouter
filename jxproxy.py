@@ -1610,12 +1610,17 @@ class ProxyServer:
     start_time: float = 0.0
     request_count: int = 0
 
+    # Local provider IDs that need keepalive pings to stay loaded.
+    _LOCAL_PROVIDERS = {"local", "ollama", "lmstudio", "llamacpp"}
+
     def __init__(self, config: ConfigManager):
         self.config = config
         self.router = ProviderRouter(config)
         self.httpd: ThreadedHTTPServer | None = None
         self._running = False
         self._thread: threading.Thread | None = None
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_stop = threading.Event()
 
     def start(self, port: int | None = None) -> bool:
         if self._running:
@@ -1646,13 +1651,77 @@ class ProxyServer:
 
             self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
             self._thread.start()
+
+            # Start keepalive for local models (Ollama, llama.cpp, LM Studio)
+            self._start_keepalive()
+
             return True
         except OSError as e:
             log(f"Failed to start server: {e}", "error")
             self._running = False
             return False
 
+    def _start_keepalive(self):
+        """Start a background thread that pings local model endpoints periodically
+        to prevent Ollama/llama.cpp from unloading the model from GPU memory."""
+        # Check if any local provider is in the active chain
+        chain = self.config.get_provider_chain()
+        local_in_chain = any(p in self._LOCAL_PROVIDERS for p in chain)
+        if not local_in_chain:
+            log("No local provider in chain — keepalive not needed", "debug")
+            return
+
+        # Determine which local endpoints to ping
+        local_endpoints = []
+        for pid in self._LOCAL_PROVIDERS:
+            if pid in chain:
+                base = self.config.base_url_for(pid)
+                if base:
+                    # Strip /v1 suffix if present for health endpoint
+                    health = base.rstrip('/')
+                    if health.endswith('/v1'):
+                        health = health[:-3]
+                    local_endpoints.append((pid, health))
+
+        if not local_endpoints:
+            return
+
+        self._keepalive_stop.clear()
+
+        def _keepalive_worker():
+            log(f"Keepalive started for local models: {[e[0] for e in local_endpoints]}", "info")
+            while not self._keepalive_stop.is_set():
+                for pid, base in local_endpoints:
+                    if self._keepalive_stop.is_set():
+                        break
+                    # Ping /v1/models or /api/tags (Ollama) to keep model alive
+                    for path in ("/v1/models", "/api/tags", "/health"):
+                        url = f"{base}{path}"
+                        try:
+                            req = urllib.request.Request(url)
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                if resp.status == 200:
+                                    log(f"Keepalive OK — {pid}{path}", "debug")
+                                    break
+                        except Exception:
+                            continue
+
+                # Wait 30 seconds between keepalive cycles
+                # Ollama default keepalive is 5min; 30s is well within that.
+                self._keepalive_stop.wait(timeout=30)
+
+            log("Keepalive stopped", "info")
+
+        self._keepalive_thread = threading.Thread(
+            target=_keepalive_worker, daemon=True, name="jxproxy-keepalive"
+        )
+        self._keepalive_thread.start()
+
     def stop(self):
+        log("Shutting down keepalive…", "debug")
+        self._keepalive_stop.set()
+        self._keepalive_thread = None
+
         if self.httpd and self._running:
             log("Shutting down proxy…", "info")
             self.httpd.shutdown()

@@ -92,6 +92,13 @@ final class ProxyServer: @unchecked Sendable {
     private var autoRestartCount = 0
     private let maxAutoRestarts = 10
 
+    /// Keepalive task that pings local model endpoints so Ollama/llama.cpp
+    /// doesn't unload the model from GPU memory while the proxy is running.
+    private var keepaliveTask: Task<Void, Never>?
+
+    /// Local provider identifiers whose backends need keepalive pings.
+    private let localProviderIDs: Set<String> = ["local", "ollama", "lmstudio", "llamacpp"]
+
     private var activeConnections: [UUID: NWConnection] = [:]
     private var appConnectionCounts: [String: Int] = [:]
 
@@ -167,12 +174,18 @@ final class ProxyServer: @unchecked Sendable {
             }
         }
 
+        // Start keepalive for local models (Ollama, llama.cpp, LM Studio)
+        startKeepalive()
+
         print("[ProxyServer] HTTP proxy started on port \(port)")
     }
 
     func stop() {
         userInitiatedStop = true
         stopWatchdog()
+
+        // Stop keepalive pings
+        stopKeepalive()
 
         // Stop HTTP proxy listener
         httpListener?.cancel()
@@ -254,6 +267,71 @@ final class ProxyServer: @unchecked Sendable {
 
     private func stopWatchdog() {
         // Disabled
+    }
+
+    // MARK: - Local Model Keepalive
+
+    /// Start periodic pings to local model endpoints so Ollama/llama.cpp
+    /// keep the model loaded in GPU memory while the proxy is running.
+    /// Pings every 30 seconds (Ollama default keepalive is 5 min).
+    private func startKeepalive() {
+        // Determine which local endpoints to ping based on provider chain.
+        let cfg = ConfigManager.shared
+        let chain = [cfg.provider] + cfg.fallbackProviders.components(separatedBy: ",").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+
+        var endpoints: [(String, String)] = []
+        for pid in localProviderIDs {
+            if chain.contains(pid) {
+                var base = cfg.baseUrl(for: pid)
+                if !base.isEmpty {
+                    // Strip /v1 suffix for health endpoint
+                    if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+                    endpoints.append((pid, base))
+                }
+            }
+        }
+
+        guard !endpoints.isEmpty else {
+            print("[Keepalive] No local provider in chain — keepalive not needed")
+            return
+        }
+
+        print("[Keepalive] Started for local models: \(endpoints.map { $0.0 })")
+
+        keepaliveTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                for (pid, base) in endpoints {
+                    if Task.isCancelled { break }
+                    // Try /v1/models, /api/tags (Ollama), /health
+                    let paths = ["/v1/models", "/api/tags", "/health"]
+                    for path in paths {
+                        guard let url = URL(string: "\(base)\(path)") else { continue }
+                        do {
+                            var req = URLRequest(url: url)
+                            req.timeoutInterval = 5
+                            let (_, resp) = try await URLSession.shared.data(for: req)
+                            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                                print("[Keepalive] OK — \(pid)\(path)")
+                                break
+                            }
+                        } catch {
+                            continue
+                        }
+                    }
+                }
+                // Sleep 30 seconds between cycles
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+            print("[Keepalive] Stopped")
+        }
+    }
+
+    private func stopKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
     }
 
     private func checkWatchdog() async throws {
