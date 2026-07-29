@@ -138,6 +138,21 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.localLlmModel); publish() }
     }
 
+    /// Override chat template for local GGUF models that have a broken
+    /// baked-in template (e.g. raise_exception block).
+    /// If empty, uses the model's built-in template.
+    /// Can reference an env var with $ENV_VAR syntax.
+    var chatTemplate: String {
+        get {
+            let raw = defaults.string(forKey: "chatTemplate") ?? ""
+            if raw.hasPrefix("$") {
+                return ProcessInfo.processInfo.environment[String(raw.dropFirst())] ?? ""
+            }
+            return raw
+        }
+        set { defaults.set(newValue, forKey: "chatTemplate"); publish() }
+    }
+
     /// Auth token for proxy authentication.
     var authToken: String {
         get { defaults.string(forKey: UDKey.authToken) ?? "jxproxy" }

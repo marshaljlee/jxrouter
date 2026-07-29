@@ -139,9 +139,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "deepseek", "gemini", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway":
             return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "local", "ollama":
-            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false, chatTemplate: config.chatTemplate)
         case "lmstudio", "llamacpp":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: "", baseUrl: baseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: model, apiKey: "", baseUrl: baseUrl, isOpenRouter: false, chatTemplate: config.chatTemplate)
         default:
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Unknown provider: \(providerId)")
         }
@@ -173,8 +173,15 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool) async throws -> ProviderResponse {
-        let openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model)
+    private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool, chatTemplate: String = "") async throws -> ProviderResponse {
+        var openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model)
+        
+        // Inject chat_template override for local GGUF models with broken
+        // baked-in templates (e.g. raise_exception blocks).
+        if !chatTemplate.isEmpty {
+            openaiBody["chat_template"] = chatTemplate
+            print("[ProviderRouter] Using chat_template override for local model")
+        }
         
         let url = URL(string: "\(baseUrl)/chat/completions")!
         let host = url.host ?? "api.openai.com"

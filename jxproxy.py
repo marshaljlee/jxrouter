@@ -388,6 +388,22 @@ class ConfigManager:
         self._config["local_llm_model"] = val
         self._save()
 
+    @property
+    def chat_template(self) -> str:
+        """Override chat template for local GGUF models that have a broken
+        baked-in template (e.g. raise_exception block). If empty, uses the
+        model's built-in template."""
+        val = self._config.get("chat_template", "")
+        if val and val.startswith("$"):
+            # Expand $ENV_VAR references
+            return os.environ.get(val[1:], "")
+        return val
+
+    @chat_template.setter
+    def chat_template(self, val: str):
+        self._config["chat_template"] = val
+        self._save()
+
     # ── API Key Access ───────────────────────────────────────────────────
 
     def get_api_key(self, provider_id: str) -> str:
@@ -966,6 +982,16 @@ class ProviderRouter:
                               base_url: str, req: "MessagesRequest",
                               is_openrouter: bool) -> dict:
         openai_body = MessageTranslator.to_openai(req.json, model)
+
+        # Inject chat_template override for local GGUF models with broken
+        # baked-in templates (e.g. raise_exception blocks).
+        local_providers = {"local", "ollama", "lmstudio", "llamacpp"}
+        if provider_id in local_providers:
+            ct = self.config.chat_template
+            if ct:
+                openai_body["chat_template"] = ct
+                log(f"Using chat_template override for {provider_id}", "debug")
+
         url = f"{base_url}/chat/completions"
         host = urlparse(url).hostname or "api.openai.com"
         ip = DirectDNSResolver.resolve(host) or host
