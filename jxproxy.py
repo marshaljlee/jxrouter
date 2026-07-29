@@ -986,11 +986,18 @@ class ProviderRouter:
         # Inject chat_template override for local GGUF models with broken
         # baked-in templates (e.g. raise_exception blocks).
         local_providers = {"local", "ollama", "lmstudio", "llamacpp"}
+        ollama_providers = {"local", "ollama"}
         if provider_id in local_providers:
             ct = self.config.chat_template
             if ct:
                 openai_body["chat_template"] = ct
                 log(f"Using chat_template override for {provider_id}", "debug")
+
+        # For Ollama: keep model loaded by setting keep_alive=-1.
+        # Without this, Ollama unloads after 5 min of inactivity.
+        # llama.cpp ignores this field — harmless.
+        if provider_id in ollama_providers:
+            openai_body["keep_alive"] = -1
 
         url = f"{base_url}/chat/completions"
         host = urlparse(url).hostname or "api.openai.com"
@@ -1688,53 +1695,57 @@ class ProxyServer:
             return False
 
     def _start_keepalive(self):
-        """Start a background thread that pings local model endpoints periodically
-        to prevent Ollama/llama.cpp from unloading the model from GPU memory."""
-        # Check if any local provider is in the active chain
+        """Keep local model loaded while proxy runs.
+
+        - llama.cpp: model stays loaded for server process lifetime — no-op.
+        - LM Studio: model stays loaded while app is open — no-op.
+        - Ollama: sends a tiny inference every 120s to keep model resident.
+          (Listing /v1/models does NOT keep a model alive.)
+        """
         chain = self.config.get_provider_chain()
-        local_in_chain = any(p in self._LOCAL_PROVIDERS for p in chain)
-        if not local_in_chain:
-            log("No local provider in chain — keepalive not needed", "debug")
+
+        # Only Ollama needs keepalive. llama.cpp/LM Studio keep the model
+        # loaded for the server/process lifetime naturally.
+        if "ollama" not in chain and "local" not in chain:
+            log("Keepalive not needed — provider keeps model loaded natively", "debug")
             return
 
-        # Determine which local endpoints to ping
-        local_endpoints = []
-        for pid in self._LOCAL_PROVIDERS:
-            if pid in chain:
-                base = self.config.base_url_for(pid)
-                if base:
-                    # Strip /v1 suffix if present for health endpoint
-                    health = base.rstrip('/')
-                    if health.endswith('/v1'):
-                        health = health[:-3]
-                    local_endpoints.append((pid, health))
-
-        if not local_endpoints:
-            return
+        # Build Ollama keepalive inference URL
+        base = self.config.base_url_for("ollama")
+        if not base:
+            base = "http://127.0.0.1:11434/v1"
+        base = base.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        chat_url = f"{base}/v1/chat/completions"
+        model_name = self.config.local_llm_model
 
         self._keepalive_stop.clear()
 
         def _keepalive_worker():
-            log(f"Keepalive started for local models: {[e[0] for e in local_endpoints]}", "info")
+            log("Keepalive: sending inference pings to Ollama every 120s", "info")
             while not self._keepalive_stop.is_set():
-                for pid, base in local_endpoints:
-                    if self._keepalive_stop.is_set():
-                        break
-                    # Ping /v1/models or /api/tags (Ollama) to keep model alive
-                    for path in ("/v1/models", "/api/tags", "/health"):
-                        url = f"{base}{path}"
-                        try:
-                            req = urllib.request.Request(url)
-                            with urllib.request.urlopen(req, timeout=5) as resp:
-                                if resp.status == 200:
-                                    log(f"Keepalive OK — {pid}{path}", "debug")
-                                    break
-                        except Exception:
-                            continue
+                body = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                    "keep_alive": -1,
+                }
+                try:
+                    data = json.dumps(body).encode()
+                    req = urllib.request.Request(
+                        chat_url, data=data,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        if resp.status == 200:
+                            log("Keepalive: inference ping OK — model kept alive", "debug")
+                except Exception as e:
+                    log(f"Keepalive: ping failed — {e}", "warn")
 
-                # Wait 30 seconds between keepalive cycles
-                # Ollama default keepalive is 5min; 30s is well within that.
-                self._keepalive_stop.wait(timeout=30)
+                self._keepalive_stop.wait(timeout=120)
 
             log("Keepalive stopped", "info")
 

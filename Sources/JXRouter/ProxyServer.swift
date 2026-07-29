@@ -271,59 +271,65 @@ final class ProxyServer: @unchecked Sendable {
 
     // MARK: - Local Model Keepalive
 
-    /// Start periodic pings to local model endpoints so Ollama/llama.cpp
-    /// keep the model loaded in GPU memory while the proxy is running.
-    /// Pings every 30 seconds (Ollama default keepalive is 5 min).
+    /// Keep the local model loaded while the proxy runs.
+    ///
+    /// - **llama.cpp**: Model stays loaded for the server process lifetime.
+    ///   No keepalive needed — this is a no-op.
+    /// - **Ollama**: Unloads model after 5 min idle by default. We send a
+    ///   tiny inference request every 120s to keep it resident.
+    /// - **LM Studio**: Model stays loaded while app is open. No keepalive.
     private func startKeepalive() {
-        // Determine which local endpoints to ping based on provider chain.
         let cfg = ConfigManager.shared
-        let chain = [cfg.provider] + cfg.fallbackProviders.components(separatedBy: ",").map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
+        let chain = ([cfg.provider] + cfg.fallbackProviders
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) })
 
-        var endpoints: [(String, String)] = []
-        for pid in localProviderIDs {
-            if chain.contains(pid) {
-                var base = cfg.baseUrl(for: pid)
-                if !base.isEmpty {
-                    // Strip /v1 suffix for health endpoint
-                    if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
-                    endpoints.append((pid, base))
-                }
-            }
-        }
-
-        guard !endpoints.isEmpty else {
-            print("[Keepalive] No local provider in chain — keepalive not needed")
+        // Only Ollama needs keepalive pings. llama.cpp/LM Studio keep the
+        // model loaded for the server/process lifetime naturally.
+        guard chain.contains("ollama") else {
+            print("[Keepalive] Not needed — \(cfg.provider) keeps model loaded natively")
             return
         }
 
-        print("[Keepalive] Started for local models: \(endpoints.map { $0.0 })")
+        // Build base URL for Ollama keepalive inference pings
+        var base = cfg.baseUrl(for: "ollama")
+        if base.isEmpty { base = "http://127.0.0.1:11434/v1" }
+        if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+        let chatURL = "\(base)/v1/chat/completions"
+
+        print("[Keepalive] Sending keepalive inference to Ollama every 120s")
 
         keepaliveTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                for (pid, base) in endpoints {
-                    if Task.isCancelled { break }
-                    // Try /v1/models, /api/tags (Ollama), /health
-                    let paths = ["/v1/models", "/api/tags", "/health"]
-                    for path in paths {
-                        guard let url = URL(string: "\(base)\(path)") else { continue }
-                        do {
-                            var req = URLRequest(url: url)
-                            req.timeoutInterval = 5
-                            let (_, resp) = try await URLSession.shared.data(for: req)
-                            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-                                print("[Keepalive] OK — \(pid)\(path)")
-                                break
-                            }
-                        } catch {
-                            continue
-                        }
-                    }
+                // Send a real (but minimal) inference to keep the model alive.
+                // Listing models (/v1/models) does NOT keep a model resident.
+                let body: [String: Any] = [
+                    "model": cfg.localLlmModel,
+                    "messages": [["role": "user", "content": "hi"]],
+                    "max_tokens": 1,
+                    "stream": false,
+                    "keep_alive": -1,
+                ]
+                guard let url = URL(string: chatURL),
+                      let jsonData = try? JSONSerialization.data(withJSONObject: body) else {
+                    try? await Task.sleep(nanoseconds: 120_000_000_000)
+                    continue
                 }
-                // Sleep 30 seconds between cycles
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.httpBody = jsonData
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.timeoutInterval = 30
+                do {
+                    let (_, resp) = try await URLSession.shared.data(for: req)
+                    if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                        print("[Keepalive] Inference ping OK — model kept alive")
+                    }
+                } catch {
+                    print("[Keepalive] Ping failed: \(error.localizedDescription)")
+                }
+                try? await Task.sleep(nanoseconds: 120_000_000_000) // 2 min
             }
             print("[Keepalive] Stopped")
         }

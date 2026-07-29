@@ -139,8 +139,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "deepseek", "gemini", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway":
             return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "local", "ollama":
-            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false, chatTemplate: config.chatTemplate)
+            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false, chatTemplate: config.chatTemplate, keepAlive: true)
         case "lmstudio", "llamacpp":
+            // llama.cpp server keeps model loaded for process lifetime — no keep_alive needed
             return try await routeToOpenAICompatible(request: request, model: model, apiKey: "", baseUrl: baseUrl, isOpenRouter: false, chatTemplate: config.chatTemplate)
         default:
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Unknown provider: \(providerId)")
@@ -173,7 +174,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool, chatTemplate: String = "") async throws -> ProviderResponse {
+    private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool, chatTemplate: String = "", keepAlive: Bool = false) async throws -> ProviderResponse {
         var openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model)
         
         // Inject chat_template override for local GGUF models with broken
@@ -181,6 +182,12 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         if !chatTemplate.isEmpty {
             openaiBody["chat_template"] = chatTemplate
             print("[ProviderRouter] Using chat_template override for local model")
+        }
+        
+        // For Ollama: keep model loaded forever by setting keep_alive=-1.
+        // Without this, Ollama unloads the model after 5 min of inactivity.
+        if keepAlive {
+            openaiBody["keep_alive"] = -1
         }
         
         let url = URL(string: "\(baseUrl)/chat/completions")!
