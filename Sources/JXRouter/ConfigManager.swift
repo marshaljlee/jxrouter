@@ -1,6 +1,44 @@
 import Foundation
 import Observation
 
+/// Per-provider reasoning pass-through policy.
+///
+/// - `.auto` (default): reasoning is requested/surfaced only for providers and
+///   models that are reasoning-capable (`MessageTranslator.isReasoningCapable`).
+/// - `.on`: always pass reasoning through (thinking blocks preserved).
+/// - `.off`: never request or surface reasoning.
+///
+/// The global `ConfigManager.enableThinking` toggle acts as a master switch on
+/// top of this per-provider policy.
+enum ReasoningPolicy: String, CaseIterable {
+    case auto = "auto"
+    case on = "on"
+    case off = "off"
+
+    var displayName: String {
+        switch self {
+        case .auto: return "Auto"
+        case .on: return "On"
+        case .off: return "Off"
+        }
+    }
+}
+
+/// A user-defined OpenAI-compatible provider (name + endpoint + key). The API
+/// key is stored separately in the Keychain (account = customProviderKey(id));
+/// the name and base URL live in a JSON list in UserDefaults.
+struct CustomProviderDef: Identifiable, Codable, Equatable, Hashable {
+    var id: String
+    var name: String
+    var baseUrl: String
+
+    init(id: String, name: String, baseUrl: String) {
+        self.id = id
+        self.name = name
+        self.baseUrl = baseUrl
+    }
+}
+
 /// Shared configuration manager for JXProxy.
 ///
 /// - **Secrets** (API keys, auth tokens) are stored in the macOS Keychain.
@@ -19,16 +57,20 @@ final class ConfigManager: @unchecked Sendable {
         static let modelSonnet = "modelSonnet"
         static let modelHaiku = "modelHaiku"
         static let enableThinking = "enableThinking"
+        static let reasoningPolicyJSON = "reasoningPolicyJSON"
         static let fallbackProviders = "fallbackProviders"
+        static let tierProvidersJSON = "tierProvidersJSON"
         static let openaiBaseUrl = "openaiBaseUrl"
         static let localLlmBaseUrl = "localLlmBaseUrl"
         static let localLlmModel = "localLlmModel"
         static let authToken = "authToken"
+        static let authTokenResetDone = "authTokenResetDone"
         static let appRoutesJSON = "appRoutesJSON"
         static let hasMigrated = "hasMigratedFromConfigEnv"
         static let enabledProviders = "enabledProviders"
         static let visibleModels = "visibleModels"
         static let providerBackendUrls = "providerBackendUrls"
+        static let customProviders = "customProvidersJSON"
         static let mitmHosts = "mitmHosts"
         static let dnsRedirect = "dnsRedirectEnabled"
         static let botIntegrationEnabled = "botIntegrationEnabled"
@@ -61,8 +103,10 @@ final class ConfigManager: @unchecked Sendable {
         static let zai = "ZAI_API_KEY"
         static let ollamaCloud = "OLLAMA_API_KEY"
         static let aiGateway = "AI_GATEWAY_API_KEY"
+        static let custom = "CUSTOM_API_KEY"
         static let telegramBotToken = "TELEGRAM_BOT_TOKEN"
         static let adminPassword = "ADMIN_PASSWORD"
+        static let authToken = "JXPROXY_AUTH_TOKEN"
     }
 
     /// UserDefaults key for storing API keys JSON dictionary.
@@ -86,38 +130,120 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Default model name.
     var model: String {
-        get { defaults.string(forKey: UDKey.model) ?? "big-pickle" }
+        get { defaults.string(forKey: UDKey.model) ?? "" }
         set { defaults.set(newValue, forKey: UDKey.model); publish() }
     }
 
     /// Model override for opus-tier.
     var modelOpus: String {
-        get { defaults.string(forKey: UDKey.modelOpus) ?? "opencode/big-pickle" }
+        get { defaults.string(forKey: UDKey.modelOpus) ?? "" }
         set { defaults.set(newValue, forKey: UDKey.modelOpus); publish() }
     }
 
     /// Model override for sonnet-tier.
     var modelSonnet: String {
-        get { defaults.string(forKey: UDKey.modelSonnet) ?? "opencode/big-pickle-reasoning" }
+        get { defaults.string(forKey: UDKey.modelSonnet) ?? "" }
         set { defaults.set(newValue, forKey: UDKey.modelSonnet); publish() }
     }
 
     /// Model override for haiku-tier.
     var modelHaiku: String {
-        get { defaults.string(forKey: UDKey.modelHaiku) ?? "opencode/big-pickle-turbo" }
+        get { defaults.string(forKey: UDKey.modelHaiku) ?? "" }
         set { defaults.set(newValue, forKey: UDKey.modelHaiku); publish() }
     }
 
-    /// Enable model thinking / reasoning.
+    /// Master switch for pass-through reasoning content. When on, upstream
+    /// `reasoning_content` (DeepSeek, OpenCode, etc.) is translated into Anthropic
+    /// `thinking` blocks so thinking tokens are preserved; when off, reasoning is
+    /// never requested or surfaced (except as a last resort in non-streaming
+    /// responses whose content would otherwise be empty). Reasoning is also
+    /// skipped for tool-calling turns — reasoning + function calling is
+    /// unsupported by many upstream providers (e.g. DeepSeek-R1).
+    /// The per-provider `ReasoningPolicy` (default `.auto`) refines this switch.
     var enableThinking: Bool {
         get { defaults.object(forKey: UDKey.enableThinking) as? Bool ?? true }
         set { defaults.set(newValue, forKey: UDKey.enableThinking); publish() }
+    }
+
+    // MARK: - Per-Provider Reasoning Policy
+
+    /// JSON dict of per-provider reasoning policies (provider id → auto/on/off).
+    private var reasoningPolicyJSON: String {
+        get { defaults.string(forKey: UDKey.reasoningPolicyJSON) ?? "{}" }
+        set { defaults.set(newValue, forKey: UDKey.reasoningPolicyJSON) }
+    }
+
+    /// Stored per-provider reasoning policies. Absent providers default to `.auto`.
+    var reasoningPolicies: [String: ReasoningPolicy] {
+        get {
+            guard let data = reasoningPolicyJSON.data(using: .utf8),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
+            var result: [String: ReasoningPolicy] = [:]
+            for (providerId, value) in raw {
+                if let policy = ReasoningPolicy(rawValue: value) { result[providerId] = policy }
+            }
+            return result
+        }
+        set {
+            var raw: [String: String] = [:]
+            for (providerId, policy) in newValue { raw[providerId] = policy.rawValue }
+            reasoningPolicyJSON = ((try? JSONSerialization.data(withJSONObject: raw)).flatMap { String(data: $0, encoding: .utf8) }) ?? "{}"
+        }
+    }
+
+    /// Reasoning policy for a provider — defaults to `.auto` when unset.
+    func reasoningPolicy(for providerId: String) -> ReasoningPolicy {
+        reasoningPolicies[providerId] ?? .auto
+    }
+
+    /// Effective reasoning pass-through decision for a provider + resolved model.
+    /// The global `enableThinking` toggle gates everything; otherwise the
+    /// per-provider policy applies, with `.auto` deciding from provider/model
+    /// capability.
+    func reasoningEnabled(for providerId: String, model: String) -> Bool {
+        guard enableThinking else { return false }
+        switch reasoningPolicy(for: providerId) {
+        case .on: return true
+        case .off: return false
+        case .auto: return MessageTranslator.isReasoningCapable(providerId: providerId, model: model)
+        }
     }
 
     /// Comma-separated fallback provider names.
     var fallbackProviders: String {
         get { defaults.string(forKey: UDKey.fallbackProviders) ?? "nvidia,local" }
         set { defaults.set(newValue, forKey: UDKey.fallbackProviders); publish() }
+    }
+
+    /// Per-tier provider selections (tier key → provider id) used by the four
+    /// independent Provider+Model routing pairs (Default / Opus / Sonnet / Haiku).
+    /// Absent tiers fall back to the primary provider at routing time.
+    var tierProvidersJSON: String {
+        get { defaults.string(forKey: UDKey.tierProvidersJSON) ?? "{}" }
+        set { defaults.set(newValue, forKey: UDKey.tierProvidersJSON) }
+    }
+
+    /// Per-tier provider ids, or nil for a tier that uses the primary provider.
+    func tierProvider(for tier: String) -> String? {
+        guard let data = tierProvidersJSON.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return nil }
+        return dict[tier]
+    }
+
+    /// Store a per-tier provider id (or remove it when empty).
+    func setTierProvider(_ tier: String, _ providerId: String) {
+        var dict: [String: String] = [:]
+        if let data = tierProvidersJSON.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            dict = parsed
+        }
+        if providerId.isEmpty {
+            dict.removeValue(forKey: tier)
+        } else {
+            dict[tier] = providerId
+        }
+        tierProvidersJSON = ((try? JSONSerialization.data(withJSONObject: dict))
+            .flatMap { String(data: $0, encoding: .utf8) }) ?? "{}"
     }
 
     /// Base URL for OpenAI-compatible providers.
@@ -138,7 +264,9 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.localLlmModel); publish() }
     }
 
-    /// Auth token for proxy authentication.
+    /// Auth token for proxy authentication. Defaults to the documented token
+    /// "jxproxy" (README, install.sh); a custom token can be set in Settings
+    /// and is honored by the proxy and the regenerated launcher scripts.
     var authToken: String {
         get { defaults.string(forKey: UDKey.authToken) ?? "jxproxy" }
         set { defaults.set(newValue, forKey: UDKey.authToken); publish() }
@@ -194,45 +322,48 @@ final class ConfigManager: @unchecked Sendable {
     // MARK: - API Key Storage (UserDefaults)
 
     /// Store an API key securely in the Keychain.
+    ///
+    /// On Keychain failure the error is surfaced and the prior value is kept —
+    /// secrets are never written to UserDefaults (ticket 0001).
     func setApiKey(chainKey: String, value: String) {
-        let isEmpty = value.isEmpty
-        if !isEmpty {
-            do {
-                try KeychainManager.store(key: chainKey, value: value)
-            } catch {
-                print("[ConfigManager] Failed to store key in Keychain, falling back to UserDefaults: \(error)")
-                var keys = loadApiKeysDict()
-                keys[chainKey] = value
-                saveApiKeysDict(keys)
-            }
-        } else {
+        guard !value.isEmpty else {
             try? KeychainManager.delete(key: chainKey)
-            var keys = loadApiKeysDict()
-            keys.removeValue(forKey: chainKey)
-            saveApiKeysDict(keys)
+            return
+        }
+        do {
+            try KeychainManager.store(key: chainKey, value: value)
+        } catch {
+            print("[ConfigManager] Failed to store key \(chainKey) in Keychain: \(error). Key was not saved.")
         }
     }
 
     /// Retrieve an API key securely from the Keychain.
     func getApiKey(chainKey: String) -> String {
-        // Try Keychain first (Primary Secure Storage)
-        if let keychainValue = KeychainManager.retrieve(key: chainKey), !keychainValue.isEmpty {
-            return keychainValue
+        guard let keychainValue = KeychainManager.retrieve(key: chainKey), !keychainValue.isEmpty else {
+            return ""
         }
-        
-        // Fallback to UserDefaults (in case Keychain is unavailable)
-        let keys = loadApiKeysDict()
-        if let udValue = keys[chainKey], !udValue.isEmpty {
-            // Attempt to migrate back to secure Keychain
-            try? KeychainManager.store(key: chainKey, value: udValue)
-            return udValue
-        }
-        
-        return ""
+        return keychainValue
+    }
+
+    /// Keychain account for a custom provider's API key.
+    static func customProviderKey(_ id: String) -> String {
+        "CUSTOM_PROVIDER_KEY_\(id)"
     }
 
     /// Get the resolved API key for a given provider identifier.
     func apiKey(for providerId: String) -> String {
+        // Named custom providers first — each has its own Keychain account.
+        // Fall through to the legacy "custom" account if the per-provider
+        // account is empty (pre-migration setups stored the key there).
+        if let def = customProviders.first(where: { $0.id == providerId }) {
+            let key = getApiKey(chainKey: Self.customProviderKey(def.id))
+            if !key.isEmpty { return key }
+            if def.id == "custom" {
+                let legacy = getApiKey(chainKey: KeychainKey.custom)
+                if !legacy.isEmpty { return legacy }
+            }
+            return key
+        }
         switch providerId {
         case "direct": return getApiKey(chainKey: KeychainKey.anthropic)
         case "openrouter": return getApiKey(chainKey: KeychainKey.openrouter)
@@ -259,17 +390,29 @@ final class ConfigManager: @unchecked Sendable {
         case "zai": return getApiKey(chainKey: KeychainKey.zai)
         case "ollama-cloud": return getApiKey(chainKey: KeychainKey.ollamaCloud)
         case "ai-gateway": return getApiKey(chainKey: KeychainKey.aiGateway)
-        case "local", "ollama", "lmstudio", "llamacpp": return ""
+        case "custom": return getApiKey(chainKey: KeychainKey.custom)
+        case "local", "ollama", "lmstudio", "llamacpp", "jan": return ""
         default: return ""
         }
     }
 
-    private func loadApiKeysDict() -> [String: String] {
-        (defaults.dictionary(forKey: Self.udApiKeysKey) as? [String: String]) ?? [:]
-    }
-
-    private func saveApiKeysDict(_ dict: [String: String]) {
-        defaults.set(dict, forKey: Self.udApiKeysKey)
+    /// One-time hygiene sweep: any legacy plaintext keys previously stored in the
+    /// "apiKeysDict" UserDefaults key are migrated into the Keychain, then the
+    /// dict is removed so secrets never persist in UserDefaults (ticket 0001).
+    private func migrateLegacyApiKeysDict() {
+        let legacy = defaults.dictionary(forKey: Self.udApiKeysKey)
+        guard let dict = legacy as? [String: String] else {
+            if legacy != nil { defaults.removeObject(forKey: Self.udApiKeysKey) }
+            return
+        }
+        for (chainKey, value) in dict where !value.isEmpty {
+            do {
+                try KeychainManager.store(key: chainKey, value: value)
+            } catch {
+                print("[ConfigManager] Failed to migrate legacy key \(chainKey) from UserDefaults to Keychain: \(error)")
+            }
+        }
+        defaults.removeObject(forKey: Self.udApiKeysKey)
     }
 
     // MARK: - Migration Flag
@@ -297,9 +440,28 @@ final class ConfigManager: @unchecked Sendable {
     // MARK: - Initialization & Migration
 
     private init() {
+        // Hygiene sweep: migrate any legacy plaintext apiKeysDict into Keychain (ticket 0001).
+        migrateLegacyApiKeysDict()
+
         if !hasMigrated {
             migrateFromConfigEnv()
             hasMigrated = true
+        }
+
+        // Auth policy is the documented "jxproxy" default. One-time sweep:
+        // clear any token minted by the earlier random-token protocol (32 hex
+        // chars, stored in Keychain + UserDefaults) so the change takes effect
+        // even on installs that already generated a token. Deliberately
+        // customized tokens are left alone. Runs after migration so a legacy
+        // config.env token is cleared too when it matches the minted format.
+        if !defaults.bool(forKey: UDKey.authTokenResetDone) {
+            let stored = defaults.string(forKey: UDKey.authToken)
+            if let stored, stored.count == 32,
+               stored.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil {
+                try? KeychainManager.delete(key: KeychainKey.authToken)
+                defaults.removeObject(forKey: UDKey.authToken)
+            }
+            defaults.set(true, forKey: UDKey.authTokenResetDone)
         }
     }
 
@@ -355,6 +517,15 @@ final class ConfigManager: @unchecked Sendable {
         migrateValue(env: env, key: "JXPROXY_AUTH_TOKEN", to: \.authToken)
         migrateValue(env: env, key: "ENABLED_PROVIDERS", to: \.enabledProviders)
         migrateValue(env: env, key: "VISIBLE_MODELS", to: \.visibleModelsRaw)
+
+        // Secrets have been migrated to the Keychain — remove the legacy
+        // plaintext config.env (ticket 0018). Best-effort.
+        do {
+            try FileManager.default.removeItem(atPath: configPath)
+            print("[ConfigManager] Removed legacy plaintext config.env at \(configPath) after successful migration.")
+        } catch {
+            print("[ConfigManager] Failed to remove legacy config.env at \(configPath): \(error)")
+        }
     }
 
     private func parseEnv(_ content: String) -> [String: String] {
@@ -393,6 +564,10 @@ final class ConfigManager: @unchecked Sendable {
     /// Checks providerBackendUrls first (user-configured override), then falls back
     /// to built-in defaults so every provider's URL is editable from the UI.
     func baseUrl(for providerId: String) -> String {
+        // Named custom providers first — their endpoint is their own base URL.
+        if let def = customProviders.first(where: { $0.id == providerId }), !def.baseUrl.isEmpty {
+            return def.baseUrl
+        }
         // User-configured override takes priority
         let overrides = providerBackendUrls
         if let custom = overrides[providerId], !custom.isEmpty {
@@ -429,6 +604,11 @@ final class ConfigManager: @unchecked Sendable {
         case "local", "ollama": return localLlmBaseUrl
         case "lmstudio": return "http://127.0.0.1:1234/v1"
         case "llamacpp": return "http://127.0.0.1:8080/v1"
+        case "jan": return "http://127.0.0.1:1337/v1"
+        case "custom":
+            // The custom provider's endpoint lives in providerBackendUrls;
+            // fall back to a sensible OpenAI-compatible default.
+            return providerBackendUrls["custom"] ?? "https://api.openai.com/v1"
         default: return ""
         }
     }
@@ -450,6 +630,49 @@ final class ConfigManager: @unchecked Sendable {
                 defaults.set(json, forKey: UDKey.providerBackendUrls)
             }
         }
+    }
+
+    // MARK: - Custom Providers (named OpenAI-compatible endpoints)
+
+    /// JSON-encoded list of user-defined custom providers.
+    var customProvidersJSON: String {
+        get { defaults.string(forKey: UDKey.customProviders) ?? "[]" }
+        set { defaults.set(newValue, forKey: UDKey.customProviders) }
+    }
+
+    /// User-defined custom providers (name + endpoint; keys in Keychain).
+    var customProviders: [CustomProviderDef] {
+        get {
+            guard let data = customProvidersJSON.data(using: .utf8),
+                  let list = try? JSONDecoder().decode([CustomProviderDef].self, from: data) else {
+                return []
+            }
+            return list
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue),
+               let json = String(data: data, encoding: .utf8) {
+                customProvidersJSON = json
+            }
+        }
+    }
+
+    /// Add or update a custom provider and persist its API key in the Keychain.
+    func upsertCustomProvider(_ def: CustomProviderDef, apiKey: String) {
+        var list = customProviders
+        if let idx = list.firstIndex(where: { $0.id == def.id }) {
+            list[idx] = def
+        } else {
+            list.append(def)
+        }
+        customProviders = list
+        setApiKey(chainKey: Self.customProviderKey(def.id), value: apiKey)
+    }
+
+    /// Remove a custom provider and its Keychain key.
+    func removeCustomProvider(id: String) {
+        customProviders = customProviders.filter { $0.id != id }
+        try? KeychainManager.delete(key: Self.customProviderKey(id))
     }
 
     /// Resolve a friendly fallback provider name to a canonical provider ID.

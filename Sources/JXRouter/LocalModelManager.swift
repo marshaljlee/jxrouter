@@ -40,6 +40,12 @@ final class LocalModelManager {
 
     var status: ServerStatus = .stopped
     var provider: LocalProvider = .llamacpp
+
+    /// Whether the server is currently running (for UI state).
+    var isRunning: Bool {
+        if case .running = status { return true }
+        return false
+    }
     var modelPath: String = ""
     var port: Int = 8080
     var host: String = "127.0.0.1"
@@ -90,16 +96,23 @@ final class LocalModelManager {
         switch provider {
         case .llamacpp:
             let ctxSize = 8192
+            // binPath and resolvedPath are passed as argv ($1/$2) instead of being
+            // interpolated into the shell script — a path containing spaces or shell
+            // metacharacters can no longer inject commands (CWE-78). bash expands
+            // "$1"/"$2" from the argv values; they are never re-parsed as script text.
             proc.arguments = [
                 "-c", """
-                nohup \(binPath) \
+                nohup "$1" \
                     --host \(host) \
                     --port \(port) \
-                    --model \(resolvedPath) \
+                    --model "$2" \
                     --ctx-size \(ctxSize) \
                     > /tmp/llama-server-stdout.log 2> /tmp/llama-server-stderr.log &
                 echo $!
-                """
+                """,
+                "llama-server", // $0
+                binPath,        // $1
+                resolvedPath    // $2
             ]
         case .ollama:
             proc.arguments = [
@@ -176,6 +189,63 @@ final class LocalModelManager {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return false
+    }
+
+    // MARK: - Readiness & Auto-Detect
+
+    enum LocalModelReadiness {
+        /// Binary (and, for llama.cpp, a model file) available — can start now.
+        case ready
+        /// Server binary not installed — show the onboarding tutorial.
+        case needsInstall
+        /// Binary installed but no model file found (llama.cpp) — show the model step.
+        case needsModel
+    }
+
+    /// Path to the server binary if present (custom override or common locations).
+    func binaryPath() -> String? {
+        which(provider.serverName)
+    }
+
+    /// Whether the local LLM can be started right now.
+    func readiness() -> LocalModelReadiness {
+        guard binaryPath() != nil else { return .needsInstall }
+        if provider == .llamacpp {
+            let resolved = modelPath.isEmpty ? (autoDetectModelFile() ?? "") : modelPath
+            let expanded = NSString(string: resolved).expandingTildeInPath
+            if resolved.isEmpty || !FileManager.default.fileExists(atPath: expanded) {
+                return .needsModel
+            }
+        }
+        return .ready
+    }
+
+    /// Find a usable .gguf in the preferred model directory (or common locations)
+    /// so "Run" can start llama.cpp with zero configuration.
+    func autoDetectModelFile() -> String? {
+        if let found = findGGUF(in: modelDirectory, depth: 3) { return found }
+        if let found = findGGUF(in: "~/Downloads", depth: 3) { return found }
+        // HF hub layout is <org>/<model>/snapshots/<hash>/file.gguf — 4 levels
+        // of subdirectories, so it needs a deeper (but still bounded) search.
+        if let found = findGGUF(in: "~/.cache/huggingface/hub", depth: 5) { return found }
+        return nil
+    }
+
+    /// Recursive (bounded) search for a .gguf file.
+    private func findGGUF(in root: String, depth: Int) -> String? {
+        let expanded = NSString(string: root).expandingTildeInPath
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: expanded) else { return nil }
+        for entry in entries {
+            let full = (expanded as NSString).appendingPathComponent(entry)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir) else { continue }
+            if !isDir.boolValue {
+                if entry.lowercased().hasSuffix(".gguf") { return full }
+            } else if depth > 0 {
+                if let found = findGGUF(in: full, depth: depth - 1) { return found }
+            }
+        }
+        return nil
     }
 
     // MARK: - Helpers

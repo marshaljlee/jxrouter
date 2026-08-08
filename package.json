@@ -1,0 +1,26 @@
+{
+  "name": "jxrouter",
+  "version": "1.0.0",
+  "description": "routing experiment",
+  "keywords": [
+    "route"
+  ],
+  "homepage": "https://github.com/marshaljlee/jxrouter#readme",
+  "bugs": {
+    "url": "https://github.com/marshaljlee/jxrouter/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marshaljlee/jxrouter.git"
+  },
+  "license": "ISC",
+  "author": "marshaljlee",
+  "type": "commonjs",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}

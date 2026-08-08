@@ -65,6 +65,7 @@ final class CertificateAuthority: @unchecked Sendable {
     private func generateCA() -> Bool {
         // First generate PKCS#1 RSA Key
         guard runOpenssl(["genrsa", "-out", caKeyPath.path, "2048"]) else { return false }
+        restrictKeyFile(at: caKeyPath)
 
         let args = [
             "req", "-x509", "-new",
@@ -92,6 +93,7 @@ final class CertificateAuthority: @unchecked Sendable {
 
         // First generate PKCS#1 RSA Key
         guard runOpenssl(["genrsa", "-out", keyPath.path, "2048"]) else { return false }
+        restrictKeyFile(at: keyPath)
 
         // Generate CSR using that key
         let genArgs = [
@@ -205,6 +207,7 @@ final class CertificateAuthority: @unchecked Sendable {
 
         // First generate PKCS#1 RSA Key
         guard runOpenssl(["genrsa", "-out", keyPath.path, "2048"]) else { return false }
+        restrictKeyFile(at: keyPath)
 
         // Generate CSR using that key
         let genArgs = [
@@ -257,6 +260,12 @@ final class CertificateAuthority: @unchecked Sendable {
 
     private func sanitizeHost(_ host: String) -> String {
         host.replacingOccurrences(of: "[^a-zA-Z0-9._-]", with: "_", options: .regularExpression)
+    }
+
+    /// Restrict a generated private key file to the current user (0600).
+    /// Public certificates stay readable; only private keys are locked down.
+    private func restrictKeyFile(at path: URL) {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
     }
 
     @discardableResult

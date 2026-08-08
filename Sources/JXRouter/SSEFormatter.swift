@@ -14,17 +14,33 @@ enum SSEFormatter {
         "event: \(event)\ndata: \(data)\n\n"
     }
 
-    static func textDelta(text: String) -> String {
+    static func textDelta(text: String, index: Int = 0) -> String {
         let str = String(data: (try? JSONEncoder().encode(text)) ?? Data(), encoding: .utf8) ?? "\"\""
-        return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\(str)}}")
+        return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(index),\"delta\":{\"type\":\"text_delta\",\"text\":\(str)}}")
     }
 
-    static func assistantMessageStart(model: String) -> [String] {
+    static func textBlockStart(index: Int) -> String {
+        format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":\(index),\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
+    }
+
+    /// `message_start` without any content block — blocks are opened lazily when
+    /// the first delta of that kind arrives, so reasoning (thinking block) can
+    /// claim index 0 ahead of text.
+    static func messageStart(model: String) -> String {
         let msgId = "msg_\(UUID().uuidString.prefix(8))"
-        return [
-            format(event: "message_start", data: "{\"type\":\"message_start\",\"message\":{\"id\":\"\(msgId)\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"\(model)\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}"),
-            format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
-        ]
+        return format(event: "message_start", data: "{\"type\":\"message_start\",\"message\":{\"id\":\"\(msgId)\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"\(model)\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}")
+    }
+
+    /// Start an Anthropic `thinking` content block so reasoning tokens from
+    /// OpenAI-compatible providers (DeepSeek, OpenCode, etc.) are preserved as
+    /// thinking tokens instead of being flattened into visible text.
+    static func thinkingStart(index: Int) -> String {
+        format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":\(index),\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}")
+    }
+
+    static func thinkingDelta(text: String, index: Int = 0) -> String {
+        let str = String(data: (try? JSONEncoder().encode(text)) ?? Data(), encoding: .utf8) ?? "\"\""
+        return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(index),\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\(str)}}")
     }
 
     static func toolUseStart(index: Int, id: String, name: String) -> String {
@@ -37,10 +53,11 @@ enum SSEFormatter {
         return format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(index),\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\(argStr)}}")
     }
 
-    static func messageStop(index: Int, stopReason: String, outputTokens: Int) -> [String] {
-        [
-            format(event: "content_block_stop", data: "{\"type\":\"content_block_stop\",\"index\":\(index)}"),
-            format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(stopReason)\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":\(outputTokens)}}")
-        ]
+    static func blockStop(index: Int) -> String {
+        format(event: "content_block_stop", data: "{\"type\":\"content_block_stop\",\"index\":\(index)}")
+    }
+
+    static func messageDelta(stopReason: String, outputTokens: Int) -> String {
+        format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(stopReason)\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":\(outputTokens)}}")
     }
 }

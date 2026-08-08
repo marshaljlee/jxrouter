@@ -21,6 +21,8 @@ fi
 
 REPO_URL="https://github.com/marshaljlee/jxrouter.git"
 BUILD_DIR="/tmp/jxproxy-rebuild"
+JXPROXY_PORT="${JXPROXY_PORT:-5255}"
+JXPROXY_AUTH_TOKEN="${JXPROXY_AUTH_TOKEN:-jxproxy}"
 
 # =============================================================================
 # STEP 0: Stop running processes
@@ -77,11 +79,15 @@ clean_shell_config() {
     if [ -f "$config" ]; then
         local changed=false
         if grep -q "JXPROXY" "$config" 2>/dev/null; then
+            # Remove the whole JXProxy block (config + protective alias + End marker)
+            sed -i '' '/^# JXProxy Configuration/,/^# End JXProxy$/d' "$config" 2>/dev/null || true
             sed -i '' '/^# JXProxy Configuration/d' "$config" 2>/dev/null || true
+            sed -i '' '/^# JXProxy protective alias/d' "$config" 2>/dev/null || true
+            sed -i '' '/^# End JXProxy/d' "$config" 2>/dev/null || true
             sed -i '' '/^export JXPROXY_PORT/d' "$config" 2>/dev/null || true
             sed -i '' '/^export JXPROXY_AUTH_TOKEN/d' "$config" 2>/dev/null || true
-            # Remove PATH addition lines that reference .local/bin (only ours)
             sed -i '' '/^export PATH=.*local\/bin.*JXPROXY/d' "$config" 2>/dev/null || true
+            sed -i '' '/alias claude="unset ANTHROPIC_DEFAULT/d' "$config" 2>/dev/null || true
             changed=true
         fi
         if $changed; then
@@ -101,7 +107,6 @@ echo "5. Cleaning build artifacts..."
 rm -rf /tmp/JXRouterBuild 2>/dev/null || true
 rm -rf /tmp/jxproxy-hosts.tmp /tmp/jxproxy-pf.conf /tmp/jxproxy-hosts-clean.tmp 2>/dev/null || true
 rm -rf "$BUILD_DIR" 2>/dev/null || true
-rm -rf Build/ 2>/dev/null || true
 echo "   Removed temp files and build artifacts"
 
 # =============================================================================
@@ -130,7 +135,32 @@ echo ""
 echo "8. Removing FIFO pipe and legacy config..."
 rm -f "$HOME/.jxproxy_bot_commands" 2>/dev/null || true
 rm -rf "$HOME/.jxproxy" 2>/dev/null || true
-echo "   Cleaned FIFO pipe and legacy config"
+
+# Restore Claude Code settings written by JXProxy (routing env block)
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_BACKUP="$HOME/.claude/settings.json.jxproxy-bak"
+if [ -f "$CLAUDE_BACKUP" ]; then
+    rm -f "$CLAUDE_SETTINGS" 2>/dev/null || true
+    mv "$CLAUDE_BACKUP" "$CLAUDE_SETTINGS" 2>/dev/null || true
+elif [ -f "$CLAUDE_SETTINGS" ]; then
+    python3 - "$CLAUDE_SETTINGS" << 'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+keys = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+try:
+    with open(path) as f: data = json.load(f)
+    env = data.get("env", {})
+    for k in keys: env.pop(k, None)
+    if env: data["env"] = env
+    else: data.pop("env", None)
+    with open(path, "w") as f: json.dump(data, f, indent=2)
+except Exception:
+    pass
+PY
+fi
+rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
+echo "   Cleaned FIFO pipe, legacy config, and Claude routing settings"
 
 # =============================================================================
 # STEP 9: Remove DNS hijack + pf anchor (requires admin)
@@ -215,6 +245,24 @@ fi
 echo "   Build succeeded"
 
 # =============================================================================
+# STEP 13b: Bundle Agent Resources
+# =============================================================================
+echo ""
+echo "13b. Bundling agent resources..."
+APP_BUNDLE="/tmp/JXRouterBuild/Release/JXRouter.app"
+RESOURCES_SRC="$BUILD_DIR/JXRouter/Resources"
+RESOURCES_DST="$APP_BUNDLE/Contents/Resources"
+
+if [ -d "$RESOURCES_SRC" ]; then
+    cp "$RESOURCES_SRC/AGENTS.md" "$RESOURCES_DST/AGENTS.md"
+    mkdir -p "$RESOURCES_DST/skills"
+    cp -R "$RESOURCES_SRC/skills/"* "$RESOURCES_DST/skills/"
+    echo "   Bundled AGENTS.md + 5 skill SKILL.md files"
+else
+    echo "   ⚠️  WARNING: Resources/ directory not found at $RESOURCES_SRC"
+fi
+
+# =============================================================================
 # STEP 14: Deploy
 # =============================================================================
 echo ""
@@ -225,7 +273,16 @@ if [ ! -d "$APP_BUNDLE" ]; then
     exit 1
 fi
 cp -R "$APP_BUNDLE" /Applications/
-codesign --force --deep --sign - /Applications/JXRouter.app 2>/dev/null || true
+xattr -cr "/Applications/JXRouter.app" 2>/dev/null || true
+if find "/Applications/JXRouter.app" \( -name '*.debug.dylib' -o -name '*__preview.dylib' \) -print -quit | grep -q .; then
+    echo "❌ Debug dylibs present in /Applications/JXRouter.app (stale debug build artifacts)." >&2
+    exit 1
+fi
+if ! codesign --verify --deep --strict "/Applications/JXRouter.app"; then
+    echo "❌ Code signature verification failed for /Applications/JXRouter.app." >&2
+    echo "   The copy invalidated the Xcode-produced signature; re-run the build." >&2
+    exit 1
+fi
 echo "   Deployed JXProxy to /Applications"
 
 # =============================================================================
@@ -310,7 +367,7 @@ else
     open "/Applications/JXRouter.app"
 fi
 echo "   Default port: ${JXPROXY_PORT:-5255}"
-echo "   Default auth token: ${JXPROXY_AUTH_TOKEN:-jxproxy}"
+echo "   Auth token: ${JXPROXY_AUTH_TOKEN:-jxproxy}"
 LAUNCHER
 chmod +x "$LOCAL_BIN/jxserver"
 
@@ -329,9 +386,16 @@ add_to_path() {
             {
                 echo ""
                 echo "# JXProxy Configuration"
-                echo "export JXPROXY_PORT=\"5255\""
-                echo "export JXPROXY_AUTH_TOKEN=\"jxproxy\""
+                echo "export JXPROXY_PORT=\"${JXPROXY_PORT:-5255}\""
+                if [ -n "${JXPROXY_AUTH_TOKEN:-}" ]; then
+                    echo "export JXPROXY_AUTH_TOKEN=\"${JXPROXY_AUTH_TOKEN}\""
+                fi
                 echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+                echo ""
+                echo "# JXProxy protective alias - neutralises shell-level ANTHROPIC_DEFAULT_* model overrides"
+                echo "# that would otherwise bypass JXProxy's tier routing. Plain \`claude\` keeps working."
+                echo "alias claude=\"unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL && claude\""
+                echo "# End JXProxy"
             } >> "$config"
             echo "   Added JXProxy config to $config"
         fi
@@ -363,8 +427,8 @@ echo "   Claude Code: jxclaude"
 echo "   Codex:       jxcodex"
 echo "   Pi:          jxpi"
 echo ""
-echo "   Port:        5255"
-echo "   Auth token:  jxproxy"
+echo "   Port:        ${JXPROXY_PORT:-5255}"
+echo "   Auth token:  ${JXPROXY_AUTH_TOKEN:-jxproxy}"
 echo ""
 echo "   Or open from: /Applications/JXRouter.app"
 echo "==========================================="

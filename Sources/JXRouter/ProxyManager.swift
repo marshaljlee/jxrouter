@@ -21,6 +21,33 @@ final class ProxyManager {
     var currentModel: String {
         config.model
     }
+
+    // MARK: - Dashboard Connection Details
+
+    /// Loopback proxy address clients point at (e.g. 127.0.0.1:5255).
+    var proxyAddress: String {
+        "127.0.0.1:\(config.port)"
+    }
+
+    /// TLS listener port (proxy port + 1) used by DNS-redirected HTTPS traffic.
+    var tlsPort: Int {
+        config.port + 1
+    }
+
+    /// Display name of the active provider.
+    var activeProviderName: String {
+        ProviderPreset.preset(for: config.provider)?.name ?? config.provider
+    }
+
+    /// Resolved backend URL of the active provider.
+    var activeProviderBackend: String {
+        config.baseUrl(for: config.provider)
+    }
+
+    /// Proxy auth token clients must send as x-api-key.
+    var authToken: String {
+        config.authToken
+    }
     var currentProvider: String = "opencode-zen"
     var activeModel: String = "big-pickle"
     var latency: Double {
@@ -107,11 +134,27 @@ final class ProxyManager {
             && config.apiKey(for: "openai").isEmpty
     }
 
+    /// Whether the user has configured any provider API key — built-in
+    /// key-requiring providers or named custom providers. Used to auto-show the
+    /// free API key guide after the first-launch onboarding splash.
+    var hasNoProviderKey: Bool {
+        let builtIn = ProviderPreset.all.contains { preset in
+            preset.requiresKey && !config.apiKey(for: preset.id).isEmpty
+        }
+        let custom = config.customProviders.contains { def in
+            !config.apiKey(for: def.id).isEmpty
+        }
+        return !builtIn && !custom
+    }
+
     private init() {
         config.providerRouter = providerRouter
         proxyServer.providerRouter = providerRouter
+        proxyServer.onTrafficEntry = { @MainActor [weak self] entry in
+            self?.trafficLog.append(entry)
+        }
         loadAllFromConfig()
-        proxyServer.port = UInt16(config.port)
+        proxyServer.port = resolvedPort(config.port)
         proxyServer.authToken = config.authToken
         autoLaunchEnabled = SMAppService.mainApp.status == .enabled
 
@@ -129,7 +172,7 @@ final class ProxyManager {
         currentProvider = config.provider
         activeModel = config.model
         proxyServer.authToken = config.authToken
-        proxyServer.port = UInt16(config.port)
+        proxyServer.port = resolvedPort(config.port)
         proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
 
         loadProvidersFromConfig()
@@ -138,7 +181,7 @@ final class ProxyManager {
     }
 
     private func syncFromConfig() {
-        proxyServer.port = UInt16(config.port)
+        proxyServer.port = resolvedPort(config.port)
         proxyServer.authToken = config.authToken
         proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
     }
@@ -235,6 +278,7 @@ final class ProxyManager {
         case "cerebras": return ConfigManager.KeychainKey.cerebras
         case "huggingface": return ConfigManager.KeychainKey.huggingface
         case "xai": return ConfigManager.KeychainKey.xai
+        case "custom": return ConfigManager.KeychainKey.custom
         default: return "\(providerId.uppercased())_API_KEY"
         }
     }
@@ -258,7 +302,10 @@ final class ProxyManager {
     // MARK: - System Proxy
 
     func enableSystemProxy(port: Int) {
-        setBuiltInProxyPort(UInt16(port))
+        setBuiltInProxyPort(resolvedPort(port))
+        if !builtInProxyRunning {
+            setError("System-Wide Proxy is enabled but the proxy is not running — apps will lose internet access until the proxy is started.")
+        }
         systemProxyManager.enable()
         systemProxyEnabled = true
     }
@@ -282,18 +329,45 @@ final class ProxyManager {
         do {
             // Sync system proxy port with the configured port before starting
             setBuiltInProxyPort(proxyServer.port)
+
+            // Consent gate: re-sync the DNS toggle so ProxyServer skips
+            // installDNS when the user turned DNS redirection off.
+            proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
+
             try proxyServer.start(port: proxyServer.port)
             builtInProxyRunning = true
             startTime = Date()
             isRunning = true
 
-            // Enable system proxy on Wi-Fi so apps route traffic through JXProxy
-            systemProxyManager.discoverInterfaces()
-            systemProxyManager.enable()
-            systemProxyEnabled = true
+            // Consent gate: only touch macOS proxy settings when the
+            // "Enable System-Wide Proxy" toggle is on. Otherwise the proxy
+            // runs loopback-only for launcher clients.
+            if systemProxyEnabled {
+                systemProxyManager.discoverInterfaces()
+                systemProxyManager.enable()
+                systemProxyEnabled = true
+            } else {
+                print("[ProxyManager] System proxy toggle off — leaving macOS proxy settings untouched")
+            }
 
             // Install/reinstall launcher scripts with current provider+model
             installLauncherScripts()
+
+            // Route Claude Code through the proxy from ANY launch context:
+            // write the env block into ~/.claude/settings.json (base URL +
+            // auth token + ANTHROPIC_DEFAULT_* neutralisation). Removed on stop.
+            ClaudeSettingsWriter.shared.apply(proxyPort: config.port, authToken: config.authToken)
+
+            // Seed Claude Code's constitution (~/.claude/CLAUDE.md) with the
+            // bundled AGENTS.md (Joshua's Will + mandatory rules) so Claude
+            // Code integrates with them at its core. User-authored content
+            // already in the constitution is preserved (absorbed).
+            ConstitutionManager.shared.apply()
+
+            // Install replacement skills (web-search-free, web-fetch-free,
+            // shell-ops, file-editor, desktop-automation) into ~/.claude/skills/
+            // so they're available as mandatory overrides for broken native tools.
+            SkillManager.shared.apply()
 
             // First-time Claude Code launch
             if !hasOpenedClaudeFirstTime {
@@ -317,6 +391,13 @@ final class ProxyManager {
         // Disable system proxy so apps don't route to a dead port
         systemProxyManager.disable()
         systemProxyEnabled = false
+
+        // Stop routing Claude Code through the proxy: restore the user's
+        // original ~/.claude/settings.json from backup.
+        ClaudeSettingsWriter.shared.remove()
+
+        // Remove JXRouter-managed replacement skills from ~/.claude/skills/.
+        SkillManager.shared.remove()
     }
 
     // MARK: - Comprehensive Recovery (Restart)
@@ -328,8 +409,17 @@ final class ProxyManager {
     func restartProxy() async {
         print("[Recovery] ═══ Starting full circuit-breaker recovery ═══")
 
-        // 1. Stop everything cleanly first
-        stopProxy()
+        // Keep healthy DNS redirection in place across the restart. Tearing it
+        // down and reinstalling would trigger two osascript admin prompts for
+        // zero benefit; install() is idempotent and re-verifies on the way up.
+        // The health check must run BEFORE stopProxy — once the TLS listener is
+        // down, the connectivity probe can't succeed, so a post-stop check
+        // would falsely report "not installed".
+        // Gate on dnsRedirectEnabled too: when the user turned redirection OFF,
+        // stale entries must still be cleaned (no suppression), so the hijack
+        // never silently keeps running against their wishes.
+        let dnsHealthy = config.dnsRedirectEnabled && DNSRedirectionManager.shared.isInstalled()
+        DNSRedirectionManager.shared.suppressUninstall = dnsHealthy
         print("[Recovery] ✓ Proxy stopped")
 
         // 2. Kill any process holding the proxy port
@@ -348,9 +438,19 @@ final class ProxyManager {
         recoverFlushPF()
         print("[Recovery] ✓ PF rules flushed")
 
-        // 5. Clean up stale /etc/hosts entries
-        DNSRedirectionManager.shared.uninstall()
-        print("[Recovery] ✓ DNS entries cleaned")
+        // 5. Clean up stale /etc/hosts entries — only when redirection was NOT
+        //    healthy before the restart. Healthy redirection is preserved (the
+        //    suppressed uninstall in stopProxy left it untouched), so a plain
+        //    restart no longer prompts for admin twice.
+        if !dnsHealthy {
+            DNSRedirectionManager.shared.uninstall()
+            print("[Recovery] ✓ Stale DNS entries cleaned")
+        } else {
+            print("[Recovery] ✓ DNS redirection already functional — preserved")
+        }
+        // Re-enable prompts; install() below re-verifies idempotently and only
+        // prompts when the preserved state actually needs repair.
+        DNSRedirectionManager.shared.suppressUninstall = false
 
         // 6. Reset system proxy on ALL network interfaces (not just the cached one),
         //    not just the selected interface. This handles the case where the
@@ -386,9 +486,9 @@ final class ProxyManager {
         print("[Recovery] ═══ Recovery complete ═══")
     }
 
-    /// Kill every process listening on the given port, EXCEPT the current process.
-    /// Without this filter, killing the port AFTER stopping the listener would
-    /// find our own PID and `kill -9` the app itself.
+    /// Kill processes holding the given port ONLY when their executable or
+    /// loaded libraries belong to this app bundle (CWE-404 fix). Unrelated
+    /// processes on the port are logged and left alive. Self is always skipped.
     private func recoverKillPort(_ port: Int) {
         let selfPID = String(ProcessInfo.processInfo.processIdentifier)
         let task = Process()
@@ -409,16 +509,56 @@ final class ProxyManager {
                     print("[Recovery] Skipping self PID \(pid)")
                     continue
                 }
-                let killTask = Process()
-                killTask.executableURL = URL(fileURLWithPath: "/bin/kill")
-                killTask.arguments = ["-9", pid]
-                try? killTask.run()
-                killTask.waitUntilExit()
-                print("[Recovery] Killed PID \(pid) holding port \(port)")
+                guard let owningPaths = textFilePaths(ofPID: pid) else {
+                    print("[Recovery] PID \(pid) on port \(port): cannot determine executable — leaving alive")
+                    continue
+                }
+                if owningPaths.contains(where: { belongsToThisApp($0) }) {
+                    let killTask = Process()
+                    killTask.executableURL = URL(fileURLWithPath: "/bin/kill")
+                    killTask.arguments = ["-9", pid]
+                    try? killTask.run()
+                    killTask.waitUntilExit()
+                    print("[Recovery] Killed PID \(pid) (\(owningPaths[0])) holding port \(port) — owned by this app")
+                } else {
+                    print("[Recovery] PID \(pid) on port \(port) does not belong to this app (\(owningPaths[0])) — leaving alive")
+                }
             }
         } catch {
             print("[Recovery] killPort error: \(error)")
         }
+    }
+
+    /// Text-file (executable + loaded libraries) paths for a PID via
+    /// `lsof -a -p <pid> -d txt -Fn`. Returns nil when lsof yields nothing.
+    private func textFilePaths(ofPID pid: String) -> [String]? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-a", "-p", pid, "-d", "txt", "-Fn"]
+        let outPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            let paths = output.components(separatedBy: .newlines)
+                .compactMap { line -> String? in
+                    guard line.hasPrefix("n") else { return nil }
+                    let path = String(line.dropFirst())
+                    return path.isEmpty ? nil : path
+                }
+            return paths.isEmpty ? nil : paths
+        } catch {
+            return nil
+        }
+    }
+
+    /// True when the given file path lives inside this app's bundle.
+    private func belongsToThisApp(_ path: String) -> Bool {
+        let bundlePath = Bundle.main.bundlePath
+        return path == bundlePath || path.hasPrefix(bundlePath + "/")
     }
 
     /// Check whether something is already listening on the port.
@@ -525,20 +665,35 @@ final class ProxyManager {
     func installAndLaunchClaude() {
         Task {
             do {
+                // npm must exist before we attempt the global install.
+                let npmCheck = Process()
+                npmCheck.executableURL = URL(fileURLWithPath: "/bin/sh")
+                npmCheck.arguments = ["-c", "command -v npm >/dev/null 2>&1 || command -v bun >/dev/null 2>&1"]
+                try npmCheck.run()
+                npmCheck.waitUntilExit()
+                guard npmCheck.terminationStatus == 0 else {
+                    setError("Could not install Claude Code: npm (or bun) is not installed. Install Node.js from https://nodejs.org, then press Start again.")
+                    return
+                }
+
                 let task = Process()
                 task.executableURL = URL(fileURLWithPath: "/bin/sh")
-                // Use default npm installation command
                 task.arguments = ["-c", "npm install -g @anthropic-ai/claude-code"]
                 try task.run()
                 task.waitUntilExit()
                 
                 if task.terminationStatus == 0 {
                     DispatchQueue.main.async {
-                        self.launchClaudeInTerminal()
-                        self.hasOpenedClaudeFirstTime = true
+                        if self.claudeCodeInstalled() {
+                            self.launchClaudeInTerminal()
+                            self.hasOpenedClaudeFirstTime = true
+                        } else {
+                            self.setError("Claude Code was installed but the `claude` command isn't on PATH yet. Open a new Terminal window and run `claude` — it is now routed through JXProxy.")
+                            self.hasOpenedClaudeFirstTime = true
+                        }
                     }
                 } else {
-                    setError("Failed to install Claude Code. Make sure npm is installed.")
+                    setError("Failed to install Claude Code. Make sure npm is installed: npm install -g @anthropic-ai/claude-code")
                 }
             } catch {
                 setError("Error running install command: \(error.localizedDescription)")
@@ -546,11 +701,111 @@ final class ProxyManager {
         }
     }
 
+    // MARK: - Claude Code Presence & Install
+
+    /// Whether the Claude Code CLI is installed (checks PATH + common locations).
+    func claudeCodeInstalled() -> Bool {
+        let paths = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "\(NSHomeDirectory())/.npm-global/bin/claude",
+            "\(NSHomeDirectory())/.local/bin/claude",
+        ]
+        if paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return true }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "command -v claude >/dev/null 2>&1"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    // MARK: - Uninstall
+
+    /// Removes everything JXProxy wrote while running / installing — claude
+    /// settings.json routing, launcher scripts, and the shell-config blocks.
+    /// The app bundle itself is left in place (deleting a running app is
+    /// handled by the uninstall script / Finder). Returns a summary message.
+    func performUninstall() -> String {
+        // 1. Stop the proxy (also restores ~/.claude/settings.json and removes DNS).
+        if isRunning { stopProxy() }
+
+        // 2. Belt & suspenders: ensure the claude settings env block is gone.
+        ClaudeSettingsWriter.shared.remove()
+
+        // 3. Remove launcher scripts we generated.
+        let localBin = NSString(string: "~/.local/bin").expandingTildeInPath
+        for name in ["jxclaude", "jxcodex", "jxpi", "jxserver", "llama-local", "llama-chat-template.txt"] {
+            try? FileManager.default.removeItem(atPath: "\(localBin)/\(name)")
+        }
+
+        // 4. Remove the JXProxy blocks (PATH + protective alias) from shell configs.
+        for config in [".zshrc", ".bashrc", ".zshenv", ".bash_profile"] {
+            removeShellConfigBlock(config)
+        }
+
+        // 5. Remove the JXProxy-managed constitution block (~/.claude/CLAUDE.md),
+        //    preserving any user-authored content that was absorbed.
+        ConstitutionManager.shared.remove()
+
+        // 6. Remove JXRouter-managed replacement skills (~/.claude/skills/).
+        SkillManager.shared.remove()
+
+        return "JXProxy has been stopped and every written setting was removed:\n\u{2022} ~/.claude/settings.json restored to its original state\n\u{2022} launcher scripts (~/.local/bin/jx*) deleted\n\u{2022} shell config blocks (.zshrc / .zshenv / …) cleaned\n\u{2022} DNS redirection removed\n\u{2022} JXProxy constitution block removed from ~/.claude/CLAUDE.md\n\u{2022} Replacement skills removed from ~/.claude/skills/\n\nTo finish, delete /Applications/JXRouter.app (or run ./uninstall.sh)."
+    }
+
+    /// Remove the JXProxy configuration block and the protective claude alias
+    /// from a single shell config file, keeping everything else intact.
+    private func removeShellConfigBlock(_ fileName: String) {
+        let path = "\(NSHomeDirectory())/\(fileName)"
+        guard FileManager.default.fileExists(atPath: path),
+              let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+
+        var lines: [String] = []
+        var inBlock = false
+        var changed = false
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Everything between the block markers (config exports + the
+            // protective alias) is removed together.
+            if trimmed == "# JXProxy Configuration" { inBlock = true; changed = true; continue }
+            if trimmed == "# End JXProxy" { inBlock = false; changed = true; continue }
+            if inBlock { changed = true; continue }
+            lines.append(line)
+        }
+        // Also strip any stray alias line that unsets the default models.
+        if !changed, content.contains("alias claude=\"unset ANTHROPIC_DEFAULT") {
+            lines = content.components(separatedBy: "\n").filter {
+                !$0.contains("alias claude=\"unset ANTHROPIC_DEFAULT")
+            }
+            changed = true
+        }
+        guard changed else { return }
+        try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
     // MARK: - System Proxy Controls
 
     func setBuiltInProxyPort(_ port: UInt16) {
         proxyServer.port = port
         systemProxyManager.proxyPort = port
+    }
+
+    /// Safely converts a user-supplied port to `UInt16`, falling back to the
+    /// default port (5255) when it is out of range (e.g. > 65535 or <= 0).
+    private func resolvedPort(_ port: Int) -> UInt16 {
+        guard port > 0, let p = UInt16(exactly: port) else {
+            print("[ProxyManager] Invalid port \(port), using default 5255")
+            return 5255
+        }
+        return p
     }
 
     func toggleSystemProxy() {
@@ -688,6 +943,28 @@ final class ProxyManager {
     func clearError() {
         errorMessage = nil
         errorAcknowledged = true
+    }
+
+    // MARK: - Termination Cleanup
+
+    /// Synchronous, prompt-free cleanup for process termination — both normal
+    /// quits and termination signals (SIGTERM/SIGINT from `killall JXRouter`,
+    /// logout, Ctrl-C, which do NOT run `applicationWillTerminate`).
+    ///
+    /// The system proxy is the one setting that blocks ALL internet when stale,
+    /// so it is cleared on every exit path. DNS/pf redirection is intentionally
+    /// skipped here (it needs an admin prompt that would hang a signal exit);
+    /// leftover redirection is cleaned by `stopProxy()` on normal quit and by
+    /// the launch-time sweep after a kill.
+    func emergencyCleanup() {
+        print("[ProxyManager] 🧹 Emergency cleanup — disabling system proxy on all interfaces")
+        systemProxyManager.disable()
+        systemProxyEnabled = false
+    }
+
+    /// Set the network service the system proxy applies to (Settings picker).
+    func setSystemProxyInterface(_ interface: String) {
+        systemProxyManager.selectedInterface = interface
     }
 
     // MARK: - Health Check (simplified — passive)

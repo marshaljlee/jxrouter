@@ -59,12 +59,15 @@ struct RequestClassifier: Sendable {
         "ollama.com",
     ]
 
+    /// Suffix matching only for domains where every host is AI-owned. Broad
+    /// domains (.azure.com, .googleapis.com, .nvidia.com, .huggingface.co,
+    /// .replicate.com, .vercel.ai, .openai.com) must use exact hosts from
+    /// aiHostPatterns so non-AI traffic (storage.googleapis.com, www.nvidia.com)
+    /// is never TLS-terminated and misrouted.
     let aiHostSuffixes: [String] = [
         ".anthropic.com",
-        ".openai.com",
         ".openrouter.ai",
         ".opencode.ai",
-        ".nvidia.com",
         ".groq.com",
         ".cohere.ai",
         ".mistral.ai",
@@ -72,19 +75,14 @@ struct RequestClassifier: Sendable {
         ".perplexity.ai",
         ".together.xyz",
         ".fireworks.ai",
-        ".azure.com",
-        ".huggingface.co",
-        ".googleapis.com",
         ".x.ai",
         ".cerebras.ai",
         ".sambanova.ai",
-        ".replicate.com",
         ".wafer.ch",
         ".moonshot.cn",
         ".kimi-coding.com",
         ".minimax.chat",
         ".z.ai",
-        ".vercel.ai",
         ".ollama.com",
     ]
 

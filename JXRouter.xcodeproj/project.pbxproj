@@ -830,7 +830,10 @@
 		<key>E721D6CACE44A6C4B69B31BD</key>
 		<dict>
 			<key>children</key>
-			<array>
+			<array>				<string>4D2994B2AE0A24424042042C19E12B8B</string>
+				<string>99D143B7FA525428B8314F76B297E7CC</string>
+				<string>BB4E666D46E00C60F4D4EAE747C24444</string>
+
 				<string>B94B23D08EA44978FD41A4AE</string>
 				<string>F0FAB96EFC86AE89DF60F64E</string>
 				<string>DF71D4B064CE98F4D7EAB1B3</string>
@@ -1009,6 +1012,8 @@
 				<string></string>
 				<key>CODE_SIGN_IDENTITY</key>
 				<string>Apple Development</string>
+				<key>CODE_SIGN_INJECT_BASE_ENTITLEMENTS</key>
+				<string>NO</string>
 				<key>CODE_SIGN_STYLE</key>
 				<string>Automatic</string>
 				<key>COMBINE_HIDPI_IMAGES</key>
@@ -1182,6 +1187,12 @@
 			<key>files</key>
 			<array>
 				<string>74AC9D59AD58EFF4A4B44DEE</string>
+				<string>RA07BUILDAGENTS0000000006</string>
+				<string>RA08BUILDSKILL010000000007</string>
+				<string>RA09BUILDSKILL020000000008</string>
+				<string>RA10BUILDSKILL030000000009</string>
+				<string>RA11BUILDSKILL040000000010</string>
+				<string>RA12BUILDSKILL050000000011</string>
 			</array>
 			<key>isa</key>
 			<string>PBXResourcesBuildPhase</string>
@@ -1204,7 +1215,10 @@
 			<key>buildActionMask</key>
 			<string>2147483647</string>
 			<key>files</key>
-			<array>
+			<array>				<string>89504D0D0E8918A22A53F19B86771C65</string>
+				<string>315B552649CAE9972AD4A8D80014A28D</string>
+				<string>787F19D30B1129115B86CBFB8FC3E234</string>
+
 				<string>8F2761C25F7580026E40C342</string>
 				<string>A8F850E0C475CD5077502118</string>
 				<string>0E159ECD222E2E1AF710C4F0</string>
@@ -1256,6 +1270,168 @@
 			<key>sourceTree</key>
 			<string>&lt;group&gt;</string>
 		</dict>
+		<key>4D2994B2AE0A24424042042C19E12B8B</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXFileReference</string>
+			<key>lastKnownFileType</key>
+			<string>sourcecode.swift</string>
+			<key>path</key>
+			<string>ClaudeSettingsWriter.swift</string>
+			<key>sourceTree</key>
+			<string>&lt;group&gt;</string>
+		</dict>
+		<key>99D143B7FA525428B8314F76B297E7CC</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXFileReference</string>
+			<key>lastKnownFileType</key>
+			<string>sourcecode.swift</string>
+			<key>path</key>
+			<string>ProviderValidator.swift</string>
+			<key>sourceTree</key>
+			<string>&lt;group&gt;</string>
+		</dict>
+		<key>BB4E666D46E00C60F4D4EAE747C24444</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXFileReference</string>
+			<key>lastKnownFileType</key>
+			<string>sourcecode.swift</string>
+			<key>path</key>
+			<string>LocalProviderDetector.swift</string>
+			<key>sourceTree</key>
+			<string>&lt;group&gt;</string>
+		</dict>
+		<key>89504D0D0E8918A22A53F19B86771C65</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXBuildFile</string>
+			<key>fileRef</key>
+			<string>4D2994B2AE0A24424042042C19E12B8B</string>
+		</dict>
+		<key>315B552649CAE9972AD4A8D80014A28D</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXBuildFile</string>
+			<key>fileRef</key>
+			<string>99D143B7FA525428B8314F76B297E7CC</string>
+		</dict>
+		<key>787F19D30B1129115B86CBFB8FC3E234</key>
+		<dict>
+			<key>isa</key>
+			<string>PBXBuildFile</string>
+			<key>fileRef</key>
+			<string>BB4E666D46E00C60F4D4EAE747C24444</string>
+		</dict>
+	</dict>
+	<key>RA01AGENTSMD0000000000001</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/AGENTS.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA02SKILLDESKTOP0000000001</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/skills/desktop-automation/SKILL.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA03SKILLFILEEDIT0000000002</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/skills/file-editor/SKILL.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA04SKILLSHELLOP0000000003</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/skills/shell-ops/SKILL.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA05SKILLWEBFETC0000000004</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/skills/web-fetch-free/SKILL.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA06SKILLWEBSEAR0000000005</key>
+	<dict>
+		<key>isa</key>
+		<string>PBXFileReference</string>
+		<key>lastKnownFileType</key>
+		<string>net.daringfireball.markdown</string>
+		<key>path</key>
+		<string>JXRouter/Resources/skills/web-search-free/SKILL.md</string>
+		<key>sourceTree</key>
+		<string>SOURCE_ROOT</string>
+	</dict>
+	<key>RA07BUILDAGENTS0000000006</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA01AGENTSMD0000000000001</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
+	</dict>
+	<key>RA08BUILDSKILL010000000007</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA02SKILLDESKTOP0000000001</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
+	</dict>
+	<key>RA09BUILDSKILL020000000008</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA03SKILLFILEEDIT0000000002</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
+	</dict>
+	<key>RA10BUILDSKILL030000000009</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA04SKILLSHELLOP0000000003</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
+	</dict>
+	<key>RA11BUILDSKILL040000000010</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA05SKILLWEBFETC0000000004</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
+	</dict>
+	<key>RA12BUILDSKILL050000000011</key>
+	<dict>
+		<key>fileRef</key>
+		<string>RA06SKILLWEBSEAR0000000005</string>
+		<key>isa</key>
+		<string>PBXBuildFile</string>
 	</dict>
 	<key>rootObject</key>
 	<string>E3A3CC1F8127AEAB55DF44D3</string>

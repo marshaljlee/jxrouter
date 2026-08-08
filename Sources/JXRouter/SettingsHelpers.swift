@@ -76,25 +76,6 @@ struct LabeledField<Content: View>: View {
     }
 }
 
-// MARK: - Info Row
-
-struct InfoRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
-                .font(.system(size: DesignToken.captionSize))
-                .foregroundStyle(Color.dsTextSecondary)
-            Spacer()
-            Text(value)
-                .font(.system(size: DesignToken.captionSize, design: .monospaced))
-                .foregroundStyle(Color.dsTextPrimary)
-        }
-    }
-}
-
 // MARK: - App Rule Row
 
 struct AppRuleRow: View {
@@ -154,6 +135,9 @@ struct AppRuleRow: View {
 struct ComboBox: NSViewRepresentable {
     @Binding var text: String
     var options: [String]
+    /// Called every time the dropdown opens — used to auto-fetch fresh model
+    /// lists so the user never needs a manual refresh button.
+    var onOpen: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -170,10 +154,16 @@ struct ComboBox: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSComboBox, context: Context) {
-        if nsView.stringValue != text {
+        // Never fight the user: while they're actively typing in the field, or
+        // while the dropdown list is open, don't restore stringValue or rebuild
+        // the item list. Doing so mid-edit / mid-selection was wiping the user's
+        // model choice back to the old @State value ("reverts to big-pickle").
+        let isEditing = nsView.currentEditor() != nil
+        let listOpen = context.coordinator.isListOpen
+        if !isEditing, !listOpen, nsView.stringValue != text {
             nsView.stringValue = text
         }
-        if nsView.numberOfItems != options.count {
+        if !isEditing, !listOpen, nsView.numberOfItems != options.count {
             nsView.removeAllItems()
             nsView.addItems(withObjectValues: options)
         }
@@ -181,6 +171,9 @@ struct ComboBox: NSViewRepresentable {
 
     class Coordinator: NSObject, NSComboBoxDataSource, NSComboBoxDelegate {
         var parent: ComboBox
+        /// True while the dropdown list is open — item rebuilds are deferred so
+        /// an async model fetch can't reset the list under the user's cursor.
+        var isListOpen = false
 
         init(_ parent: ComboBox) { self.parent = parent }
 
@@ -202,9 +195,25 @@ struct ComboBox: NSViewRepresentable {
             parent.text = comboBox.stringValue
         }
 
+        /// Commit the field value when the user clicks/tabs away (e.g. directly
+        /// onto the Save button) so an in-progress edit is never lost.
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard let comboBox = obj.object as? NSComboBox else { return }
+            parent.text = comboBox.stringValue
+        }
+
         func comboBoxSelectionDidChange(_ notification: Notification) {
             guard let comboBox = notification.object as? NSComboBox else { return }
             parent.text = comboBox.stringValue
+        }
+
+        func comboBoxWillPopUp(_ notification: Notification) {
+            isListOpen = true
+            parent.onOpen?()
+        }
+
+        func comboBoxDidClose(_ notification: Notification) {
+            isListOpen = false
         }
     }
 }

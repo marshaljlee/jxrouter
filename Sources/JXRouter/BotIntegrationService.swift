@@ -154,7 +154,7 @@ final class BotIntegrationService {
     
     private func createFIFO() {
         if !FileManager.default.fileExists(atPath: fifoPath) {
-            mkfifo(fifoPath, 0o666)
+            mkfifo(fifoPath, 0o600)
         }
     }
     

@@ -66,7 +66,7 @@ final class StatusItemManager: NSObject {
         }
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 820),
             styleMask: [
                 .titled,
                 .closable,
@@ -140,6 +140,23 @@ final class StatusItemManager: NSObject {
             action: #selector(openSettingsAction),
             keyEquivalent: ","
         ))
+
+        // Security — CA trust management
+        menu.addItem(NSMenuItem.separator())
+        let securityLabel = NSMenuItem(title: "Security", action: nil, keyEquivalent: "")
+        securityLabel.isEnabled = false
+        menu.addItem(securityLabel)
+        menu.addItem(NSMenuItem(
+            title: "Install CA Certificate…",
+            action: #selector(installCACertificateAction),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Remove CA Certificate…",
+            action: #selector(removeCACertificateAction),
+            keyEquivalent: ""
+        ))
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(
             title: "Quit JXProxy",
@@ -167,6 +184,136 @@ final class StatusItemManager: NSObject {
     private func openSettingsAction() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
+
+    // MARK: - CA Trust Management
+
+    /// Path of the JXProxy CA certificate, mirroring `CertificateAuthority`
+    /// (`~/Library/Application Support/JXProxy/ca-cert.pem`).
+    private var caCertificatePath: String {
+        let appDir = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return appDir
+            .appendingPathComponent("JXProxy", isDirectory: true)
+            .appendingPathComponent("ca-cert.pem")
+            .path
+    }
+
+    /// Path of the user's login keychain.
+    private var loginKeychainPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Keychains/login.keychain-db")
+            .path
+    }
+
+    /// Common name of the JXProxy CA. `CertificateAuthority.generateCA()`
+    /// signs it with `-subj /CN=JXProxy CA`.
+    private var caCommonName: String { "JXProxy CA" }
+
+    /// Consent-based install of the JXProxy CA into the login keychain,
+    /// trusted as a root certificate for TLS interception.
+    @objc
+    private func installCACertificateAction() {
+        guard confirm(
+            title: "Install JXProxy CA Certificate?",
+            message: "This trusts the JXProxy root certificate (\(caCommonName)) in your login keychain so JXProxy can intercept and inspect TLS traffic to AI providers.\n\nOnly do this if you trust this Mac and the JXProxy app. You can remove the certificate at any time from this menu.",
+            confirmButton: "Install"
+        ) else { return }
+
+        let caPath = caCertificatePath
+        let keychainPath = loginKeychainPath
+        Task.detached(priority: .userInitiated) { [weak self] in
+            // Make sure the CA has actually been generated before installing.
+            guard CertificateAuthority.shared.ensureCA(),
+                  FileManager.default.fileExists(atPath: caPath) else {
+                await self?.presentError(
+                    title: "CA Certificate Not Found",
+                    message: "JXProxy could not generate its CA certificate at \(caPath), so nothing was installed."
+                )
+                return
+            }
+            let args = [
+                "add-trusted-cert",
+                "-d",
+                "-r", "trustRoot",
+                "-k", keychainPath,
+                caPath,
+            ]
+            let result = invokeSecurity(args)
+            await self?.finishSecurityRun(
+                status: result.status,
+                output: result.output,
+                args: args,
+                actionLabel: "Install CA Certificate"
+            )
+        }
+    }
+
+    /// Consent-based removal of the JXProxy CA from the login keychain.
+    @objc
+    private func removeCACertificateAction() {
+        guard confirm(
+            title: "Remove JXProxy CA Certificate?",
+            message: "This removes the \(caCommonName) certificate from your login keychain. After removal, JXProxy's TLS interception will no longer be trusted by this Mac.",
+            confirmButton: "Remove"
+        ) else { return }
+
+        let caName = caCommonName
+        let keychainPath = loginKeychainPath
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let args = ["delete-certificate", "-c", caName, "-k", keychainPath]
+            let result = invokeSecurity(args)
+            await self?.finishSecurityRun(
+                status: result.status,
+                output: result.output,
+                args: args,
+                actionLabel: "Remove CA Certificate"
+            )
+        }
+    }
+
+    /// Shows a modal confirmation dialog. Returns true when the user accepts.
+    private func confirm(title: String, message: String, confirmButton: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: confirmButton)
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Shows a modal error dialog on the main actor.
+    private func presentError(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    /// Handles the outcome of a `security` subprocess on the main actor:
+    /// logs a completion line and surfaces failures via NSAlert.
+    private func finishSecurityRun(
+        status: Int32,
+        output: String,
+        args: [String],
+        actionLabel: String
+    ) {
+        print("[CA Trust] \(actionLabel) completed: security \(args.joined(separator: " ")) -> exit \(status)")
+        guard status != 0 else { return }
+        let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        presentError(
+            title: "\(actionLabel) Failed",
+            message: detail.isEmpty
+                ? "The security command exited with code \(status)."
+                : detail
+        )
     }
 
     // MARK: - Icon Observation
@@ -246,5 +393,28 @@ private final class StatusBarClickView: NSView {
         // Return self so we receive mouse events, but forward everything else.
         let hit = super.hitTest(point)
         return hit == self ? self : hit
+    }
+}
+
+// MARK: - Security Subprocess
+
+/// Runs `/usr/bin/security` with the given arguments and returns its exit
+/// status plus captured combined output. Safe to call from any thread —
+/// used off the main thread by the CA trust flow.
+private func invokeSecurity(_ args: [String]) -> (status: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    process.arguments = args
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return (process.terminationStatus, output)
+    } catch {
+        return (-1, "\(error)")
     }
 }

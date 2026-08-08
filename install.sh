@@ -11,20 +11,36 @@ JXPROXY_AUTH_TOKEN="${JXPROXY_AUTH_TOKEN:-jxproxy}"
 LOCAL_BIN="${HOME}/.local/bin"
 APP_NAME="JXRouter"
 
+# Default auth token (documented in README). Override with JXPROXY_AUTH_TOKEN to customize.
+
 # Check for Xcode CLI tools
 if ! command -v xcodebuild >/dev/null 2>&1; then
     echo "Error: xcodebuild not found. Please run 'xcode-select --install'"
     exit 1
 fi
 
+# Pre-flight check: hardcoded ANTHROPIC_DEFAULT_* models in shell configs
+# force Claude Code to bypass JXProxy's tier routing.
+CONFLICT_FILES=""
+for f in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+    if [ -f "$f" ] && grep -qE 'ANTHROPIC_DEFAULT_(OPUS|SONNET|HAIKU)_MODEL' "$f" 2>/dev/null; then
+        CONFLICT_FILES="$CONFLICT_FILES $f"
+    fi
+done
+if [ -n "$CONFLICT_FILES" ]; then
+    echo ""
+    echo "⚠️  WARNING: Hardcoded ANTHROPIC_DEFAULT_* model variables detected in:"
+    echo "   $CONFLICT_FILES"
+    echo "   These override Claude's model selection and can break JXProxy's tier routing."
+    echo "   JXProxy installs a protective \`claude\` alias that neutralises them, and the app"
+    echo "   also neutralises them via ~/.claude/settings.json while running - but for best"
+    echo "   results consider deleting the ANTHROPIC_DEFAULT_* lines from those files."
+    echo ""
+fi
+
 echo ""
 echo "1. Cleaning previous builds..."
 rm -rf /tmp/JXRouterBuild 2>/dev/null
-rm -rf Build/ 2>/dev/null
-
-echo ""
-echo "2. Stripping extended attributes..."
-xattr -cr . 2>/dev/null || true
 
 echo ""
 echo "3. Building JXProxy..."
@@ -33,6 +49,21 @@ xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release S
 if [ $? -ne 0 ]; then
     echo "Build failed! Check xcodebuild output."
     exit 1
+fi
+
+echo ""
+echo "3b. Bundling agent resources..."
+APP_BUNDLE="/tmp/JXRouterBuild/Release/JXRouter.app"
+RESOURCES_SRC="$(dirname "$0")/JXRouter/Resources"
+RESOURCES_DST="$APP_BUNDLE/Contents/Resources"
+
+if [ -d "$RESOURCES_SRC" ]; then
+    cp "$RESOURCES_SRC/AGENTS.md" "$RESOURCES_DST/AGENTS.md"
+    mkdir -p "$RESOURCES_DST/skills"
+    cp -R "$RESOURCES_SRC/skills/"* "$RESOURCES_DST/skills/"
+    echo "   Bundled AGENTS.md + 5 skill SKILL.md files"
+else
+    echo "   WARNING: Resources/ directory not found at $RESOURCES_SRC"
 fi
 
 echo ""
@@ -52,8 +83,22 @@ rm -rf "/Applications/JXProxy.app" 2>/dev/null || true
 # Copy new build
 cp -R "$APP_BUNDLE" /Applications/
 
-# Sign the app in /Applications
-codesign --force --deep --sign - /Applications/JXRouter.app 2>/dev/null || true
+# Strip stray extended attributes on the deployed bundle only (never the repo)
+xattr -cr "/Applications/JXRouter.app" 2>/dev/null || true
+
+# A Release build must not contain debug dylibs; fail loudly if it does
+if find "/Applications/JXRouter.app" \( -name '*.debug.dylib' -o -name '*__preview.dylib' \) -print -quit | grep -q .; then
+    echo "Error: debug dylibs found in /Applications/JXRouter.app (stale debug build artifacts)." >&2
+    exit 1
+fi
+
+# Never ad-hoc re-sign: cp -R preserves the Xcode-produced signature.
+# Fail loudly if the copy invalidated it.
+if ! codesign --verify --deep --strict "/Applications/JXRouter.app"; then
+    echo "Error: code signature verification failed for /Applications/JXRouter.app." >&2
+    echo "   The copy invalidated the Xcode-produced signature; re-run the build." >&2
+    exit 1
+fi
 
 echo ""
 echo "5. Installing CLI launcher scripts..."
@@ -181,7 +226,7 @@ else
 fi
 echo "   Use the menu bar icon to control JXProxy."
 echo "   Default proxy port: ${JXPROXY_PORT:-5255}"
-echo "   Default auth token: ${JXPROXY_AUTH_TOKEN:-jxproxy}"
+echo "   Auth token: ${JXPROXY_AUTH_TOKEN:-jxproxy}"
 echo ""
 echo "   To use Claude Code via JXProxy:"
 echo "     jxclaude"
@@ -206,6 +251,11 @@ add_to_path() {
             echo "export JXPROXY_PORT=\"${JXPROXY_PORT}\"" >> "$shell_config"
             echo "export JXPROXY_AUTH_TOKEN=\"${JXPROXY_AUTH_TOKEN}\"" >> "$shell_config"
             echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$shell_config"
+            echo "" >> "$shell_config"
+            echo "# JXProxy protective alias - neutralises shell-level ANTHROPIC_DEFAULT_* model overrides" >> "$shell_config"
+            echo "# that would otherwise bypass JXProxy's tier routing. Plain \`claude\` keeps working." >> "$shell_config"
+            echo "alias claude=\"unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL && claude\"" >> "$shell_config"
+            echo "# End JXProxy" >> "$shell_config"
             echo "Added JXProxy configuration to $shell_config"
         fi
     fi

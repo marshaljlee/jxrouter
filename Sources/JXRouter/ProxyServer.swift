@@ -101,6 +101,12 @@ final class ProxyServer: @unchecked Sendable {
         self.port = port
         syncConfigCache()
         let params = NWParameters.tcp
+        // Security: accept connections from loopback only. All bundled launchers,
+        // install scripts, and docs point clients at http://127.0.0.1:<port>.
+        // Port 0 in the local endpoint (the real port lives in the `on:` argument)
+        // keeps the bind loopback-only; a specific port here makes NWListener
+        // throw EINVAL on creation.
+        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: 0)
 
         userInitiatedStop = false
         autoRestartCount = 0
@@ -393,8 +399,19 @@ final class ProxyServer: @unchecked Sendable {
 
         let lines = request.components(separatedBy: "\r\n")
         if let firstLine = lines.first {
-            if firstLine.contains("/api/hello") {
-                return .allowed
+            // Exempt only an exact /api/hello request target (origin-form or absolute-form).
+            let targetParts = firstLine.components(separatedBy: " ")
+            if targetParts.count >= 2 {
+                let target = targetParts[1]
+                let path: String
+                if target.hasPrefix("http://") || target.hasPrefix("https://") {
+                    path = URL(string: target)?.path ?? target
+                } else {
+                    path = target.components(separatedBy: "?").first ?? target
+                }
+                if path == "/api/hello" {
+                    return .allowed
+                }
             }
         }
 
@@ -404,10 +421,25 @@ final class ProxyServer: @unchecked Sendable {
         let bearerToken = authHeader.flatMap { $0.hasPrefix("Bearer ") ? String($0.dropFirst(7)) : nil }
 
         let provided = xApiKey ?? bearerToken
-        guard let provided, provided == authToken else {
+        guard let provided, constantTimeEquals(provided, authToken) else {
             return .denied("Invalid or missing auth token")
         }
         return .allowed
+    }
+
+    /// Constant-time string comparison: fixed loop over the longer length,
+    /// XOR-accumulates every byte pair, no early exit on mismatch.
+    private func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        let length = max(aBytes.count, bBytes.count)
+        var diff = UInt8(aBytes.count ^ bBytes.count)
+        for i in 0..<length {
+            let aByte = i < aBytes.count ? aBytes[i] : 0
+            let bByte = i < bBytes.count ? bBytes[i] : 0
+            diff |= aByte ^ bByte
+        }
+        return diff == 0
     }
 
     private func parseHeaders(from request: String) -> [String: String] {
@@ -600,14 +632,21 @@ final class ProxyServer: @unchecked Sendable {
         // Sanitize model IDs to remove newlines and excess whitespace.
         let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
         
-        var models: [[String: Any]] = [
-            ["id": sanitize(cfg.modelOpus), "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": sanitize(cfg.modelSonnet), "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": sanitize(cfg.modelHaiku), "object": "model", "created": now, "owned_by": "jxproxy"],
-        ]
+        var models: [[String: Any]] = []
+
+        // Skip entries whose model id is empty or whitespace-only after sanitizing.
+        let addModel: (String, String) -> Void = { rawId, ownedBy in
+            let id = sanitize(rawId)
+            guard !id.isEmpty else { return }
+            models.append(["id": id, "object": "model", "created": now, "owned_by": ownedBy])
+        }
+
+        addModel(cfg.modelOpus, "jxproxy")
+        addModel(cfg.modelSonnet, "jxproxy")
+        addModel(cfg.modelHaiku, "jxproxy")
         for preset in ProviderPreset.all {
             for modelId in preset.models {
-                models.append(["id": sanitize(modelId), "object": "model", "created": now, "owned_by": preset.id])
+                addModel(modelId, preset.id)
             }
         }
         let data = (try? JSONSerialization.data(withJSONObject: ["data": models])) ?? Data()
@@ -703,22 +742,7 @@ final class ProxyServer: @unchecked Sendable {
                     while bytesLeft > 0 {
                         try Task.checkCancellation()
                         let chunkSize = min(bytesLeft, 65536)
-                        let semaphore = DispatchSemaphore(value: 0)
-                        var chunkData = Data()
-                        var chunkError: Error?
-
-                        connection.receive(minimumIncompleteLength: 1, maximumLength: chunkSize) { data, _, _, error in
-                            if let d = data { chunkData = d }
-                            if let e = error { chunkError = e }
-                            semaphore.signal()
-                        }
-
-                        if semaphore.wait(timeout: readDeadline) == .timedOut {
-                            connection.cancel()
-                            throw TimeoutError("Body read timed out after 30s")
-                        }
-
-                        if let err = chunkError { throw err }
+                        let chunkData = try waitForBody(connection: connection, maxLength: chunkSize, deadline: readDeadline)
                         bodyData.append(chunkData)
                         bytesLeft -= chunkData.count
                         if chunkData.isEmpty { break }
@@ -794,13 +818,18 @@ final class ProxyServer: @unchecked Sendable {
     // MARK: - Stats
 
     private func updateStats(for host: String, action: RouteAction) {
-        switch action {
-        case .routeAI:
-            stats.aiRouted += 1
-        case .passthrough:
-            stats.passthrough += 1
-        case .block:
-            stats.blocked += 1
+        // updateStats runs on the NW DispatchQueue while JXRouterView reads
+        // `stats` on the MainActor — hop the mutation to the main actor to
+        // avoid a data race on the read-modify-write.
+        Task { @MainActor in
+            switch action {
+            case .routeAI:
+                self.stats.aiRouted += 1
+            case .passthrough:
+                self.stats.passthrough += 1
+            case .block:
+                self.stats.blocked += 1
+            }
         }
     }
 
@@ -815,6 +844,49 @@ final class ProxyServer: @unchecked Sendable {
         connection.send(content: data, completion: .contentProcessed({ _ in
             connection.cancel()
         }))
+    }
+
+    /// Guards against self-connection loops: if a request targets this proxy's own
+    /// loopback listener, reject it with a 502 and close the connection instead of
+    /// opening an upstream connection back into ourselves. Returns true when rejected.
+    private func rejectIfSelfTarget(_ connection: NWConnection, host: String, port: UInt16) -> Bool {
+        let hostOnly = host.split(separator: ":").first.map(String.init) ?? host
+        let isLoopback = hostOnly == "127.0.0.1" || hostOnly == "localhost"
+        guard isLoopback && port == self.port else { return false }
+
+        let body = "Request loop detected"
+        let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
+        guard let data = response.data(using: .utf8) else {
+            connection.cancel()
+            return true
+        }
+        connection.send(content: data, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+        return true
+    }
+
+    /// Synchronous blocking read of one body chunk. Kept as a non-async helper so the
+    /// semaphore wait stays legal under Swift 6 (DispatchSemaphore.wait is unavailable
+    /// in async contexts).
+    private func waitForBody(connection: NWConnection, maxLength: Int, deadline: DispatchTime) throws -> Data {
+        let semaphore = DispatchSemaphore(value: 0)
+        var chunkData = Data()
+        var chunkError: Error?
+
+        connection.receive(minimumIncompleteLength: 1, maximumLength: maxLength) { data, _, _, error in
+            if let d = data { chunkData = d }
+            if let e = error { chunkError = e }
+            semaphore.signal()
+        }
+
+        if semaphore.wait(timeout: deadline) == .timedOut {
+            connection.cancel()
+            throw TimeoutError("Body read timed out after 30s")
+        }
+
+        if let err = chunkError { throw err }
+        return chunkData
     }
 
     // MARK: - CONNECT Tunnel Handler (Routes AI hosts through DirectTLS)
@@ -846,6 +918,9 @@ final class ProxyServer: @unchecked Sendable {
             return
         }
         let connectHost = targetParts.dropLast().joined(separator: ":")
+
+        // Reject CONNECT to our own listening port (self-connection loop).
+        if rejectIfSelfTarget(connection, host: connectHost, port: connectPort) { return }
 
         // For AI hosts, attempt MITM handler (which now does TCP relay, no actual MITM)
         let isMITMHost = cachedMitmHosts.contains { host in
@@ -965,6 +1040,7 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     private func forwardDirectly(_ connection: NWConnection, initialData: Data, host: String, port: UInt16) {
+        if rejectIfSelfTarget(connection, host: host, port: port) { return }
         let target = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         target.start(queue: queue)
 

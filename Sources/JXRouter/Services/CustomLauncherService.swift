@@ -153,11 +153,19 @@ struct CustomLauncherService {
             let path = "\(localBinPath)/\(launcher.name)"
             try scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
             
-            // Make executable
+            // Owner-only permissions: scripts embed auth tokens / API keys (ticket 0017)
             var attributes = try fileManager.attributesOfItem(atPath: path)
-            let currentPermissions = attributes[.posixPermissions] as? NSNumber ?? NSNumber(value: 0o755)
-            attributes[.posixPermissions] = NSNumber(value: currentPermissions.intValue | 0o111)
+            attributes[.posixPermissions] = NSNumber(value: 0o700)
             try fileManager.setAttributes(attributes, ofItemAtPath: path)
+        }
+
+        // Re-chmod any pre-existing token-bearing launchers (ticket 0017)
+        for name in ["jxclaude", "jxcodex", "jxpi", "jxserver"] {
+            let existingPath = "\(localBinPath)/\(name)"
+            guard fileManager.fileExists(atPath: existingPath) else { continue }
+            var attrs = try fileManager.attributesOfItem(atPath: existingPath)
+            attrs[.posixPermissions] = NSNumber(value: 0o700)
+            try fileManager.setAttributes(attrs, ofItemAtPath: existingPath)
         }
         
         // Write ChatML chat template for llama-server --chat-template

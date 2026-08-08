@@ -37,10 +37,13 @@ final class SystemProxyManager {
                 .filter { !$0.isEmpty && $0 != "An asterisk (*) denotes that a network service is disabled." }
 
             availableInterfaces = lines.map { name in
-                NetworkInterface(
-                    id: name,
-                    name: name,
-                    displayName: name
+                // Disabled services come back as "*ServiceName" — networksetup
+                // commands expect the name without the leading asterisk.
+                let clean = name.hasPrefix("*") ? String(name.dropFirst()) : name
+                return NetworkInterface(
+                    id: clean,
+                    name: clean,
+                    displayName: clean
                 )
             }
 
@@ -53,6 +56,7 @@ final class SystemProxyManager {
     }
 
     func enable() {
+        if selectedInterface.isEmpty { discoverInterfaces() }
         guard !selectedInterface.isEmpty else { return }
         runNetworksetup(arguments: [
             "-setwebproxy", selectedInterface, proxyAddress, "\(proxyPort)",
@@ -69,22 +73,44 @@ final class SystemProxyManager {
         isEnabled = true
     }
 
+    /// Turn the proxy OFF on every network service, not just the selected one.
+    /// A stale proxy on ANY interface routes that interface's traffic to a dead
+    /// port and kills internet for every app on it — this is the #1 cause of
+    /// "no internet after JXProxy quits". Used on termination, launch sweep,
+    /// and stop.
     func disable() {
-        guard !selectedInterface.isEmpty else { return }
-        runNetworksetup(arguments: [
-            "-setwebproxystate", selectedInterface, "off",
-        ])
-        runNetworksetup(arguments: [
-            "-setsecurewebproxystate", selectedInterface, "off",
-        ])
+        discoverInterfaces()
+        for iface in allInterfaceIds() {
+            runNetworksetup(arguments: [
+                "-setwebproxystate", iface, "off",
+            ])
+            runNetworksetup(arguments: [
+                "-setsecurewebproxystate", iface, "off",
+            ])
+        }
         isEnabled = false
     }
 
+    /// Whether the proxy is enabled on ANY network service.
     func queryState() {
-        guard !selectedInterface.isEmpty else { return }
-        let web = getProxyState(arguments: ["-getwebproxy", selectedInterface])
-        let secure = getProxyState(arguments: ["-getsecurewebproxy", selectedInterface])
-        isEnabled = web || secure
+        discoverInterfaces()
+        var anyEnabled = false
+        for iface in allInterfaceIds() {
+            let web = getProxyState(arguments: ["-getwebproxy", iface])
+            let secure = getProxyState(arguments: ["-getsecurewebproxy", iface])
+            if web || secure { anyEnabled = true }
+        }
+        isEnabled = anyEnabled
+    }
+
+    /// All interface ids to operate on — every discovered service plus the
+    /// selected one (in case discovery races a selection change).
+    private func allInterfaceIds() -> [String] {
+        var ids = availableInterfaces.map(\.id)
+        if !selectedInterface.isEmpty, !ids.contains(selectedInterface) {
+            ids.append(selectedInterface)
+        }
+        return ids
     }
 
     private func runNetworksetup(arguments: [String]) {

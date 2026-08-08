@@ -100,6 +100,14 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
                     continue
                 }
+                // Non-primary providers: 4xx client errors (400 model unavailable,
+                // 401 auth, 403 forbidden, 404 not found, 429 rate limit) mean this
+                // provider can't serve the request — continue the chain. The primary
+                // provider's 4xx response semantics stay unchanged (returned as-is).
+                if index > 0, [400, 401, 403, 404, 429].contains(response.statusCode) {
+                    lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
+                    continue
+                }
                 return response
             } catch {
                 lastError = error
@@ -118,9 +126,8 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         let apiKey = config.apiKey(for: providerId)
         let baseUrl = config.baseUrl(for: providerId)
         
-        let knownPrefixes = ["opencode/", "openrouter/", "openai/", "ollama/", "deepseek/", "xai/", "gemini/", "mistral/", "codestral/", "cohere/", "groq/", "fireworks/", "sambanova/", "cerebras/", "huggingface/", "github_models/", "wafer/", "kimi/", "kimi_code/", "minimax/", "zai/", "ollama_cloud/", "vercel/", "nvidia_nim/", "lmstudio/", "llamacpp/"]
         var model = resolvedModel
-        for prefix in knownPrefixes {
+        for prefix in ProviderPreset.knownPrefixes {
             if model.hasPrefix(prefix) {
                 model = String(model.dropFirst(prefix.count))
                 break
@@ -131,17 +138,21 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "direct":
             return try await routeToAnthropicDirect(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl)
         case "openrouter":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: true)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: true)
         case "opencode-zen", "opencode-go", "openai":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "nvidia-nim":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
-        case "deepseek", "gemini", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
+        case "deepseek", "gemini", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway", "custom", "jan":
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
+        case let pid where config.customProviders.contains(where: { $0.id == pid }):
+            // Named custom providers (Settings → Providers → Custom Providers)
+            // route through the same OpenAI-compatible path.
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "local", "ollama":
-            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, providerId: providerId, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false)
         case "lmstudio", "llamacpp":
-            return try await routeToOpenAICompatible(request: request, model: model, apiKey: "", baseUrl: baseUrl, isOpenRouter: false)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: "", baseUrl: baseUrl, isOpenRouter: false)
         default:
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Unknown provider: \(providerId)")
         }
@@ -149,6 +160,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     private func routeToAnthropicDirect(request: MessagesRequest, model: String, apiKey: String, baseUrl: String) async throws -> ProviderResponse {
         guard !apiKey.isEmpty else { return errorResponse(statusCode: 401, type: "authentication_error", message: "ANTHROPIC_API_KEY not configured") }
+        // The direct Anthropic path forwards the body untouched, so reasoning is
+        // preserved natively and the per-provider reasoning policy does not apply
+        // here — client-side thinking (ENABLE_MODEL_THINKING) governs it.
         var bodyDict = request.json
         bodyDict["model"] = model
         
@@ -173,8 +187,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func routeToOpenAICompatible(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, isOpenRouter: Bool) async throws -> ProviderResponse {
-        let openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model)
+    private func routeToOpenAICompatible(request: MessagesRequest, model: String, providerId: String, apiKey: String, baseUrl: String, isOpenRouter: Bool) async throws -> ProviderResponse {
+        // Resolve the effective reasoning pass-through for this provider + model
+        // (global master switch → per-provider auto/on/off → capability heuristic).
+        let reasoningEnabled = config.reasoningEnabled(for: providerId, model: model)
+        let openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model, enableThinking: reasoningEnabled)
         
         let url = URL(string: "\(baseUrl)/chat/completions")!
         let host = url.host ?? "api.openai.com"
@@ -195,18 +212,18 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         
         if request.stream {
             let (response, stream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: body, resolveIP: ip)
-            return try await handleOpenAIStreaming(response: response, stream: stream, request: request)
+            return try await handleOpenAIStreaming(response: response, stream: stream, request: request, reasoningEnabled: reasoningEnabled)
         } else {
             let (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: body, resolveIP: ip)
             let statusCode = response.statusCode
             guard statusCode == 200 else { return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: data) }
-            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: request.model))
+            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: request.model, enableThinking: reasoningEnabled))
         }
     }
     
     // MARK: - Streaming
     
-    private func handleOpenAIStreaming(response: HTTPURLResponse, stream inputStream: AsyncStream<Data>, request: MessagesRequest) async throws -> ProviderResponse {
+    private func handleOpenAIStreaming(response: HTTPURLResponse, stream inputStream: AsyncStream<Data>, request: MessagesRequest, reasoningEnabled: Bool) async throws -> ProviderResponse {
         let statusCode = response.statusCode
 
         if statusCode != 200 {
@@ -224,6 +241,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         Task {
             do {
                 var buffer = Data()
+                // Per-stream translation state: allocates Anthropic block indices so
+                // reasoning can stream as a thinking block ahead of text.
+                var streamState = MessageTranslator.OpenAIStreamState()
                 // FIX #3: Label the outer for-await loop so we can break out of it on [DONE].
                 streamLoop: for await chunk in inputStream {
                     buffer.append(chunk)
@@ -252,7 +272,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                             continue
                         }
 
-                        let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, alreadyStarted: hasStarted)
+                        let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, state: &streamState, enableThinking: reasoningEnabled)
                         for event in events {
                             if event.contains("content_block_start") { hasStarted = true }
                             if event.contains("message_delta") {
@@ -275,11 +295,12 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
                 if !hasFinished {
                     // If content blocks were started but we never got a finish_reason,
-                    // emit content_block_stop + message_delta + message_stop so the
-                    // client doesn't hang waiting for the stream to end.
+                    // close every opened block, then message_delta + message_stop so
+                    // the client doesn't hang waiting for the stream to end.
                     if hasStarted {
-                        let cbStop = SSEFormatter.format(event: "content_block_stop", data: "{\"type\":\"content_block_stop\",\"index\":0}")
-                        continuation.yield(Data(cbStop.utf8))
+                        for blockIndex in streamState.openedBlocks {
+                            continuation.yield(Data(SSEFormatter.blockStop(index: blockIndex).utf8))
+                        }
                         let msgDelta = SSEFormatter.format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}")
                         continuation.yield(Data(msgDelta.utf8))
                     }
@@ -314,33 +335,82 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     // MARK: - Helpers
     
     /// Resolve the incoming model name to the actual model to send to the provider.
-    /// For local providers (llamacpp, ollama, lmstudio, local) the tier mapping
-    /// (opus → modelOpus, sonnet → modelSonnet) is skipped — the default model
-    /// is used directly since the user is expected to configure it in Settings.
-    /// For well-known model names (starting with "claude-", "gpt-", "gemini-", etc.),
-    /// passes through directly instead of applying tier mapping.
-    /// Tier mapping only applies when the incoming model is exactly "opus", "sonnet",
-    /// or "haiku" — NOT when it's part of a longer model name.
+    ///
+    /// Fixes tier routing for Claude Code's native requests: Claude sends model
+    /// names like `claude-opus-4-6-20250805` / `claude-sonnet-4-6` / `claude-haiku-4-5`
+    /// (or the short `opus`/`sonnet`/`haiku`), and each tier must be mapped to the
+    /// user's per-tier overrides. Previously only the exact single-word tier names
+    /// were mapped and every `claude-*` name passed straight through, so tier
+    /// routing silently did nothing for native requests.
+    ///
+    /// Rules:
+    /// - `direct` (real Anthropic API): native names pass through untouched.
+    /// - Local providers (llamacpp, ollama, lmstudio, jan, local): a non-empty
+    ///   Default Model acts as a catch-all; otherwise tier mapping; else passthrough.
+    /// - Provider-prefixed names (`opencode/big-pickle`) pass through.
+    /// - Native Claude tier names → per-tier override when configured.
+    /// - Other well-known names (`gpt-*`, `gemini-*`) pass through.
     private func resolveModel(_ incomingModel: String, for providerId: String? = nil) -> String {
-        let localProviders = ["llamacpp", "lmstudio", "local", "ollama"]
-        if let pid = providerId, localProviders.contains(pid) {
-            return config.model
-        }
-        if incomingModel.contains("/") { return incomingModel }
-        
-        // Pass through well-known Anthropic model names directly
         let lower = incomingModel.lowercased()
-        if lower.hasPrefix("claude-") || lower.hasPrefix("gpt-") || lower.hasPrefix("gemini-") {
+
+        // Direct Anthropic: native model names must reach the real API untouched.
+        if providerId == "direct" { return incomingModel }
+
+        let localProviders = ["llamacpp", "lmstudio", "local", "ollama", "jan"]
+        if let pid = providerId, localProviders.contains(pid) {
+            // A non-empty Default Model is a catch-all for local providers —
+            // whatever the agent sends (opus, sonnet, big-pickle, …) is replaced
+            // with the local model the user configured.
+            if !config.model.isEmpty { return config.model }
+            if let tier = tierName(for: lower), let mapped = tierOverride(for: tier) { return mapped }
+            // No mapping at all: pass through so the local server can resolve it.
             return incomingModel
         }
-        
-        // Tier mapping: ONLY for exact single-word tier names
-        if lower == "opus", !config.modelOpus.isEmpty { return config.modelOpus }
-        if lower == "sonnet", !config.modelSonnet.isEmpty { return config.modelSonnet }
-        if lower == "haiku", !config.modelHaiku.isEmpty { return config.modelHaiku }
-        
-        // For any other model name, pass through as-is (no tier substring matching)
+
+        // Provider-prefixed names (e.g. "opencode/big-pickle") pass through.
+        if incomingModel.contains("/") { return incomingModel }
+
+        // Native Claude tier names → the user's per-tier override when set.
+        // When no override is configured for that tier, the native name passes
+        // through so the upstream (OpenAI-compatible) endpoint can try it.
+        if let tier = tierName(for: lower) {
+            if let mapped = tierOverride(for: tier) { return mapped }
+            return incomingModel
+        }
+
+        // Other well-known names pass through untouched.
+        if lower.hasPrefix("gpt-") || lower.hasPrefix("gemini-") { return incomingModel }
+
+        // Any other model name passes through as-is.
         return incomingModel
+    }
+
+    /// Classify a model name into the Claude tier it belongs to, matching both
+    /// the short tier names ("opus") and the native Claude model families
+    /// ("claude-opus-4-6-…", "claude-3-5-sonnet-…", "claude-3-haiku-…").
+    private func tierName(for lower: String) -> String? {
+        if lower == "opus" || lower.hasPrefix("claude-opus") || lower.hasPrefix("claude-3-opus") { return "opus" }
+        if lower == "sonnet"
+            || lower.hasPrefix("claude-sonnet")
+            || lower.hasPrefix("claude-3-sonnet")
+            || lower.hasPrefix("claude-3-5-sonnet")
+            || lower.hasPrefix("claude-3-7-sonnet") { return "sonnet" }
+        if lower == "haiku"
+            || lower.hasPrefix("claude-haiku")
+            || lower.hasPrefix("claude-3-haiku")
+            || lower.hasPrefix("claude-3-5-haiku")
+            || lower.hasPrefix("claude-3-7-haiku") { return "haiku" }
+        return nil
+    }
+
+    /// The configured model override for a tier, or nil when unset.
+    private func tierOverride(for tier: String) -> String? {
+        switch tier {
+        case "opus": return config.modelOpus.isEmpty ? nil : config.modelOpus
+        case "sonnet": return config.modelSonnet.isEmpty ? nil : config.modelSonnet
+        case "haiku": return config.modelHaiku.isEmpty ? nil : config.modelHaiku
+        default: return nil
+        }
     }
     
     private func handleTokenCount(body: Data) -> ProviderResponse {
@@ -362,15 +432,24 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     private func handleModelList() -> ProviderResponse {
         let now = Int(Date().timeIntervalSince1970)
-        var models: [[String: Any]] = [
-            ["id": config.modelOpus, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": config.modelSonnet, "object": "model", "created": now, "owned_by": "jxproxy"],
-            ["id": config.modelHaiku, "object": "model", "created": now, "owned_by": "jxproxy"],
-        ]
-        
+        var models: [[String: Any]] = []
+
+        // Sanitize model IDs to remove newlines and excess whitespace.
+        let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
+
+        // Skip entries whose model id is empty or whitespace-only after sanitizing.
+        let addModel: (String, String) -> Void = { rawId, ownedBy in
+            let id = sanitize(rawId)
+            guard !id.isEmpty else { return }
+            models.append(["id": id, "object": "model", "created": now, "owned_by": ownedBy])
+        }
+
+        addModel(config.modelOpus, "jxproxy")
+        addModel(config.modelSonnet, "jxproxy")
+        addModel(config.modelHaiku, "jxproxy")
         for preset in ProviderPreset.all {
             for modelId in preset.models {
-                models.append(["id": modelId, "object": "model", "created": now, "owned_by": preset.id])
+                addModel(modelId, preset.id)
             }
         }
         

@@ -28,6 +28,11 @@ final class DirectTLSHandler: @unchecked Sendable {
     /// Cached multi-domain identity (loaded once, reused).
     private var multiDomainIdentity: sec_identity_t?
 
+    /// Maximum request bytes accumulated before the connection is rejected (16 MiB).
+    private let maxBodyBytes = 16 * 1024 * 1024
+    /// Idle timeout: the connection is closed if no data arrives within this window.
+    private let idleTimeout: TimeInterval = 60
+
     init(providerRouter: ProviderRouter?) {
         self.providerRouter = providerRouter
     }
@@ -55,6 +60,11 @@ final class DirectTLSHandler: @unchecked Sendable {
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.enableKeepalive = false
         let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
+        // Security: accept connections from loopback only. This listener handles
+        // DNS-redirected traffic that pf forwards to 127.0.0.1:{proxyPort + 1}.
+        // Port 0 in the local endpoint (real port in `on:`) keeps the bind
+        // loopback-only; a specific port here throws EINVAL at listener creation.
+        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: 0)
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else {
             print("[DirectTLS] Failed to create TLS listener on port \(port)")
@@ -82,7 +92,7 @@ final class DirectTLSHandler: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { connection.cancel(); return }
             connection.start(queue: self.queue)
-            self.receiveRequest(connection: connection, accumulatedData: Data())
+            self.receiveRequest(connection: connection, accumulatedData: Data(), deadline: DispatchTime.now() + self.idleTimeout)
         }
 
         listener.start(queue: queue)
@@ -99,13 +109,27 @@ final class DirectTLSHandler: @unchecked Sendable {
 
     // MARK: - Connection Handling
 
-    private func receiveRequest(connection: NWConnection, accumulatedData: Data) {
+    private func receiveRequest(connection: NWConnection, accumulatedData: Data, deadline: DispatchTime) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 131_072) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             
             var newData = accumulatedData
             if let data = data, !data.isEmpty {
                 newData.append(data)
+            }
+            
+            // Cap total accumulated bytes to bound memory usage — stop recursing.
+            if newData.count > self.maxBodyBytes {
+                self.sendError(connection, statusCode: 413, message: "Request body too large")
+                connection.cancel()
+                return
+            }
+            
+            // Idle timeout: close the connection if nothing arrived before the deadline.
+            if DispatchTime.now() >= deadline {
+                self.sendError(connection, statusCode: 408, message: "Request timeout")
+                connection.cancel()
+                return
             }
             
             if error != nil {
@@ -150,7 +174,7 @@ final class DirectTLSHandler: @unchecked Sendable {
                 return
             }
             
-            self.receiveRequest(connection: connection, accumulatedData: newData)
+            self.receiveRequest(connection: connection, accumulatedData: newData, deadline: DispatchTime.now() + self.idleTimeout)
         }
     }
     
@@ -222,7 +246,7 @@ final class DirectTLSHandler: @unchecked Sendable {
                 
                 let endChunk = Data("0\r\n\r\n".utf8)
                 connection.send(content: endChunk, completion: .contentProcessed({ [weak self] _ in
-                    self?.receiveRequest(connection: connection, accumulatedData: Data())
+                    self?.receiveRequest(connection: connection, accumulatedData: Data(), deadline: DispatchTime.now() + (self?.idleTimeout ?? 60))
                 }))
             } else {
                 respStr += "Content-Length: \(response.body.count)\r\n\r\n"
@@ -230,7 +254,7 @@ final class DirectTLSHandler: @unchecked Sendable {
                 fullResponse.append(response.body)
 
                 connection.send(content: fullResponse, completion: .contentProcessed({ [weak self] _ in 
-                    self?.receiveRequest(connection: connection, accumulatedData: Data())
+                    self?.receiveRequest(connection: connection, accumulatedData: Data(), deadline: DispatchTime.now() + (self?.idleTimeout ?? 60))
                 }))
             }
         } catch {

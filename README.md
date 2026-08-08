@@ -63,6 +63,8 @@ Recommended free/zero-config providers:
 - **Groq** — Free tier with Llama models
 - **Ollama** — Fully local, no key needed
 
+> 🆓 **New to this?** See [Getting Free API Keys — Step-by-Step Guide for Everyone](docs/tutorials/getting-free-api-keys.md) for a plain-language walkthrough of signing up for **OpenCode Zen** (no key needed) and **NVIDIA NIM** (free key with 1,000 free credits), written for non-technical users. The app also has a built-in guide: **Settings → Providers → "Get a free API key"**.
+
 ### 4. Run Your Coding Agent
 
 **Claude Code:**
@@ -209,6 +211,37 @@ JXProxy acts as a local gateway:
 - Xcode Command Line Tools (`xcode-select --install`)
 - Claude Code: `npm install -g @anthropic-ai/claude-code`
 - Codex: Install from [chatgpt.com/codex](https://chatgpt.com/codex)
+
+## Troubleshooting / Known Issues
+
+### Tier routing does nothing (Opus/Sonnet/Haiku always use the same model)
+
+Check your shell configs (`~/.zshenv`, `~/.zshrc`, `~/.bash_profile`) for
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` or
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`. These force Claude Code to request a specific
+model, bypassing JXProxy's per-tier routing. Delete those lines.
+
+Since install v1.x, JXProxy neutralises them automatically while the proxy is
+running by writing empty values into `~/.claude/settings.json` (an empty string
+is treated as "not set" by Claude Code), and a protective `claude` alias is
+added to your shell config as a second line of defence. But for a fully clean
+setup, remove the variables from your shell configs — `./uninstall.sh` also
+removes the alias and the settings.json entries JXProxy wrote.
+
+### Claude Code stopped routing through JXProxy after I edited shell configs
+
+The most common cause is that `ANTHROPIC_BASE_URL` (which pointed Claude at
+`http://127.0.0.1:5255`) was removed together with the model variables. While
+JXProxy is running it manages `~/.claude/settings.json` for you, so:
+
+1. Click **Restart** in the JXProxy window (re-writes routing + DNS).
+2. Start a **new** Terminal window and run `claude`.
+3. Verify routing with `jxclaude` or check the Logs tab in Settings.
+
+### Changing tiers in the app "does nothing"
+
+See the first entry — hardcoded `ANTHROPIC_DEFAULT_*` variables in `~/.zshenv`
+or `~/.zshrc` override the app's choices and must be deleted.
 
 ## Uninstall
 

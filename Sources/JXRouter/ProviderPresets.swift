@@ -51,10 +51,75 @@ struct ProviderPreset: Identifiable, Hashable {
         ProviderPreset(id: "ollama", name: "Ollama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:11434/v1", models: ["qwen3:latest", "qwen2.5:latest", "llama3.2:latest", "mistral:latest"], requiresKey: false),
         ProviderPreset(id: "lmstudio", name: "LM Studio (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1234/v1", models: ["lmstudio/<model-id>"], requiresKey: false),
         ProviderPreset(id: "llamacpp", name: "llama.cpp (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "jan", name: "Jan (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1337/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "custom", name: "Custom (OpenAI-compatible)", symbol: "puzzlepiece.extension", defaultUrl: "https://api.openai.com/v1", models: [], requiresKey: true),
     ]
 
     static func preset(for id: String) -> ProviderPreset? {
         all.first { $0.id == id }
+    }
+
+    // MARK: - Model Naming
+
+    /// Routing prefixes the proxy strips before forwarding a model id upstream.
+    /// Single source of truth — `ProviderRouter` uses this to resolve models and
+    /// the UI uses `bareModel` to display clean names.
+    static let knownPrefixes: [String] = [
+        "opencode/", "openrouter/", "openai/", "ollama/", "deepseek/", "xai/",
+        "gemini/", "mistral/", "codestral/", "cohere/", "groq/", "fireworks/",
+        "sambanova/", "cerebras/", "huggingface/", "github_models/", "wafer/",
+        "kimi/", "kimi_code/", "minimax/", "zai/", "ollama_cloud/", "vercel/",
+        "nvidia_nim/", "lmstudio/", "llamacpp/",
+    ]
+
+    /// The routing prefix for a provider id ("opencode/" for opencode-zen, …).
+    /// Empty for providers whose models are always bare (direct, xai, llamacpp).
+    static func prefix(for providerId: String) -> String {
+        switch providerId {
+        case "opencode-zen", "opencode-go": return "opencode/"
+        case "nvidia-nim": return "nvidia/"
+        case "openrouter": return "openrouter/"
+        case "openai": return "openai/"
+        case "deepseek": return "deepseek/"
+        case "gemini": return "gemini/"
+        case "mistral": return "mistral/"
+        case "codestral": return "codestral/"
+        case "cohere": return "cohere/"
+        case "groq": return "groq/"
+        case "fireworks": return "fireworks/"
+        case "sambanova": return "sambanova/"
+        case "cerebras": return "cerebras/"
+        case "huggingface": return "huggingface/"
+        case "github-models": return "github_models/"
+        case "wafer": return "wafer/"
+        case "kimi": return "kimi/"
+        case "kimi-code": return "kimi_code/"
+        case "minimax": return "minimax/"
+        case "zai": return "zai/"
+        case "ollama-cloud": return "ollama_cloud/"
+        case "ai-gateway": return "vercel/"
+        case "ollama": return "ollama/"
+        case "lmstudio": return "lmstudio/"
+        default: return ""
+        }
+    }
+
+    /// Strip the provider's own routing prefix so stored/displayed model ids use
+    /// clean names ("opencode/big-pickle" → "big-pickle"). Other prefixes are
+    /// preserved — they may be meaningful upstream (e.g. openrouter's
+    /// "anthropic/claude-…" path must reach the API intact).
+    static func bareModel(_ model: String, for providerId: String) -> String {
+        let prefix = prefix(for: providerId)
+        guard !prefix.isEmpty, model.hasPrefix(prefix) else { return model }
+        let remainder = String(model.dropFirst(prefix.count))
+        // Nested ids like "github_models/openai/gpt-4.1" must keep their inner
+        // prefix — the router strips only ONE known prefix per request, so a
+        // bare "openai/gpt-4.1" would lose the "openai/" part on the way
+        // upstream and break routing.
+        if knownPrefixes.contains(where: { remainder.hasPrefix($0) }) {
+            return model
+        }
+        return remainder
     }
 }
 
