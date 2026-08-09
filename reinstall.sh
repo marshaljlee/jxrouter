@@ -170,8 +170,10 @@ echo "9. Removing DNS hijack entries (requires admin)..."
 echo "   You may be prompted for your password..."
 
 CLEANUP_SCRIPT=""
-if grep -q "JXProxy DNS Hijack" /etc/hosts 2>/dev/null; then
-    CLEANUP_SCRIPT="$CLEANUP_SCRIPT cp /etc/hosts /etc/hosts.jxproxy.backup; sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts;"
+# Strip hijack blocks written by any app version — the current JXProxy marker
+# and the legacy pre-rebrand ProxySwitch marker.
+if grep -qE "DNS Hijack" /etc/hosts 2>/dev/null; then
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT cp /etc/hosts /etc/hosts.jxproxy.backup; sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts; sed -i '' '/# ProxySwitch DNS Hijack/,/# End ProxySwitch DNS Hijack/d' /etc/hosts;"
 fi
 CLEANUP_SCRIPT="$CLEANUP_SCRIPT /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true;"
 CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/dscacheutil -flushcache 2>/dev/null || true;"

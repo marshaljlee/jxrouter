@@ -30,11 +30,24 @@ Pods/
 
 # MCP / Credentials
 .mcp.json
-.jetro/daemon/credentials.json
 
-# IDE configs
+# IDE / agent configs
 .cursor/
 .codex/
 .agents/
 .TerMinal/
 .claude/
+.zcode/
+.gitlab/
+
+# Agent runtime & scratch dirs (recreated on demand)
+.freebuff/
+.app-lifecycle/
+.omo/
+data/
+deepfork-out/
+projects/
+*.duckdb
+
+# Legacy Jetro extension data (different product; was accidentally tracked)
+.jetro/

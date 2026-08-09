@@ -1,11 +1,9 @@
 import Foundation
 import Network
 
-/// Handles direct TLS-terminated connections from DNS-redirected traffic.
-///
-/// When DNS resolution points AI API hosts to `127.0.0.1` (via DNSRedirectionManager)
-/// and pf redirects port 443 to the proxy's TLS port, apps connect directly to this
-/// handler thinking they're talking to the real API server.
+/// Handles direct TLS-terminated connections from intercepted AI traffic
+/// (CONNECT tunnels routed by MITMHandler). Terminates TLS on the proxy's
+/// TLS port (port + 1) and feeds the decrypted request to ProviderRouter.
 ///
 /// Flow:
 /// 1. NWListener with TLS configured using multi-domain cert from CertificateAuthority
@@ -27,6 +25,19 @@ final class DirectTLSHandler: @unchecked Sendable {
 
     /// Cached multi-domain identity (loaded once, reused).
     private var multiDomainIdentity: sec_identity_t?
+
+    /// Paths the provider router understands. Anything else on an intercepted
+    /// AI host (OpenAI's /v1/responses, /v1/embeddings, /v1/models/{id}, …) is
+    /// passed through as a fresh TLS connection to the real host so the proxy
+    /// never interferes with endpoints it doesn't route.
+    private static let routedPaths: Set<String> = [
+        "/v1/messages", "/v1/v1/messages", "/messages",
+        "/v1/messages/count_tokens",
+        "/v1/chat/completions", "/v1/v1/chat/completions", "/chat/completions",
+        "/v1/models",
+        "/health", "/", "/api/hello", "/v1/api/hello",
+        "/stop",
+    ]
 
     /// Maximum request bytes accumulated before the connection is rejected (16 MiB).
     private let maxBodyBytes = 16 * 1024 * 1024
@@ -218,6 +229,24 @@ final class DirectTLSHandler: @unchecked Sendable {
         let contentLength = headers["content-length"].flatMap { Int($0) } ?? bodyData.count
         let trimmedBody = bodyData.prefix(contentLength)
 
+        // Pass through AI-host paths the router doesn't handle (OpenAI's
+        // /v1/responses, /v1/embeddings, /v1/models/{id}, …) as a fresh TLS
+        // connection to the real host. The client's own request and auth reach
+        // the real API untouched — no interference with endpoints we don't
+        // route. (Non-AI hosts never reach this handler; they get a raw TCP
+        // relay in MITMHandler.)
+        if !Self.routedPaths.contains(path) {
+            let targetHost = headers["host"]?.split(separator: ":").first.map(String.init) ?? ""
+            guard !targetHost.isEmpty, targetHost != "127.0.0.1", targetHost != "localhost" else {
+                print("[DirectTLSHandler] No routable host for \(path)")
+                sendError(connection, statusCode: 502, message: "Cannot route \(path)")
+                return
+            }
+            print("[DirectTLSHandler] Passthrough \(targetHost)\(path)")
+            passthroughTLS(connection: connection, requestData: requestData, host: targetHost, port: 443)
+            return
+        }
+
         guard let router = providerRouter else {
             print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Provider Router unavailable")
             return
@@ -259,6 +288,32 @@ final class DirectTLSHandler: @unchecked Sendable {
             }
         } catch {
             print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Upstream error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Relay a decrypted request to the real host over a fresh TLS connection
+    /// and stream the response back. Used for AI-host paths the provider router
+    /// doesn't handle, so unsupported endpoints keep working exactly as if the
+    /// proxy weren't there.
+    private func passthroughTLS(connection: NWConnection, requestData: Data, host: String, port: UInt16) {
+        let params = NWParameters(tls: NWProtocolTLS.Options())
+        let target = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: params)
+        target.start(queue: queue)
+
+        target.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                target.send(content: requestData, completion: .contentProcessed({ _ in
+                    NetworkRelay.relayLoop(source: target, destination: connection, on: self.queue)
+                    NetworkRelay.relayLoop(source: connection, destination: target, on: self.queue)
+                }))
+            case .failed:
+                print("[DirectTLSHandler] Upstream TLS to \(host) failed")
+                self.sendError(connection, statusCode: 502, message: "Upstream connection to \(host) failed")
+            default:
+                break
+            }
         }
     }
 

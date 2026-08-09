@@ -35,6 +35,8 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         switch path {
         case "/v1/messages", "/v1/v1/messages", "/messages":
             return try await handleMessages(method: method, body: body)
+        case "/v1/chat/completions", "/v1/v1/chat/completions", "/chat/completions":
+            return try await handleChatCompletions(method: method, body: body)
         case "/v1/messages/count_tokens":
             return handleTokenCount(body: body)
         case "/v1/models":
@@ -44,7 +46,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "/stop":
             return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: Data(#"{"status":"stopped"}"#.utf8))
         default:
-            return ProviderResponse(statusCode: 200, headers: ["Content-Length": "0", "Connection": "close"], body: Data())
+            // Honest error instead of a silent empty 200 — unknown paths on an
+            // AI host are passed through by DirectTLSHandler before reaching
+            // the router, so this is only a safety net.
+            return errorResponse(statusCode: 404, type: "invalid_request_error", message: "Not found: \(path)")
         }
     }
     
@@ -61,14 +66,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         
         let messagesRequest = MessagesRequest(json: requestJSON)
         
-        let primaryProvider = ConfigManager.resolveProviderName(config.provider)
-        let fallbackNames = config.fallbackProviders
-            .components(separatedBy: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .map { ConfigManager.resolveProviderName($0) }
-        
-        let providerChain = [primaryProvider] + fallbackNames
+        let providerChain = providerChain()
         var lastError: Error?
         let chainStart = CFAbsoluteTimeGetCurrent()
         let maxChainDuration: TimeInterval = 120.0 // Total fallback chain cap
@@ -119,6 +117,131 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         return errorResponse(statusCode: 503, type: "api_error", message: errorMsg)
     }
     
+    // MARK: - OpenAI Chat Completions (system-wide OpenAI routing)
+
+    /// Route an OpenAI-format Chat Completions request — from ANY app talking
+    /// to api.openai.com through the system-wide proxy (Codex, the OpenAI SDK,
+    /// curl, …) — through the configured provider chain. The request is already
+    /// OpenAI format, so it is forwarded to OpenAI-compatible providers as-is:
+    /// no Anthropic translation, and the OpenAI-format SSE stream passes
+    /// through untouched. The `direct` provider is skipped because Anthropic's
+    /// API is not OpenAI-compatible.
+    private func handleChatCompletions(method: String, body: Data) async throws -> ProviderResponse {
+        if method == "HEAD" || method == "OPTIONS" {
+            return ProviderResponse(statusCode: 204, headers: ["Allow": "POST, HEAD, OPTIONS"], body: Data())
+        }
+
+        guard let requestJSON = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Invalid JSON body")
+        }
+
+        let requestedModel = requestJSON["model"] as? String ?? ""
+        let wantsStream = requestJSON["stream"] as? Bool ?? false
+        let chain = providerChain().filter { $0 != "direct" }
+        guard !chain.isEmpty else {
+            return errorResponse(statusCode: 503, type: "api_error", message: "No OpenAI-compatible provider configured")
+        }
+
+        var lastError: Error?
+        let chainStart = CFAbsoluteTimeGetCurrent()
+        let maxChainDuration: TimeInterval = 120.0
+        for (index, providerId) in chain.enumerated() {
+            let elapsed = CFAbsoluteTimeGetCurrent() - chainStart
+            guard elapsed < maxChainDuration else {
+                lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: 504)
+                break
+            }
+
+            if index > 0 {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                guard CFAbsoluteTimeGetCurrent() - chainStart < maxChainDuration else {
+                    lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: 504)
+                    break
+                }
+            }
+
+            do {
+                let startTime = CFAbsoluteTimeGetCurrent()
+                let response = try await routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream)
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+                self.lastLatencyMs = elapsedMs
+                config.lastLatencyMs = elapsedMs
+
+                if response.statusCode >= 500 {
+                    lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
+                    continue
+                }
+                if index > 0, [400, 401, 403, 404, 429].contains(response.statusCode) {
+                    lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
+                    continue
+                }
+                return response
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+
+        let errorMsg = lastError?.localizedDescription ?? "No providers available"
+        return errorResponse(statusCode: 503, type: "api_error", message: errorMsg)
+    }
+
+    /// Forward one OpenAI-format Chat Completions request to a provider's
+    /// OpenAI-compatible endpoint. The model is resolved through the same tier
+    /// logic as Anthropic requests; the response (including SSE) is returned
+    /// untouched so the OpenAI client sees native OpenAI data.
+    private func routeChatCompletionsToProvider(providerId: String, request: [String: Any], model: String, stream: Bool) async throws -> ProviderResponse {
+        var body = request
+        let resolvedModel = resolveModel(model, for: providerId)
+        var effectiveModel = resolvedModel
+        for prefix in ProviderPreset.knownPrefixes {
+            if effectiveModel.hasPrefix(prefix) {
+                effectiveModel = String(effectiveModel.dropFirst(prefix.count))
+                break
+            }
+        }
+        body["model"] = effectiveModel
+
+        let apiKey = config.apiKey(for: providerId)
+        let baseUrl = config.baseUrl(for: providerId)
+        let url = URL(string: "\(baseUrl)/chat/completions")!
+        let host = url.host ?? "api.openai.com"
+        let ip = await DirectDNSResolver.shared.resolve(host) ?? host
+
+        var headers: [String: String] = ["Content-Type": "application/json", "Host": host]
+        if !apiKey.isEmpty { headers["Authorization"] = "Bearer \(apiKey)" }
+
+        let bodyData = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+        if stream {
+            let (response, inputStream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip)
+            if response.statusCode != 200 {
+                var full = Data()
+                for await chunk in inputStream { full.append(chunk) }
+                return ProviderResponse(statusCode: response.statusCode, headers: ["Content-Type": "application/json"], body: full)
+            }
+            return ProviderResponse(
+                statusCode: 200,
+                headers: ["Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"],
+                body: Data(),
+                stream: inputStream
+            )
+        } else {
+            let (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip)
+            return ProviderResponse(statusCode: response.statusCode, headers: ["Content-Type": response.mimeType ?? "application/json"], body: data)
+        }
+    }
+
+    /// The primary provider plus the configured fallback chain.
+    private func providerChain() -> [String] {
+        let primary = ConfigManager.resolveProviderName(config.provider)
+        let fallbacks = config.fallbackProviders
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .map { ConfigManager.resolveProviderName($0) }
+        return [primary] + fallbacks
+    }
+
     // MARK: - Routing
     
     private func routeToProvider(providerId: String, request: MessagesRequest) async throws -> ProviderResponse {

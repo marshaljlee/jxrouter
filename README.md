@@ -1,260 +1,67 @@
-# JXProxy
+# JXProxy (JXRouter)
 
-A lightweight, system-wide proxy and DNS redirector for macOS that transparently routes AI API requests (Anthropic, OpenAI, etc.) to your preferred LLM provider. Powered by the **JXProxy** native macOS app.
+A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, Codex, OpenAI SDK clients — through **your** choice of LLM providers: remote (InferX, NVIDIA NIM, DeepSeek, OpenRouter, Groq, …) or local (Ollama, llama.cpp / `llama.app`). Native SwiftUI/AppKit app, no web admin, no `/etc/hosts` edits, no pf rules.
 
-Run **Claude Code**, **Codex**, or any AI coding agent through your own provider-backed proxy with a native macOS UI — no web admin required.
+> **Opt-in and additive.** Nothing on your system is modified until you press **Start** or enable system-wide routing, and everything the app writes is removed by `./uninstall.sh`.
 
-## Features
+## How routing works
 
-- **Native macOS App** — Menu bar app with dashboard, settings, and live traffic logs (replaces FCC's web admin UI)
-- **30+ Providers** — NVIDIA NIM, OpenRouter, OpenAI, DeepSeek, Gemini, Mistral, Groq, Cohere, HuggingFace, local Ollama/LM Studio/llama.cpp, and more
-- **System Proxy** — Optional system-wide HTTP/HTTPS proxy
-- **DNS Hijacking** — Intercepts domains like `api.anthropic.com` and routes them locally
-- **Model-Tier Routing** — Route Opus, Sonnet, and Haiku to different models
-- **Provider Fallback** — Chain multiple providers for reliability
-- **App-Specific Routing** — Route or block AI traffic on a per-app basis
-- **Provider Translation** — Transparently translate Anthropic Messages API ↔ OpenAI Chat Completions
-- **Streaming** — Full SSE streaming support with real-time translation
-- **CLI Launchers** — `jxclaude`, `jxcodex`, `jxpi` wrappers for one-command agent launch
-- **Auth Token** — Optional token-based proxy authentication
-- **Keychain Integration** — API keys stored securely in macOS Keychain
+- **Claude Code** is routed automatically via `~/.claude/settings.json` (loopback connection to the local proxy, token-authenticated) — no system changes required.
+- **System-wide routing** (optional): Settings → System → **Enable System-Wide Proxy** routes other apps' HTTP/HTTPS traffic through JXProxy. `api.anthropic.com` and `api.openai.com` requests are intercepted and sent to your configured providers; **every other connection passes through unmodified** (raw relay, no TLS termination).
+- HTTPS interception of those two AI hosts requires trusting the bundled CA certificate: menu-bar icon → **Security → Install CA Certificate**.
+- **Model-tier routing**: map Opus / Sonnet / Haiku (and OpenAI equivalents) to different models or providers, with automatic provider fallback chains.
+- **Local providers** are auto-detected — Ollama, and llama.cpp including `llama-server`, the unified `llama` binary, and the Llama / LlamaChat apps (`llama server` subcommand).
 
-## Quick Start
-
-### 1. Install
+## Quick start
 
 ```bash
-./install.sh
-```
-
-This builds the app, installs it to `/Applications`, creates CLI launcher scripts in `~/.local/bin/`, and configures your shell PATH.
-
-### 2. Start JXProxy
-
-Open **JXProxy** from your Applications folder or the desktop shortcut:
-
-```bash
+./install.sh   # builds the app, installs to /Applications, creates jxclaude / jxcodex launchers in ~/.local/bin, configures shell PATH
 open /Applications/JXRouter.app
 ```
 
-Or from the terminal:
+Click the **JXProxy** menu-bar icon → **Start**.
+
+## Setup
+
+1. **Settings → Providers** — pick your provider(s), paste API keys, hit **Verify** (green tick). Keys are stored in the macOS Keychain, never in plaintext files.
+   - On launch the app also imports keys it finds in `~/.zshrc`, `~/.zshenv`, `~/.bash_profile`, `~/.bashrc`, and legacy `~/.jxproxy/config.env` — **only into empty slots**, never overwriting keys you entered yourself.
+2. **Settings → General** — choose the active provider and routing mode. The model tiers auto-populate from each provider's live model list; **Test All Models** validates the whole chain and surfaces full server error messages.
+3. **Settings → Routing** — per-app routing rules (route or block AI traffic per application).
+4. **Settings → System** — system-wide proxy toggle, CA install, and uninstall options.
+
+### Shell CLI tools (curl, Codex CLI, Python)
+
+CLI tools launched from a terminal don't always honor the macOS system proxy — they read env vars instead:
 
 ```bash
-jxserver
+export HTTPS_PROXY=http://127.0.0.1:5255
+# or for OpenAI-compatible clients:
+export OPENAI_BASE_URL=http://127.0.0.1:5255/v1
 ```
 
-The app runs in the menu bar. Left-click the bolt icon to show the dashboard, right-click for the context menu.
+Default proxy port: **5255** (configurable).
 
-Default settings:
-- **Port:** 5255
-- **Auth Token:** jxproxy
-- **Default Provider:** OpenCode Zen
+## What the app writes (and cleans up)
 
-### 3. Configure a Provider
-
-Open the app dashboard → click the gear icon → **Providers** tab.
-
-Enter your API key for any of the supported providers and click **Apply**. Keys are stored in the macOS Keychain.
-
-Recommended free/zero-config providers:
-- **OpenCode Zen** — No API key needed, great fallback
-- **NVIDIA NIM** — Free API key at build.nvidia.com
-- **DeepSeek** — Free tier available
-- **Groq** — Free tier with Llama models
-- **Ollama** — Fully local, no key needed
-
-> 🆓 **New to this?** See [Getting Free API Keys — Step-by-Step Guide for Everyone](docs/tutorials/getting-free-api-keys.md) for a plain-language walkthrough of signing up for **OpenCode Zen** (no key needed) and **NVIDIA NIM** (free key with 1,000 free credits), written for non-technical users. The app also has a built-in guide: **Settings → Providers → "Get a free API key"**.
-
-### 4. Run Your Coding Agent
-
-**Claude Code:**
-```bash
-jxclaude
-```
-
-**Codex:**
-```bash
-jxcodex
-```
-
-**Pi:**
-```bash
-jxpi
-```
-
-All launchers set the necessary environment variables to route through JXProxy. Normal CLI arguments work too:
-
-```bash
-jxclaude exec "explain this codebase"
-jxcodex exec "hello"
-```
-
-## Provider Configuration
-
-Open the JXProxy app → Settings → **Providers** tab to enter API keys.
-
-| Provider | Admin Setting | API Key Required? |
+| Path | Purpose | Removed on uninstall |
 |---|---|---|
-| OpenCode Zen | No key needed | ❌ |
-| OpenCode Go | No key needed | ❌ |
-| Anthropic Direct | `ANTHROPIC_API_KEY` | ✅ |
-| OpenAI / Codex | `OPENAI_API_KEY` | ✅ |
-| OpenRouter | `OPENROUTER_API_KEY` | ✅ |
-| NVIDIA NIM | `NVIDIA_NIM_API_KEY` | ✅ |
-| DeepSeek | `DEEPSEEK_API_KEY` | ✅ |
-| Google Gemini | `GEMINI_API_KEY` | ✅ |
-| Mistral | `MISTRAL_API_KEY` | ✅ |
-| Mistral Codestral | `CODESTRAL_API_KEY` | ✅ |
-| Cohere | `COHERE_API_KEY` | ✅ |
-| Groq | `GROQ_API_KEY` | ✅ |
-| Fireworks AI | `FIREWORKS_API_KEY` | ✅ |
-| SambaNova | `SAMBANOVA_API_KEY` | ✅ |
-| Cerebras | `CEREBRAS_API_KEY` | ✅ |
-| HuggingFace | `HUGGINGFACE_API_KEY` | ✅ |
-| GitHub Models | `GITHUB_MODELS_TOKEN` | ✅ |
-| Wafer | `WAFER_API_KEY` | ✅ |
-| Kimi API | `KIMI_API_KEY` | ✅ |
-| Kimi Code | `KIMI_CODE_API_KEY` | ✅ |
-| MiniMax | `MINIMAX_API_KEY` | ✅ |
-| xAI Grok | `XAI_API_KEY` | ✅ |
-| Z.ai | `ZAI_API_KEY` | ✅ |
-| Ollama Cloud | `OLLAMA_API_KEY` | ✅ |
-| Vercel AI Gateway | `AI_GATEWAY_API_KEY` | ✅ |
-| Ollama (Local) | No key needed | ❌ |
-| LM Studio (Local) | No key needed | ❌ |
-| llama.cpp (Local) | No key needed | ❌ |
+| `~/.claude/settings.json` | Claude Code routing config | restored to original |
+| `~/.local/bin/jxclaude`, `~/.local/bin/jxcodex` | CLI launchers | deleted |
+| `~/.claude/CLAUDE.md` | managed "constitution" block | block removed |
+| `~/.zshrc` / `~/.zshenv` | launcher PATH lines | lines removed |
+| macOS Keychain | your provider API keys | entries removed |
 
-### Model Routing
+`./uninstall.sh` removes all of the above **and** strips any legacy DNS-hijack entries (old pre-2026 app versions wrote `JXProxy` / `ProxySwitch` marker blocks into `/etc/hosts`) plus any leftover pf anchor — so it can fully clean a machine that previously ran an old build.
 
-In the JXProxy app → Settings → **General** tab, you can set:
-
-- **Default Model** — The model used for all requests (fallback)
-- **Model Opus** — Override for opus-tier Claude requests
-- **Model Sonnet** — Override for sonnet-tier requests
-- **Model Haiku** — Override for haiku-tier requests
-
-### Provider Fallback
-
-Set comma-separated fallback providers in the **General** tab. If the primary provider returns a 5xx error, JXProxy automatically tries the next provider in the chain.
-
-Default fallback: `deepseek,groq`
-
-## VS Code Integration
-
-### Claude Code in VS Code
-
-Install the [Claude Code extension](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code). Open VS Code user settings as JSON and add:
-
-```json
-"claudeCode.disableLoginPrompt": true,
-"claudeCode.environmentVariables": [
-  { "name": "ANTHROPIC_BASE_URL", "value": "http://localhost:5255" },
-  { "name": "ANTHROPIC_AUTH_TOKEN", "value": "jxproxy" },
-  { "name": "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "value": "1" },
-  { "name": "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "value": "190000" },
-  { "name": "DISABLE_AUTOUPDATER", "value": "1" },
-  { "name": "DISABLE_FEEDBACK_COMMAND", "value": "1" },
-  { "name": "DISABLE_ERROR_REPORTING", "value": "1" }
-]
-```
-
-### Codex in VS Code
-
-Install the [Codex extension](https://marketplace.visualstudio.com/items?itemName=OpenAI.codex). Create or edit `~/.codex/config.toml`:
-
-```toml
-model_provider = "jxproxy"
-model = "opencode/big-pickle"
-
-[model_providers.jxproxy]
-name = "JXProxy"
-base_url = "http://127.0.0.1:5255/v1"
-http_headers = { Authorization = "Bearer jxproxy" }
-wire_api = "responses"
-```
-
-### Skip Login Prompt
-
-If Claude Code asks you to log in after configuring the proxy URL:
+## Development
 
 ```bash
-echo '{"hasCompletedOnboarding": true}' > ~/.claude.json
+xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release build
 ```
 
-## Architecture
+Pure SwiftUI/AppKit, no third-party dependencies. Source lives in `Sources/JXRouter/`.
 
-```
-┌──────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  Coding      │────▶│  JXProxy     │────▶│  Provider API   │
-│  Agent       │     │  (Port 5255) │     │  (Anthropic,    │
-│ (Claude,     │     │              │     │   OpenAI,       │
-│  Codex)      │     │  DNS Hijack  │     │   DeepSeek,     │
-│              │     │  System Proxy│     │   etc.)         │
-└──────────────┘     └──────────────┘     └─────────────────┘
-                           │
-                     ┌─────▼──────┐
-                     │  Native    │
-                     │  macOS App │
-                     │ (JXProxy) │
-                     └────────────┘
-```
+## Notes
 
-JXProxy acts as a local gateway:
-1. Requests from coding agents hit JXProxy (either through system proxy, DNS redirect, or explicit base URL)
-2. JXProxy translates Anthropic Messages API ↔ OpenAI Chat Completions format
-3. The request is forwarded to your chosen provider
-4. Streaming SSE responses are translated back in real-time
-
-## Requirements
-
-- macOS 14.0+
-- Xcode Command Line Tools (`xcode-select --install`)
-- Claude Code: `npm install -g @anthropic-ai/claude-code`
-- Codex: Install from [chatgpt.com/codex](https://chatgpt.com/codex)
-
-## Troubleshooting / Known Issues
-
-### Tier routing does nothing (Opus/Sonnet/Haiku always use the same model)
-
-Check your shell configs (`~/.zshenv`, `~/.zshrc`, `~/.bash_profile`) for
-`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` or
-`ANTHROPIC_DEFAULT_HAIKU_MODEL`. These force Claude Code to request a specific
-model, bypassing JXProxy's per-tier routing. Delete those lines.
-
-Since install v1.x, JXProxy neutralises them automatically while the proxy is
-running by writing empty values into `~/.claude/settings.json` (an empty string
-is treated as "not set" by Claude Code), and a protective `claude` alias is
-added to your shell config as a second line of defence. But for a fully clean
-setup, remove the variables from your shell configs — `./uninstall.sh` also
-removes the alias and the settings.json entries JXProxy wrote.
-
-### Claude Code stopped routing through JXProxy after I edited shell configs
-
-The most common cause is that `ANTHROPIC_BASE_URL` (which pointed Claude at
-`http://127.0.0.1:5255`) was removed together with the model variables. While
-JXProxy is running it manages `~/.claude/settings.json` for you, so:
-
-1. Click **Restart** in the JXProxy window (re-writes routing + DNS).
-2. Start a **new** Terminal window and run `claude`.
-3. Verify routing with `jxclaude` or check the Logs tab in Settings.
-
-### Changing tiers in the app "does nothing"
-
-See the first entry — hardcoded `ANTHROPIC_DEFAULT_*` variables in `~/.zshenv`
-or `~/.zshrc` override the app's choices and must be deleted.
-
-## Uninstall
-
-```bash
-./uninstall.sh
-```
-
-Or manually:
-1. Quit JXProxy from the menu bar
-2. Delete `/Applications/JXRouter.app`
-3. Remove `~/.local/bin/jxproxy-*`
-4. Clean up shell config
-
-## Credits
-
-Inspired by [Free Claude Code (FCC)](https://github.com/Alishahryar1/free-claude-code) — the original Python-based proxy that pioneered multi-provider coding agent routing. JXProxy rebuilds the concept as a native macOS application with a SwiftUI interface.
+- DNS/pf hijacking is **permanently removed** — the current app never writes `/etc/hosts` or pf rules. Any re-introduction is a bug.
+- Auth token: the local proxy authenticates Claude Code via an auto-generated token; an optional token can also gate external clients.

@@ -82,8 +82,14 @@ final class LocalModelManager {
             return
         }
 
-        guard let binPath = which(provider.serverName) else {
-            status = .failed("\(provider.serverName) not found. Install via: brew install \(provider == .llamacpp ? "llama.cpp" : "ollama")")
+        // Resolve the server binary. llama.cpp ships two ways: the standalone
+        // `llama-server` binary and the unified `llama` CLI whose `server`
+        // subcommand runs an identical server — either is accepted.
+        guard let binPath = binaryPath() else {
+            let installHint = provider == .llamacpp
+                ? "Install via: brew install llama.cpp (provides llama-server and the `llama` CLI), or use the Llama app."
+                : "Install via: brew install ollama."
+            status = .failed("\(provider.serverName) not found. \(installHint)")
             return
         }
         print("[LocalModel] Using binary: \(binPath)")
@@ -93,36 +99,31 @@ final class LocalModelManager {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
 
+        // Build the server command line. Every argument (binary path, model
+        // path, flags) is passed to bash as a positional parameter expanded by
+        // "$@" — a path containing spaces or shell metacharacters can no
+        // longer inject commands (CWE-78); bash never re-parses them as script
+        // text.
+        var serverArgs: [String]
+        let binaryName = (binPath as NSString).lastPathComponent
         switch provider {
         case .llamacpp:
             let ctxSize = 8192
-            // binPath and resolvedPath are passed as argv ($1/$2) instead of being
-            // interpolated into the shell script — a path containing spaces or shell
-            // metacharacters can no longer inject commands (CWE-78). bash expands
-            // "$1"/"$2" from the argv values; they are never re-parsed as script text.
-            proc.arguments = [
-                "-c", """
-                nohup "$1" \
-                    --host \(host) \
-                    --port \(port) \
-                    --model "$2" \
-                    --ctx-size \(ctxSize) \
-                    > /tmp/llama-server-stdout.log 2> /tmp/llama-server-stderr.log &
-                echo $!
-                """,
-                "llama-server", // $0
-                binPath,        // $1
-                resolvedPath    // $2
-            ]
+            serverArgs = [binPath]
+            // The unified `llama` binary needs the `server` subcommand;
+            // `llama-server` takes the flags directly.
+            if binaryName == "llama" { serverArgs.append("server") }
+            serverArgs += ["--host", host, "--port", "\(port)", "--model", resolvedPath, "--ctx-size", "\(ctxSize)"]
         case .ollama:
-            proc.arguments = [
-                "-c", """
-                nohup \(binPath) serve \
-                    > /tmp/ollama-stdout.log 2> /tmp/ollama-stderr.log &
-                echo $!
-                """
-            ]
+            serverArgs = [binPath, "serve"]
         }
+        proc.arguments = [
+            "-c", """
+            nohup "$@" > /tmp/\(provider.serverName)-stdout.log 2> /tmp/\(provider.serverName)-stderr.log &
+            echo $!
+            """,
+            provider.serverName, // $0
+        ] + serverArgs
 
         let outPipe = Pipe()
         proc.standardOutput = outPipe
@@ -161,12 +162,18 @@ final class LocalModelManager {
             print("[LocalModel] Server stopped (was PID \(pid))")
         }
 
-        // Also try pkill as a safety net
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-f", provider.serverName]
-        try? pkill.run()
-        pkill.waitUntilExit()
+        // Also try pkill as a safety net — cover every binary name the server
+        // can run under (llama-server, the unified `llama server`, ollama).
+        let patterns = provider == .llamacpp
+            ? ["llama-server", "llama server"]
+            : [provider.serverName]
+        for pattern in patterns {
+            let pkill = Process()
+            pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            pkill.arguments = ["-f", pattern]
+            try? pkill.run()
+            pkill.waitUntilExit()
+        }
 
         process = nil
         status = .stopped
@@ -202,9 +209,18 @@ final class LocalModelManager {
         case needsModel
     }
 
-    /// Path to the server binary if present (custom override or common locations).
+    /// Path to the server binary if present (custom override or common
+    /// locations). For llama.cpp, either the standalone `llama-server` binary
+    /// or the unified `llama` CLI (invoked with the `server` subcommand) is
+    /// accepted.
     func binaryPath() -> String? {
-        which(provider.serverName)
+        switch provider {
+        case .llamacpp:
+            if let p = which("llama-server") { return p }
+            return which("llama")
+        case .ollama:
+            return which("ollama")
+        }
     }
 
     /// Whether the local LLM can be started right now.

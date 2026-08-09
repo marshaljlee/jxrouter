@@ -6,6 +6,8 @@ struct JXRouterView: View {
     @Environment(\.openSettings) private var showSettings
     @State private var isSettingsPresented = false
     @State private var showOnboarding = false
+    /// Whether the Detected Apps panel is collapsed (window shrinks to match).
+    @State private var isDetectedAppsCollapsed = false
     /// Free API key guide — auto-presented after first-launch onboarding when
     /// the user hasn't configured any provider key yet.
     @State private var showApiKeyGuide = false
@@ -16,56 +18,33 @@ struct JXRouterView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Main Dashboard Panel — fixed-height, no page scrollbar. The
+        // Top-aligned so the dashboard starts at the very top of the window —
+        // when the taller settings panel is open, no deadspace appears above it.
+        HStack(alignment: .top, spacing: 0) {
+            // Main Dashboard Panel — fixed-width, no page scrollbar. The
             // detected-apps list scrolls inside its own card below.
             VStack(spacing: 0) {
-                // Header / Toolbar
-                HStack {
-                    // Traffic lights area (macOS native buttons are provided by the window, so we just pad this space)
-                    Spacer()
-                    
-                    // Toolbar icons
-                    HStack(spacing: 12) {
-                        Button(action: { showOnboarding = true }) {
-                            Image(systemName: "questionmark.circle")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.dsTextPrimary)
-                        .accessibilityLabel("Tutorial")
-                        .help("Reopen the onboarding tutorial")
-                        
-                        Button(action: openSettings) {
-                            Image(systemName: "gearshape.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.dsTextPrimary)
-                        .accessibilityLabel("Open Settings")
+                // Hero Status — starts at the very top of the panel; the window's
+                // traffic lights float in the top-left corner (fullSizeContentView),
+                // so no separate header band is needed. The ? and gear actions sit
+                // at the upper-right corner of this page (see the overlay below).
+                VStack(spacing: 10) {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.dsBorder, lineWidth: 2)
+                            .frame(width: 64, height: 64)
+
+                        Image(systemName: "bolt.shield.fill")
+                            .font(.system(size: 28))
+                            .foregroundStyle(manager.isRunning ? Color.dsGreen : Color.dsTextSecondary)
                     }
-                    .padding(.trailing, 16)
+
+                    Text(manager.isRunning ? "Running" : "Stopped")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(Color.dsTextPrimary)
+                        .accessibilityAddTraits(.isHeader)
                 }
-                .frame(height: 38)
-                .padding(.top, 4)
-                
-                Spacer().frame(height: 12)
-                
-                // Hero Status
-            VStack(spacing: 10) {
-                ZStack {
-                    Circle()
-                        .stroke(Color.dsBorder, lineWidth: 2)
-                        .frame(width: 64, height: 64)
-                    
-                    Image(systemName: "bolt.shield.fill")
-                        .font(.system(size: 28))
-                        .foregroundStyle(manager.isRunning ? Color.dsGreen : Color.dsTextSecondary)
-                }
-                
-                Text(manager.isRunning ? "Running" : "Stopped")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(Color.dsTextPrimary)
-                    .accessibilityAddTraits(.isHeader)
-            }
+                .padding(.top, DesignToken.spacing10)
             
             Spacer().frame(height: 10)
             
@@ -200,19 +179,29 @@ struct JXRouterView: View {
             
             Spacer().frame(height: 16)
             
-            // Detected Apps
+            // Detected Apps (collapsible)
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "antenna.radiowaves.left.and.right")
-                        .font(.system(size: 10, weight: .semibold))
-                    Text("DETECTED APPS (\(manager.appDetector.detectedApps.count))")
-                        .font(.system(size: 11, weight: .semibold))
+                Button(action: toggleDetectedApps) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isDetectedAppsCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("DETECTED APPS (\(manager.appDetector.detectedApps.count))")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                    }
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .contentShape(Rectangle())
                 }
-                .foregroundStyle(Color.dsTextSecondary)
+                .buttonStyle(.plain)
                 .padding(.horizontal, 20)
+                .accessibilityLabel(isDetectedAppsCollapsed ? "Expand detected apps" : "Collapse detected apps")
                 
                 // Detected app list
-                if manager.appDetector.detectedApps.isEmpty {
+                if isDetectedAppsCollapsed {
+                    EmptyView()
+                } else if manager.appDetector.detectedApps.isEmpty {
                     // Empty state
                     VStack(spacing: 8) {
                         Image(systemName: "point.3.connected.trianglepath.dotted")
@@ -261,15 +250,42 @@ struct JXRouterView: View {
                 }
             }
             }
-            .frame(width: 380, height: 820)
+            // Bottom margin matches the side margins (16pt) — the panel's last
+            // card no longer sits flush against the window's bottom edge.
+            .padding(.bottom, DesignToken.spacing16)
+            .frame(width: 380)
             .background(Color.dsBackground)
+            // ? / gear actions at the upper-right corner of the main page.
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 14) {
+                    Button(action: { showOnboarding = true }) {
+                        Image(systemName: "questionmark.circle")
+                            .font(.system(size: 13))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .accessibilityLabel("Tutorial")
+                    .help("Reopen the onboarding tutorial")
+
+                    Button(action: openSettings) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 13))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .accessibilityLabel("Open Settings")
+                    .help("Open settings")
+                }
+                .padding(.top, 10)
+                .padding(.trailing, 14)
+            }
         
         // Slide-out Settings Panel
         if isSettingsPresented {
             Divider()
                 .ignoresSafeArea()
             SettingsView(manager: manager)
-                .transition(.move(edge: .trailing))
+            .transition(.move(edge: .trailing))
         }
         }
         .background(Color.dsBackground)
@@ -312,6 +328,15 @@ struct JXRouterView: View {
         }
     }
 
+    /// Collapse / expand the Detected Apps panel. The window follows the
+    /// content's intrinsic height (sizingOptions = .intrinsicContentSize), so
+    /// collapsing also reclaims the vertical space.
+    private func toggleDetectedApps() {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            isDetectedAppsCollapsed.toggle()
+        }
+    }
+
     /// Present the free API key guide a beat after the onboarding sheet has
     /// fully closed — presenting two sheets back-to-back without a delay can
     /// hit "already presenting" warnings on macOS.
@@ -329,7 +354,7 @@ struct JXRouterView: View {
     private func performUninstall() {
         let alert = NSAlert()
         alert.messageText = "Uninstall JXProxy?"
-        alert.informativeText = "This stops the proxy and removes everything JXProxy wrote:\n\u{2022} routing settings in ~/.claude/settings.json\n\u{2022} launcher scripts (~/.local/bin/jx*)\n\u{2022} shell config blocks (.zshrc / .zshenv)\n\u{2022} DNS redirection\n\nYour API keys and the app itself are kept. You can reinstall anytime with install.sh."
+        alert.informativeText = "This stops the proxy and removes everything JXProxy wrote:\n\u{2022} routing settings in ~/.claude/settings.json\n\u{2022} launcher scripts (~/.local/bin/jx*)\n\u{2022} shell config blocks (.zshrc / .zshenv)\n\u{2022} leftover DNS hijack entries (if any, from old versions)\n\nYour API keys and the app itself are kept. You can reinstall anytime with install.sh."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Uninstall")
         alert.addButton(withTitle: "Cancel")

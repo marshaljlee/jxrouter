@@ -65,8 +65,12 @@ final class StatusItemManager: NSObject {
             hostingController.sizingOptions = [.intrinsicContentSize]
         }
 
+        // Initial height matches the dashboard's natural content height
+        // (~785pt with the Detected Apps card). If it doesn't, the
+        // intrinsicContentSize pass below animates a resize right after the
+        // window appears — the visible "window jiggle" at launch.
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 820),
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 785),
             styleMask: [
                 .titled,
                 .closable,
@@ -86,6 +90,10 @@ final class StatusItemManager: NSObject {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.title = "JXProxy"
+
+        // The ? / gear actions are rendered by the SwiftUI view itself, at the
+        // upper-right corner of the main page (JXRouterView) — keep them in the
+        // content, not the title bar, per user preference.
 
         // Let the user drag the window from anywhere on the background
         window.isMovableByWindowBackground = true

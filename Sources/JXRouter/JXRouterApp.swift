@@ -32,19 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             manager.disableSystemProxy()
         }
 
-        // Stale-state sweep: if the app was force-killed last time, stale DNS
-        // entries may still hijack AI hosts. When auto-start is OFF, clean them
-        // up now (one admin prompt only when something is actually installed).
-        // When auto-start is ON but DNS redirection is DISABLED in settings,
-        // entries must still be swept — the proxy won't reinstall them, so a
-        // stale hijack would silently keep routing traffic the user turned off.
-        // Only when auto-start + redirection are both ON does startProxy()
-        // re-apply/repair below via the idempotent install (no double teardown).
-        let autoStart = UserDefaults.standard.bool(forKey: "autoStartProxy")
-        let dnsEnabled = ConfigManager.shared.dnsRedirectEnabled
-        if !autoStart || !dnsEnabled {
-            DNSRedirectionManager.shared.uninstall()
-        }
+        // Stale-state sweep: the app NEVER installs DNS/pf hijacking anymore
+        // (see DNSRedirectionManager), but old versions may have left /etc/hosts
+        // hijack blocks or a pf anchor behind. Sweep them unconditionally — it
+        // is a no-op with no admin prompt when the system is already clean.
+        DNSRedirectionManager.shared.uninstall()
 
         // Stale-state sweep: if the app was force-killed last time, the routing
         // block in ~/.claude/settings.json may still point Claude at the (now

@@ -60,15 +60,23 @@ struct LocalProviderDetector {
     private static func probeLlamaCpp() async -> LocalRuntime {
         // llama.cpp models are only visible while its server is running.
         let running = await httpOK("http://127.0.0.1:8080/health")
-        let installed = running || binaryInCommonPaths("llama-server")
+        // "Installed" covers every way llama.cpp ships on macOS: the standalone
+        // `llama-server` binary, the unified `llama` CLI (whose `llama server`
+        // subcommand runs an identical server), and the Llama desktop app
+        // (llama.app / LlamaChat) that bundles llama.cpp.
+        let installed = running
+            || binaryInCommonPaths("llama-server")
+            || binaryInCommonPaths("llama")
+            || appInstalled("Llama")
+            || appInstalled("LlamaChat")
         return LocalRuntime(
             id: "llamacpp", name: "llama.cpp", port: 8080,
             state: state(running: running, installed: installed),
             hint: running
                 ? "Ready — the loaded model is auto-fetched."
                 : (installed
-                    ? "Installed but the server is not running. Click \"Run Local Model\" in Settings → General to start it, or run `llama-server -m <model.gguf>` yourself."
-                    : "Not detected. llama-server isn't installed — JXProxy's local model setup tutorial will guide you (install, pick a .gguf, run).")
+                    ? "Installed but the server is not running. Click \"Run Local Model\" in Settings → General to start it, or run `llama-server -m <model.gguf>` (or `llama server -m <model.gguf>`) yourself."
+                    : "Not detected. llama.cpp isn't installed — JXProxy's local model setup tutorial will guide you (install, pick a .gguf, run).")
         )
     }
 
@@ -121,7 +129,9 @@ struct LocalProviderDetector {
     }
 
     private static func appInstalled(_ name: String) -> Bool {
-        FileManager.default.fileExists(atPath: "/Applications/\(name).app")
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return FileManager.default.fileExists(atPath: "/Applications/\(name).app")
+            || FileManager.default.fileExists(atPath: "\(home)/Applications/\(name).app")
     }
 
     private static func binaryInCommonPaths(_ name: String) -> Bool {

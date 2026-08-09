@@ -49,7 +49,9 @@ final class ProxyServer: @unchecked Sendable {
     /// Listens on port+1 (e.g. 5256) with TLS terminated via multi-domain cert.
     private var directTLSHandler: DirectTLSHandler?
 
-    /// DNS redirection manager.
+    /// Sweeps leftover DNS-hijack state written by OLD app versions
+    /// (/etc/hosts blocks + pf anchor). The app itself never installs DNS
+    /// redirection anymore — see DNSRedirectionManager.
     private let dnsManager = DNSRedirectionManager.shared
 
     /// Error state for UI propagation.
@@ -61,9 +63,6 @@ final class ProxyServer: @unchecked Sendable {
     var cachedModelSonnet: String = "claude-sonnet-5-20251001"
     var cachedModelHaiku: String = "claude-haiku-4-5-20251001"
     var cachedMitmHosts: Set<String> = ["api.anthropic.com"]
-
-    /// Whether DNS redirection is enabled.
-    var dnsRedirectEnabled = false
 
     /// Sync cached config values from ConfigManager (call from MainActor).
     func syncConfigCache() {
@@ -167,10 +166,6 @@ final class ProxyServer: @unchecked Sendable {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             self.startDirectTLS()
-            // Install DNS redirection after TLS is ready
-            if self.dnsRedirectEnabled {
-                self.installDNS()
-            }
         }
 
         print("[ProxyServer] HTTP proxy started on port \(port)")
@@ -187,7 +182,8 @@ final class ProxyServer: @unchecked Sendable {
         // Stop DirectTLS listener
         stopDirectTLS()
 
-        // Remove DNS redirection
+        // Sweep leftover DNS-hijack state from old app versions. No-op (and
+        // no admin prompt) when the system is already clean.
         dnsManager.uninstall()
 
         isRunning = false
@@ -231,19 +227,6 @@ final class ProxyServer: @unchecked Sendable {
     private func stopDirectTLS() {
         directTLSHandler?.stop()
         directTLSHandler = nil
-    }
-
-    /// Install DNS redirection (best-effort, may prompt for admin).
-    private func installDNS() {
-        Task { @MainActor in
-            let ok = dnsManager.install(proxyPort: port + 1) // Redirect to TLS listener port
-            if ok {
-                print("[ProxyServer] DNS redirection installed")
-            } else {
-                print("[ProxyServer] DNS redirection not available (will use system proxy only)")
-                lastError = "DNS redirection unavailable — some AI apps may need system proxy"
-            }
-        }
     }
 
     // MARK: - Auto-Restart
@@ -365,15 +348,23 @@ final class ProxyServer: @unchecked Sendable {
             return
         }
 
-        // Auth enforcement on direct HTTP calls
+        // Auth enforcement on direct HTTP calls — scoped to the internal
+        // endpoints and AI-routed hosts only. Plain-HTTP requests to any OTHER
+        // site pass through the system proxy untouched (no token needed), so
+        // the proxy never interferes with non-AI traffic.
         if authEnabled {
-            let authResult = validateAuth(request: requestStr)
-            switch authResult {
-            case .denied(let reason):
-                sendHttpResponse(connection, statusCode: 401, message: reason)
-                return
-            case .allowed:
-                break
+            let requestHost = requestTargetHost(requestStr)
+            let isInternal = requestHost == "127.0.0.1" || requestHost == "localhost"
+            let isAI = classifier.isKnownAiHost(requestHost)
+            if isInternal || isAI {
+                let authResult = validateAuth(request: requestStr)
+                switch authResult {
+                case .denied(let reason):
+                    sendHttpResponse(connection, statusCode: 401, message: reason)
+                    return
+                case .allowed:
+                    break
+                }
             }
         }
 
@@ -444,6 +435,21 @@ final class ProxyServer: @unchecked Sendable {
 
     private func parseHeaders(from request: String) -> [String: String] {
         HTTPUtils.parseHeaders(from: request)
+    }
+
+    /// Extract the target host from an origin-form or absolute-form request
+    /// line. Used to scope auth enforcement to internal endpoints and AI hosts.
+    private func requestTargetHost(_ request: String) -> String {
+        let lines = request.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return "" }
+        let parts = requestLine.components(separatedBy: " ")
+        guard parts.count >= 2 else { return "" }
+        let target = parts[1]
+        if target.hasPrefix("http://") || target.hasPrefix("https://") {
+            return URL(string: target)?.host ?? ""
+        }
+        return parseHeaders(from: request)["host"]?
+            .split(separator: ":").first.map(String.init) ?? ""
     }
 
     // MARK: - HTTP Proxy Handler

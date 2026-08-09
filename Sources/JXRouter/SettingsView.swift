@@ -105,33 +105,7 @@ struct SettingsView: View {
     @State private var networkInterface: String = "Wi-Fi"
     @State private var appRoutes: [AppRouteRule] = []
     @State private var availableInterfaces: [String] = []
-    @State private var adminPassword: String = ""
     
-    // Local model server
-    @State private var lmProvider: String = "llamacpp"
-    @State private var lmModelPath: String = ""
-    @State private var lmPort: String = "8080"
-    @State private var lmBinaryPath: String = ""
-    @State private var lmStatus: String = "stopped"
-    private var lmStatusText: String {
-        switch lmStatus {
-        case "stopped": return "Stopped"
-        case "starting": return "Starting..."
-        case "running": return "Running"
-        case "failed": return "Failed"
-        default: return lmStatus
-        }
-    }
-    private var lmStatusColor: Color {
-        switch lmStatus {
-        case "stopped": return Color.dsTextTertiary
-        case "starting": return Color.orange
-        case "running": return Color.dsGreen
-        case "failed": return Color.dsRed
-        default: return Color.dsTextTertiary
-        }
-    }
-
     // Bot
     @State private var botIntegrationEnabled: Bool = false
     @State private var telegramBotToken: String = ""
@@ -310,6 +284,12 @@ struct SettingsView: View {
     private func verifyAllTierModels() async {
         for tier in TierKey.allCases {
             tierModelChecks[tier.rawValue] = .checking
+            // Local/custom providers (e.g. llama.app) expose their models only
+            // via the live fetch — if a tier has no model yet, fetch the list
+            // first so "Test All Models" can pick up the available model.
+            if tierModelValue(tier).isEmpty {
+                await fetchTierModels(for: tier)
+            }
             let pid = tierProviderId(for: tier)
             let modelName = tierModelValue(tier)
             guard !modelName.isEmpty else {
@@ -401,6 +381,10 @@ struct SettingsView: View {
                     .foregroundStyle(Color.dsRed)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    // Hover shows the FULL server message — the row itself is
+                    // truncated, but the guidance ("set a default tenant…")
+                    // must be reachable.
+                    .help(reason)
             }
         }
     }
@@ -1016,7 +1000,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Text("JXProxy already intercepts all api.anthropic.com traffic automatically (DNS redirection) — this system-wide toggle is only needed for non-Anthropic AI apps that don't honor the proxy. Non-AI requests pass through unmodified.")
+                Text("Routes every app's HTTP/HTTPS traffic through JXProxy. Anthropic (api.anthropic.com) and OpenAI (api.openai.com) connections are routed through your configured providers — every other request passes through unmodified. Claude Code is routed automatically via its settings and doesn't need this. HTTPS interception requires trusting the JXProxy CA (menu-bar icon → Security → Install CA Certificate).")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
             }
@@ -1034,112 +1018,6 @@ struct SettingsView: View {
                 if botIntegrationEnabled {
                     secureField("Telegram Bot Token", text: $telegramBotToken)
                 }
-            }
-
-            sectionGroup("Local Model Server") {
-                VStack(alignment: .leading, spacing: 8) {
-                    // Provider picker
-                    HStack {
-                        Text("Provider")
-                            .font(.system(size: DesignToken.captionSize, weight: .medium))
-                        Spacer()
-                        Picker("", selection: $lmProvider) {
-                            Text("llama.cpp").tag("llamacpp")
-                            Text("Ollama").tag("ollama")
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 180)
-                    }
-
-                    // Model file path
-                    HStack {
-                        Text("Model File")
-                            .font(.system(size: DesignToken.captionSize, weight: .medium))
-                        Spacer()
-                        Text(lmModelPath.isEmpty ? "None selected" : (lmModelPath as NSString).lastPathComponent)
-                            .font(.system(size: DesignToken.captionSize, design: .monospaced))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .foregroundStyle(lmModelPath.isEmpty ? Color.dsTextTertiary : Color.dsTextPrimary)
-                        Button("Auto-Detect") {
-                            autoDetectModel()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Find a .gguf model automatically")
-                        Button("Browse") {
-                            browseForModel()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    // Port (for llama.cpp)
-                    if lmProvider == "llamacpp" {
-                        HStack {
-                            Text("Port")
-                                .font(.system(size: DesignToken.captionSize, weight: .medium))
-                            Spacer()
-                            TextField("8080", text: $lmPort)
-                                .frame(width: 80)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(size: DesignToken.captionSize, design: .monospaced))
-                        }
-                    }
-
-                    // Binary path override
-                    HStack {
-                        Text("Binary Path")
-                            .font(.system(size: DesignToken.captionSize, weight: .medium))
-                        Spacer()
-                        TextField("(auto-detect)", text: $lmBinaryPath)
-                            .frame(width: 200)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: DesignToken.captionSize, design: .monospaced))
-                            .help("Leave empty to auto-detect in PATH and common install locations")
-                    }
-
-                    // Status + Run/Stop
-                    HStack {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(lmStatusColor)
-                                .frame(width: 8, height: 8)
-                            Text(lmStatusText)
-                                .font(.system(size: DesignToken.captionSize, weight: .medium))
-                                .foregroundStyle(lmStatusColor)
-                        }
-
-                        Spacer()
-
-                        if lmStatus == "running" {
-                            Button("Stop", role: .destructive) {
-                                stopLocalModel()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        } else if lmStatus == "stopped" || lmStatus == "failed" {
-                            Button("Run") {
-                                startLocalModel()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .disabled(lmStatus == "starting")
-                        } else if lmStatus == "starting" {
-                            ProgressView()
-                                .scaleEffect(0.6)
-                        }
-                    }
-                }
-                .padding(.horizontal, DesignToken.spacing12)
-                .padding(.vertical, DesignToken.spacing8)
-            }
-
-            sectionGroup("Privilege Elevation") {
-                secureField("Mac Admin Password", text: $adminPassword)
-                Text("DNS redirection needs one-time macOS authorization (a password prompt) when it is first installed or removed. JXProxy does not use a stored password to bypass it — after the first install, Starts and Restarts no longer prompt while redirection is already active.")
-                    .font(.system(size: DesignToken.captionSize))
-                    .foregroundStyle(Color.dsTextTertiary)
             }
 
             sectionGroup("Auto-Launch") {
@@ -1325,8 +1203,7 @@ struct SettingsView: View {
             groqKey, fireworksKey, sambanovaKey, cerebrasKey, huggingfaceKey, xaiKey,
             customUrl, customKey,
             customProvidersStr,
-            String(botIntegrationEnabled), telegramBotToken,
-            adminPassword
+            String(botIntegrationEnabled), telegramBotToken
         ].joined(separator: "\u{1F}")
     }
 
@@ -1390,7 +1267,6 @@ struct SettingsView: View {
         enableSystemProxy = manager.systemProxyEnabled
         botIntegrationEnabled = config.botIntegrationEnabled
         telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
-        adminPassword = config.getApiKey(chainKey: ConfigManager.KeychainKey.adminPassword)
         loadAppRoutesFromConfig()
     }
 
@@ -1463,7 +1339,6 @@ struct SettingsView: View {
         config.setApiKey(chainKey: ConfigManager.KeychainKey.xai, value: xaiKey)
         config.botIntegrationEnabled = botIntegrationEnabled
         config.setApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken, value: telegramBotToken)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.adminPassword, value: adminPassword)
 
         saveAppRoutesToConfig()
         manager.loadAllFromConfig()
@@ -1615,7 +1490,6 @@ struct SettingsView: View {
         appRoutes = []
         botIntegrationEnabled = false
         telegramBotToken = ""
-        adminPassword = ""
         // Reset persists immediately via the auto-save on the resulting
         // settingsHash change.
     }
@@ -1697,74 +1571,6 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Local Model Server
-
-    private func browseForModel() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.data]
-        panel.message = "Select a GGUF model file"
-        panel.directoryURL = URL(fileURLWithPath: NSString(string: LocalModelManager.shared.modelDirectory).expandingTildeInPath)
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let path = url.path
-        lmModelPath = path
-        LocalModelManager.shared.setModelPathFromFile(path)
-        LocalModelManager.shared.port = Int(lmPort) ?? 8080
-    }
-
-    private func startLocalModel() {
-        let manager = LocalModelManager.shared
-        manager.provider = LocalModelManager.LocalProvider(rawValue: lmProvider) ?? .llamacpp
-        manager.modelPath = lmModelPath
-        manager.port = Int(lmPort) ?? manager.provider.defaultPort
-        manager.customBinaryPath = lmBinaryPath
-        onboardingProvider = manager.provider
-
-        // One-click flow: if the server binary or a model file is missing, open
-        // the setup tutorial instead of failing with a bare error string.
-        switch manager.readiness() {
-        case .needsInstall, .needsModel:
-            showLocalOnboarding = true
-        case .ready:
-            if lmModelPath.isEmpty {
-                lmModelPath = manager.autoDetectModelFile() ?? ""
-                manager.modelPath = lmModelPath
-            }
-            lmStatus = "starting"
-            Task {
-                await manager.start()
-                updateLMStatus()
-                await fetchLiveModels()
-            }
-        }
-    }
-
-    private func stopLocalModel() {
-        LocalModelManager.shared.stop()
-        lmStatus = "stopped"
-    }
-
-    private func refreshLocalModelStatus() {
-        updateLMStatus()
-    }
-
-    private func syncBinaryPathToManager() {
-        LocalModelManager.shared.customBinaryPath = lmBinaryPath
-    }
-
-    private func updateLMStatus() {
-        let mgr = LocalModelManager.shared
-        switch mgr.status {
-        case .stopped: lmStatus = "stopped"
-        case .starting: lmStatus = "starting"
-        case .running: lmStatus = "running"
-        case .failed(let msg): lmStatus = "failed: \(msg)"
-        }
-    }
-
     /// Quick "Run Local Model" for the General tab's local provider panel:
     /// maps the selected preset to the local server provider, then runs the
     /// one-click flow (auto-detect model → start in background, or onboarding).
@@ -1772,7 +1578,7 @@ struct SettingsView: View {
         let mgr = LocalModelManager.shared
         let newProvider: LocalModelManager.LocalProvider = provider == "ollama" ? .ollama : .llamacpp
         // Only reset the port when the provider actually changes, so a custom
-        // port set in the System tab isn't clobbered by re-tapping Run.
+        // port isn't clobbered by re-tapping Run.
         if mgr.provider != newProvider {
             mgr.provider = newProvider
             mgr.port = newProvider.defaultPort
@@ -1790,20 +1596,6 @@ struct SettingsView: View {
                 await mgr.start()
                 await fetchLiveModels()
             }
-        }
-    }
-
-    /// Scan for a local .gguf and configure llama.cpp with it.
-    private func autoDetectModel() {
-        let mgr = LocalModelManager.shared
-        if let found = mgr.autoDetectModelFile() {
-            lmProvider = "llamacpp"
-            mgr.provider = .llamacpp
-            lmModelPath = found
-            mgr.modelPath = found
-        } else {
-            onboardingProvider = .llamacpp
-            showLocalOnboarding = true
         }
     }
 
@@ -2166,6 +1958,13 @@ struct SettingsView: View {
                     tierLiveModels[tier.rawValue] = names
                     if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
                         manager.providers[idx].visibleModelIds.formUnion(names)
+                    }
+                    // Auto-populate an empty tier model from the first live
+                    // model — custom/local providers (e.g. llama.app) expose
+                    // their models only via this fetch, so a freshly selected
+                    // provider would otherwise sit at "No model selected".
+                    if tierModelValue(tier).isEmpty {
+                        setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
                     }
                 }
             }

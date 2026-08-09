@@ -72,7 +72,6 @@ final class ConfigManager: @unchecked Sendable {
         static let providerBackendUrls = "providerBackendUrls"
         static let customProviders = "customProvidersJSON"
         static let mitmHosts = "mitmHosts"
-        static let dnsRedirect = "dnsRedirectEnabled"
         static let botIntegrationEnabled = "botIntegrationEnabled"
     }
 
@@ -105,7 +104,6 @@ final class ConfigManager: @unchecked Sendable {
         static let aiGateway = "AI_GATEWAY_API_KEY"
         static let custom = "CUSTOM_API_KEY"
         static let telegramBotToken = "TELEGRAM_BOT_TOKEN"
-        static let adminPassword = "ADMIN_PASSWORD"
         static let authToken = "JXPROXY_AUTH_TOKEN"
     }
 
@@ -297,9 +295,12 @@ final class ConfigManager: @unchecked Sendable {
     }
 
     /// Comma-separated hostnames whose HTTPS traffic should be MITM-intercepted.
+    /// Anthropic + OpenAI by default so the system-wide proxy routes both
+    /// providers' connections through JXProxy; the classifier covers many more
+    /// AI hosts regardless.
     var mitmHosts: Set<String> {
         get {
-            let raw = defaults.string(forKey: UDKey.mitmHosts) ?? "api.anthropic.com"
+            let raw = defaults.string(forKey: UDKey.mitmHosts) ?? "api.anthropic.com,api.openai.com"
             return Set(raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
         }
         set {
@@ -307,16 +308,114 @@ final class ConfigManager: @unchecked Sendable {
         }
     }
 
-    /// Whether DNS redirection is enabled (redirects AI API hostnames to local proxy).
-    var dnsRedirectEnabled: Bool {
-        get { defaults.object(forKey: UDKey.dnsRedirect) as? Bool ?? true }
-        set { defaults.set(newValue, forKey: UDKey.dnsRedirect); publish() }
-    }
-
     /// Whether Bot Integration is enabled.
     var botIntegrationEnabled: Bool {
         get { defaults.object(forKey: UDKey.botIntegrationEnabled) as? Bool ?? false }
         set { defaults.set(newValue, forKey: UDKey.botIntegrationEnabled); publish() }
+    }
+
+    // MARK: - API Key Import from Shell Configs
+
+    /// Known shell-variable names mapped to their Keychain keys. GUI apps
+    /// launched from the menu bar / Finder do NOT inherit the shell
+    /// environment, so keys a user exports in ~/.zshrc were previously
+    /// invisible to the app. This map lets those exports be picked up.
+    private static let shellEnvKeyMap: [String: String] = [
+        "ANTHROPIC_API_KEY": KeychainKey.anthropic,
+        "OPENAI_API_KEY": KeychainKey.openai,
+        "OPENROUTER_API_KEY": KeychainKey.openrouter,
+        "OPENCODE_API_KEY": KeychainKey.opencode,
+        "NVIDIA_NIM_API_KEY": KeychainKey.nvidia,
+        "DEEPSEEK_API_KEY": KeychainKey.deepseek,
+        "GEMINI_API_KEY": KeychainKey.gemini,
+        "MISTRAL_API_KEY": KeychainKey.mistral,
+        "CODESTRAL_API_KEY": KeychainKey.codestral,
+        "COHERE_API_KEY": KeychainKey.cohere,
+        "GROQ_API_KEY": KeychainKey.groq,
+        "FIREWORKS_API_KEY": KeychainKey.fireworks,
+        "SAMBANOVA_API_KEY": KeychainKey.sambanova,
+        "CEREBRAS_API_KEY": KeychainKey.cerebras,
+        "HUGGINGFACE_API_KEY": KeychainKey.huggingface,
+        // HF_TOKEN is HuggingFace's canonical variable name.
+        "HF_TOKEN": KeychainKey.huggingface,
+        "XAI_API_KEY": KeychainKey.xai,
+        "GITHUB_MODELS_TOKEN": KeychainKey.githubModels,
+        "WAFER_API_KEY": KeychainKey.wafer,
+        "KIMI_API_KEY": KeychainKey.kimi,
+        "KIMI_CODE_API_KEY": KeychainKey.kimiCode,
+        "MINIMAX_API_KEY": KeychainKey.minimax,
+        "CLOUDFLARE_API_TOKEN": KeychainKey.cloudflareApiToken,
+        "ZAI_API_KEY": KeychainKey.zai,
+        "OLLAMA_API_KEY": KeychainKey.ollamaCloud,
+        "AI_GATEWAY_API_KEY": KeychainKey.aiGateway,
+    ]
+
+    /// Import API keys from the user's shell configs into the Keychain.
+    ///
+    /// Why this exists: a menu-bar app like JXProxy is never launched from a
+    /// shell, so `export ANTHROPIC_API_KEY=…` in ~/.zshrc never reaches the
+    /// process environment — the keys were simply invisible to the app.
+    /// This parses the config files directly.
+    ///
+    /// Rules (kept deliberately conservative):
+    ///   • Only EMPTY Keychain slots are filled — existing keys are never
+    ///     overwritten, so a key pasted in Settings always wins.
+    ///   • Values containing unexpanded shell substitutions (`$…`, `` `… ``)
+    ///     are skipped — importing a literal `$JXPROXY_AUTH_TOKEN` would store
+    ///     garbage.
+    ///   • Idempotent and cheap — safe to run on every launch.
+    func importKeysFromShellConfigs() {
+        let files = [
+            "~/.zshrc",
+            "~/.zshenv",
+            "~/.bash_profile",
+            "~/.bashrc",
+            // Legacy config file from the old app version (usually already
+            // consumed by migrateFromConfigEnv — belt and suspenders).
+            "~/.jxproxy/config.env",
+        ]
+        var env: [String: String] = [:]
+        for file in files {
+            let expanded = NSString(string: file).expandingTildeInPath
+            guard let content = try? String(contentsOfFile: expanded, encoding: .utf8) else { continue }
+            mergeShellEnv(&env, content)
+        }
+
+        var imported = 0
+        for (varName, chainKey) in Self.shellEnvKeyMap {
+            guard let value = env[varName], !value.isEmpty,
+                  getApiKey(chainKey: chainKey).isEmpty else { continue }
+            setApiKey(chainKey: chainKey, value: value)
+            imported += 1
+            print("[ConfigManager] Imported \(varName) from shell configs into the Keychain")
+        }
+        if imported > 0 {
+            print("[ConfigManager] Imported \(imported) API key(s) from shell configs")
+        }
+    }
+
+    /// Parse `KEY=value` and `export KEY="value"` lines into a dict (last
+    /// occurrence wins). Skips comments and values containing unexpanded shell
+    /// substitution (`$` or backticks).
+    private func mergeShellEnv(_ env: inout [String: String], _ content: String) {
+        for line in content.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            var body = trimmed
+            if body.hasPrefix("export ") { body = String(body.dropFirst(7)) }
+            let parts = body.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let name = String(parts[0]).trimmingCharacters(in: .whitespaces)
+            var value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+            // Strip a single pair of surrounding quotes ('…' or "…").
+            if value.count >= 2, value.first == value.last,
+               value.first == "\"" || value.first == "'" {
+                value = String(value.dropFirst().dropLast())
+            }
+            // Never import unexpanded shell substitutions as a key.
+            if value.contains("$") || value.contains("`") { continue }
+            env[name] = value
+        }
     }
 
     // MARK: - API Key Storage (UserDefaults)
@@ -447,6 +546,10 @@ final class ConfigManager: @unchecked Sendable {
             migrateFromConfigEnv()
             hasMigrated = true
         }
+
+        // Pick up keys the user exported in shell configs (~/.zshrc etc.) —
+        // see importKeysFromShellConfigs(). Fills only empty Keychain slots.
+        importKeysFromShellConfigs()
 
         // Auth policy is the documented "jxproxy" default. One-time sweep:
         // clear any token minted by the earlier random-token protocol (32 hex

@@ -120,12 +120,6 @@ final class ProxyManager {
         !config.apiKey(for: config.provider).isEmpty
     }
 
-    /// Whether DNS redirection is enabled (redirects AI hosts to local proxy).
-    var dnsRedirectEnabled: Bool {
-        get { config.dnsRedirectEnabled }
-        set { config.dnsRedirectEnabled = newValue; proxyServer.dnsRedirectEnabled = newValue }
-    }
-
     /// Whether this is the very first launch (no keys anywhere).
     var isFirstLaunch: Bool {
         config.apiKey(for: "opencode-zen").isEmpty
@@ -173,7 +167,6 @@ final class ProxyManager {
         activeModel = config.model
         proxyServer.authToken = config.authToken
         proxyServer.port = resolvedPort(config.port)
-        proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
 
         loadProvidersFromConfig()
         loadFallbackOrder()
@@ -183,7 +176,6 @@ final class ProxyManager {
     private func syncFromConfig() {
         proxyServer.port = resolvedPort(config.port)
         proxyServer.authToken = config.authToken
-        proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
     }
 
     private func loadProvidersFromConfig() {
@@ -330,10 +322,6 @@ final class ProxyManager {
             // Sync system proxy port with the configured port before starting
             setBuiltInProxyPort(proxyServer.port)
 
-            // Consent gate: re-sync the DNS toggle so ProxyServer skips
-            // installDNS when the user turned DNS redirection off.
-            proxyServer.dnsRedirectEnabled = config.dnsRedirectEnabled
-
             try proxyServer.start(port: proxyServer.port)
             builtInProxyRunning = true
             startTime = Date()
@@ -409,17 +397,9 @@ final class ProxyManager {
     func restartProxy() async {
         print("[Recovery] ═══ Starting full circuit-breaker recovery ═══")
 
-        // Keep healthy DNS redirection in place across the restart. Tearing it
-        // down and reinstalling would trigger two osascript admin prompts for
-        // zero benefit; install() is idempotent and re-verifies on the way up.
-        // The health check must run BEFORE stopProxy — once the TLS listener is
-        // down, the connectivity probe can't succeed, so a post-stop check
-        // would falsely report "not installed".
-        // Gate on dnsRedirectEnabled too: when the user turned redirection OFF,
-        // stale entries must still be cleaned (no suppression), so the hijack
-        // never silently keeps running against their wishes.
-        let dnsHealthy = config.dnsRedirectEnabled && DNSRedirectionManager.shared.isInstalled()
-        DNSRedirectionManager.shared.suppressUninstall = dnsHealthy
+        // Note: the app never installs DNS/pf hijacking anymore (see
+        // DNSRedirectionManager), so there is nothing to preserve across a
+        // restart — leftover state from old versions is simply swept below.
         print("[Recovery] ✓ Proxy stopped")
 
         // 2. Kill any process holding the proxy port
@@ -438,19 +418,10 @@ final class ProxyManager {
         recoverFlushPF()
         print("[Recovery] ✓ PF rules flushed")
 
-        // 5. Clean up stale /etc/hosts entries — only when redirection was NOT
-        //    healthy before the restart. Healthy redirection is preserved (the
-        //    suppressed uninstall in stopProxy left it untouched), so a plain
-        //    restart no longer prompts for admin twice.
-        if !dnsHealthy {
-            DNSRedirectionManager.shared.uninstall()
-            print("[Recovery] ✓ Stale DNS entries cleaned")
-        } else {
-            print("[Recovery] ✓ DNS redirection already functional — preserved")
-        }
-        // Re-enable prompts; install() below re-verifies idempotently and only
-        // prompts when the preserved state actually needs repair.
-        DNSRedirectionManager.shared.suppressUninstall = false
+        // 5. Sweep leftover DNS-hijack state (hosts blocks + pf anchor) written
+        //    by OLD app versions. No-op, with no admin prompt, when clean.
+        DNSRedirectionManager.shared.uninstall()
+        print("[Recovery] ✓ Stale DNS hijack state cleaned")
 
         // 6. Reset system proxy on ALL network interfaces (not just the cached one),
         //    not just the selected interface. This handles the case where the
@@ -479,7 +450,7 @@ final class ProxyManager {
         print("[Recovery] ✓ Proxy server internals reset")
 
         // 11. Fresh start — creates new NWListener, enables system proxy,
-        //     installs DNS redirection, regenerates launcher scripts
+        //     regenerates launcher scripts
         await startProxy()
         print("[Recovery] ✓ Proxy started")
 
@@ -758,7 +729,7 @@ final class ProxyManager {
         // 6. Remove JXRouter-managed replacement skills (~/.claude/skills/).
         SkillManager.shared.remove()
 
-        return "JXProxy has been stopped and every written setting was removed:\n\u{2022} ~/.claude/settings.json restored to its original state\n\u{2022} launcher scripts (~/.local/bin/jx*) deleted\n\u{2022} shell config blocks (.zshrc / .zshenv / …) cleaned\n\u{2022} DNS redirection removed\n\u{2022} JXProxy constitution block removed from ~/.claude/CLAUDE.md\n\u{2022} Replacement skills removed from ~/.claude/skills/\n\nTo finish, delete /Applications/JXRouter.app (or run ./uninstall.sh)."
+        return "JXProxy has been stopped and every written setting was removed:\n\u{2022} ~/.claude/settings.json restored to its original state\n\u{2022} launcher scripts (~/.local/bin/jx*) deleted\n\u{2022} shell config blocks (.zshrc / .zshenv / …) cleaned\n\u{2022} DNS hijack entries removed from /etc/hosts (if any, from old versions)\n\u{2022} JXProxy constitution block removed from ~/.claude/CLAUDE.md\n\u{2022} Replacement skills removed from ~/.claude/skills/\n\nTo finish, delete /Applications/JXRouter.app (or run ./uninstall.sh)."
     }
 
     /// Remove the JXProxy configuration block and the protective claude alias

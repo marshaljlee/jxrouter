@@ -30,6 +30,14 @@ struct ProviderValidator {
         if apiKey.isEmpty {
             let preset = ProviderPreset.preset(for: providerId)
             if let preset, !preset.requiresKey { return ProviderCheckResult(ok: true, message: "Connected") }
+            // Providers that require a key but have none entered would only
+            // fail with a raw 401 ("authorization was missing", "no tenant
+            // context", …). Say what's wrong instead of running the request.
+            // Local endpoints (custom providers pointing at 127.0.0.1 etc.) are
+            // exempt — a llama.app / Ollama server needs no auth at all.
+            if (preset?.requiresKey ?? true), !isLocalEndpoint(baseUrl) {
+                return ProviderCheckResult(ok: false, message: "No API key entered — add it in Settings → Providers")
+            }
         }
         let urlStr = baseUrl.hasSuffix("/v1") ? baseUrl : baseUrl + "/v1"
         guard let url = URL(string: urlStr + "/models") else {
@@ -61,6 +69,18 @@ struct ProviderValidator {
     /// or a model that doesn't exist on a custom endpoint).
     static func validateModel(providerId: String, model: String, apiKey: String, baseUrl: String) async -> ProviderCheckResult {
         guard !model.isEmpty else { return ProviderCheckResult(ok: false, message: "No model selected") }
+        // Same missing-key guard as validateKey: without an API key the request
+        // is guaranteed to 401, so surface the real problem (empty key) instead
+        // of the provider's raw "Header of type authorization was missing".
+        // Local endpoints are exempt — they serve without any auth.
+        if apiKey.isEmpty {
+            let preset = ProviderPreset.preset(for: providerId)
+            // Custom (named) providers always require a key — preset lookup
+            // returns nil for them, which is treated as "needs a key".
+            if (preset?.requiresKey ?? true), !isLocalEndpoint(baseUrl) {
+                return ProviderCheckResult(ok: false, message: "No API key entered — add it in Settings → Providers")
+            }
+        }
         let urlStr = baseUrl.hasSuffix("/v1") ? baseUrl : baseUrl + "/v1"
         guard let url = URL(string: urlStr + "/chat/completions") else {
             return ProviderCheckResult(ok: false, message: "Invalid base URL")
@@ -95,6 +115,17 @@ struct ProviderValidator {
         }
     }
 
+    /// True when the base URL points at this Mac (127.0.0.1 / localhost / ::1).
+    /// Local servers (llama.app, Ollama, LM Studio) accept requests with no
+    /// API key, so the "No API key entered" guard must not fire for them.
+    private static func isLocalEndpoint(_ baseUrl: String) -> Bool {
+        let host = baseUrl.replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+            .split(separator: "/").first.map(String.init) ?? ""
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+            || host.hasPrefix("127.0.0.1:") || host.hasPrefix("localhost:")
+    }
+
     /// Extract the human-readable error text from a JSON error body
     /// (`{"error": {"message": …}}`, `{"message": …}`, `{"detail": …}`) or fall
     /// back to the raw body text (many gateways reply with plain text like
@@ -109,6 +140,9 @@ struct ProviderValidator {
         }
         guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return "" }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return String(trimmed.prefix(140))
+        // Show the full server guidance (e.g. InferX's "set a default tenant or
+        // use a tenant-routing header") — truncating at 140 chars cut off the
+        // actionable part of the message.
+        return String(trimmed.prefix(400))
     }
 }
