@@ -255,7 +255,11 @@ struct JXRouterView: View {
             .padding(.bottom, DesignToken.spacing16)
             .frame(width: 380)
             .background(Color.dsBackground)
-            // ? / gear actions at the upper-right corner of the main page.
+            // ? / gear actions at the upper-right corner of the main page. The
+            // content area starts below the ~28pt title bar (fullSizeContentView
+            // still insets the SwiftUI layout), so a negative top offset plus a
+            // top safe-area escape on the overlay itself rides the icons up to
+            // the traffic-light row without moving the dashboard content.
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 14) {
                     Button(action: { showOnboarding = true }) {
@@ -276,7 +280,9 @@ struct JXRouterView: View {
                     .accessibilityLabel("Open Settings")
                     .help("Open settings")
                 }
-                .padding(.top, 10)
+                // Negative top offset compensates the ~28pt title-bar inset of
+                // the content area, aligning the icons with the traffic lights.
+                .padding(.top, -19)
                 .padding(.trailing, 14)
             }
         

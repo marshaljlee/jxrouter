@@ -1,6 +1,6 @@
 import Foundation
 
-/// A detected local model runtime (Ollama, llama.cpp, LM Studio, Jan …).
+/// A detected local model runtime (Ollama, llama.app, LM Studio, Jan …).
 struct LocalRuntime: Identifiable, Sendable {
     enum State: Sendable {
         /// Server is running and answering on its port.
@@ -11,7 +11,7 @@ struct LocalRuntime: Identifiable, Sendable {
         case missing
     }
 
-    let id: String       // provider id ("ollama", "llamacpp", "lmstudio", "jan")
+    let id: String       // provider id ("ollama", "llamaapp", "lmstudio", "jan")
     let name: String
     let port: Int
     let state: State
@@ -35,10 +35,10 @@ struct LocalProviderDetector {
     /// Probe every known local runtime concurrently.
     static func detect() async -> [LocalRuntime] {
         async let ollama = probeOllama()
-        async let llamacpp = probeLlamaCpp()
+        async let llama = probeLlamaApp()
         async let lmstudio = probeLMStudio()
         async let jan = probeJan()
-        return await [ollama, llamacpp, lmstudio, jan]
+        return await [ollama, llama, lmstudio, jan]
     }
 
     // MARK: - Individual probes
@@ -57,26 +57,21 @@ struct LocalProviderDetector {
         )
     }
 
-    private static func probeLlamaCpp() async -> LocalRuntime {
-        // llama.cpp models are only visible while its server is running.
+    private static func probeLlamaApp() async -> LocalRuntime {
+        // llama.app exposes its models only while its local server is running.
         let running = await httpOK("http://127.0.0.1:8080/health")
-        // "Installed" covers every way llama.cpp ships on macOS: the standalone
-        // `llama-server` binary, the unified `llama` CLI (whose `llama server`
-        // subcommand runs an identical server), and the Llama desktop app
-        // (llama.app / LlamaChat) that bundles llama.cpp.
-        let installed = running
-            || binaryInCommonPaths("llama-server")
-            || binaryInCommonPaths("llama")
-            || appInstalled("Llama")
-            || appInstalled("LlamaChat")
+        // "Installed" covers the Llama desktop app (llama.app) and its
+        // predecessor LlamaChat — both bundle llama.cpp and serve an
+        // OpenAI-compatible API on port 8080 when their local server is on.
+        let installed = running || appInstalled("Llama") || appInstalled("LlamaChat")
         return LocalRuntime(
-            id: "llamacpp", name: "llama.cpp", port: 8080,
+            id: "llamaapp", name: "Llama (app)", port: 8080,
             state: state(running: running, installed: installed),
             hint: running
-                ? "Ready — the loaded model is auto-fetched."
+                ? "Ready — the loaded model is auto-fetched from llama.app's local server."
                 : (installed
-                    ? "Installed but the server is not running. Click \"Run Local Model\" in Settings → General to start it, or run `llama-server -m <model.gguf>` (or `llama server -m <model.gguf>`) yourself."
-                    : "Not detected. llama.cpp isn't installed — JXProxy's local model setup tutorial will guide you (install, pick a .gguf, run).")
+                    ? "Installed but its local server is not running. Open the Llama app, load a model, and make sure the local server is enabled (port 8080), then press Refresh."
+                    : "Not detected. Install the free Llama app from https://llama.com — JXProxy connects to its built-in OpenAI-compatible server on port 8080.")
         )
     }
 

@@ -147,6 +147,9 @@ final class ProxyManager {
         proxyServer.onTrafficEntry = { @MainActor [weak self] entry in
             self?.trafficLog.append(entry)
         }
+        proxyServer.onTrafficServed = { @MainActor [weak self] id, provider, usedFallback in
+            self?.trafficLog.updateServed(id: id, provider: provider, usedFallback: usedFallback)
+        }
         loadAllFromConfig()
         proxyServer.port = resolvedPort(config.port)
         proxyServer.authToken = config.authToken

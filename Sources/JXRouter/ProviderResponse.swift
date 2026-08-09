@@ -6,6 +6,11 @@ struct ProviderResponse: Sendable {
     let headers: [String: String]
     let body: Data
     var stream: AsyncStream<Data>?
+    /// The upstream provider id that served this response (nil when the request
+    /// was not routed to a provider). Set by the router on the success path.
+    var servingProvider: String?
+    /// True when a fallback provider served the request because the primary failed.
+    var usedFallback: Bool = false
 }
 
 enum ProviderError: Error, LocalizedError {

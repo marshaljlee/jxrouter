@@ -10,6 +10,10 @@ struct TrafficEntry: Identifiable, Sendable {
     let url: String
     let appProcessName: String?
     let duration: TimeInterval?
+    /// The upstream provider that actually served this request (routeAI only).
+    var servedBy: String?
+    /// True when the primary provider failed and a configured fallback served.
+    var usedFallback: Bool = false
 }
 
 @MainActor
@@ -27,5 +31,13 @@ final class TrafficLog {
 
     func clear() {
         entries.removeAll()
+    }
+
+    /// Record which upstream provider served a routed request, and whether a
+    /// fallback was used (the primary provider had already failed).
+    func updateServed(id: UUID, provider: String?, usedFallback: Bool) {
+        guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[idx].servedBy = provider
+        entries[idx].usedFallback = usedFallback
     }
 }

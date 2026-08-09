@@ -50,7 +50,7 @@ struct ProviderPreset: Identifiable, Hashable {
         ProviderPreset(id: "ai-gateway", name: "Vercel AI Gateway", symbol: "arrow.triangle.branch", defaultUrl: "https://gateway.ai.vercel.ai/v1", models: ["vercel/openai/gpt-5.5"], requiresKey: true),
         ProviderPreset(id: "ollama", name: "Ollama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:11434/v1", models: ["qwen3:latest", "qwen2.5:latest", "llama3.2:latest", "mistral:latest"], requiresKey: false),
         ProviderPreset(id: "lmstudio", name: "LM Studio (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1234/v1", models: ["lmstudio/<model-id>"], requiresKey: false),
-        ProviderPreset(id: "llamacpp", name: "llama.cpp (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "llamaapp", name: "Llama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: [], requiresKey: false),
         ProviderPreset(id: "jan", name: "Jan (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1337/v1", models: [], requiresKey: false),
         ProviderPreset(id: "custom", name: "Custom (OpenAI-compatible)", symbol: "puzzlepiece.extension", defaultUrl: "https://api.openai.com/v1", models: [], requiresKey: true),
     ]
@@ -69,11 +69,11 @@ struct ProviderPreset: Identifiable, Hashable {
         "gemini/", "mistral/", "codestral/", "cohere/", "groq/", "fireworks/",
         "sambanova/", "cerebras/", "huggingface/", "github_models/", "wafer/",
         "kimi/", "kimi_code/", "minimax/", "zai/", "ollama_cloud/", "vercel/",
-        "nvidia_nim/", "lmstudio/", "llamacpp/",
+        "nvidia_nim/", "lmstudio/", "llamaapp/",
     ]
 
     /// The routing prefix for a provider id ("opencode/" for opencode-zen, …).
-    /// Empty for providers whose models are always bare (direct, xai, llamacpp).
+    /// Empty for providers whose models are always bare (direct, xai, llamaapp).
     static func prefix(for providerId: String) -> String {
         switch providerId {
         case "opencode-zen", "opencode-go": return "opencode/"

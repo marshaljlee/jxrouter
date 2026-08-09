@@ -40,7 +40,7 @@ struct SettingsView: View {
     /// sync with ConfigManager so switching providers doesn't discard unsaved choices.
     @State private var reasoningPolicies: [String: ReasoningPolicy] = [:]
     @State private var showLocalOnboarding = false
-    @State private var onboardingProvider: LocalModelManager.LocalProvider = .llamacpp
+    @State private var onboardingProvider: LocalModelManager.LocalProvider = .llamaapp
     /// Free API key guide sheet (OpenCode Zen / NVIDIA NIM) for non-technical users.
     @State private var showApiKeyGuide = false
     @State private var provider: String = "opencode-zen"
@@ -95,7 +95,7 @@ struct SettingsView: View {
     /// Per-tier model connectivity results from the "Test All Models" button.
     @State private var tierModelChecks: [String: ProviderCheckState] = [:]
 
-    // Auto-detected local runtimes (Ollama, llama.cpp, LM Studio, Jan)
+    // Auto-detected local runtimes (Ollama, llama.app, LM Studio, Jan)
     @State private var localRuntimes: [LocalRuntime] = []
     
     @AppStorage("autoStartProxy") private var autoStartProxy = false
@@ -110,7 +110,7 @@ struct SettingsView: View {
     @State private var botIntegrationEnabled: Bool = false
     @State private var telegramBotToken: String = ""
 
-    /// Live models fetched from the provider's /v1/models API (e.g., llama.cpp
+    /// Live models fetched from the provider's /v1/models API (e.g., llama.app
     /// only exposes its loaded models when the server is actually running).
     @State private var liveModels: [String] = []
 
@@ -198,15 +198,15 @@ struct SettingsView: View {
 
 
     /// Fetch available models from a provider's /v1/models API.
-    /// For local providers (llamacpp, ollama, lmstudio) this discovers models
+    /// For local providers (llamaapp, ollama, lmstudio) this discovers models
     /// loaded by the running server. For remote providers (e.g. NVIDIA) the
     /// API key is included in the request when available. Non-fatal on failure.
     private func fetchLiveModels(for providerId: String? = nil) async {
         let pid = providerId ?? provider
         var baseUrl = config.baseUrl(for: pid).replacingOccurrences(of: "/v1", with: "")
-        // For llamacpp, honour the port configured in LocalModelManager so that
-        // a server started with a custom port is still discovered.
-        if pid == "llamacpp" {
+        // For llamaapp, honour the port configured in LocalModelManager so
+        // that a server started with a custom port is still discovered.
+        if pid == "llamaapp" {
             let mgr = LocalModelManager.shared
             if mgr.port != 8080 {
                 baseUrl = "http://\(mgr.host):\(mgr.port)"
@@ -417,8 +417,8 @@ struct SettingsView: View {
     /// Open the appropriate guidance for a local runtime that isn't running.
     private func guideFor(_ runtime: LocalRuntime) {
         switch runtime.id {
-        case "llamacpp", "ollama":
-            onboardingProvider = LocalModelManager.LocalProvider(rawValue: runtime.id) ?? .llamacpp
+        case "llamaapp", "ollama":
+            onboardingProvider = LocalModelManager.LocalProvider(rawValue: runtime.id) ?? .llamaapp
             showLocalOnboarding = true
         default:
             let alert = NSAlert()
@@ -723,6 +723,8 @@ struct SettingsView: View {
                     tierPair(tier)
                 }
 
+                fallbackControl
+
                 if isLocalAutoProvider {
                     localModelQuickControl
                 }
@@ -798,7 +800,7 @@ struct SettingsView: View {
                 Text("Override the default API endpoint for any provider.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
-                ForEach(ProviderPreset.all.filter { $0.id != "local" && $0.id != "ollama" && $0.id != "lmstudio" && $0.id != "llamacpp" && $0.id != "custom" }) { preset in
+                ForEach(ProviderPreset.all.filter { $0.id != "local" && $0.id != "ollama" && $0.id != "lmstudio" && $0.id != "llamaapp" && $0.id != "custom" }) { preset in
                     labeledField(preset.name) {
                         TextField(
                             preset.defaultUrl,
@@ -1400,6 +1402,7 @@ struct SettingsView: View {
         values["port"] = port
         values["authToken"] = authToken
         values["provider"] = provider
+        values["fallbackProviders"] = fallbackProviders
         values["model"] = model
         values["enableThinking"] = String(enableThinking)
         values["openaiBaseUrl"] = openaiBaseUrl
@@ -1576,7 +1579,7 @@ struct SettingsView: View {
     /// one-click flow (auto-detect model → start in background, or onboarding).
     private func runLocalModel() {
         let mgr = LocalModelManager.shared
-        let newProvider: LocalModelManager.LocalProvider = provider == "ollama" ? .ollama : .llamacpp
+        let newProvider: LocalModelManager.LocalProvider = provider == "ollama" ? .ollama : .llamaapp
         // Only reset the port when the provider actually changes, so a custom
         // port isn't clobbered by re-tapping Run.
         if mgr.provider != newProvider {
@@ -1586,12 +1589,9 @@ struct SettingsView: View {
         onboardingProvider = mgr.provider
 
         switch mgr.readiness() {
-        case .needsInstall, .needsModel:
+        case .needsInstall:
             showLocalOnboarding = true
         case .ready:
-            if mgr.modelPath.isEmpty {
-                mgr.modelPath = mgr.autoDetectModelFile() ?? ""
-            }
             Task {
                 await mgr.start()
                 await fetchLiveModels()
@@ -1599,10 +1599,91 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Fallback Providers
+
+    /// The current fallback chain as a list of provider ids, in priority order.
+    private var fallbackList: [String] {
+        fallbackProviders
+            .components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Add/remove a provider from the fallback chain (append keeps priority order).
+    private func toggleFallback(_ pid: String) {
+        var list = fallbackList
+        if let idx = list.firstIndex(of: pid) {
+            list.remove(at: idx)
+        } else {
+            list.append(pid)
+        }
+        fallbackProviders = list.joined(separator: ",")
+    }
+
+    /// Multi-select control for the automatic provider fallback chain: if the
+    /// active provider fails (bad model, auth error, rate limit), JXProxy
+    /// retries each selected fallback in order before giving up.
+    private var fallbackControl: some View {
+        let current = fallbackList
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Fallback Providers")
+                    .font(.system(size: DesignToken.captionSize))
+                    .foregroundStyle(Color.dsTextSecondary)
+                savedFieldCheckmark("fallbackProviders")
+                Spacer()
+            }
+            Menu {
+                ForEach(availableProviders.filter { $0.id != provider }) { preset in
+                    Button {
+                        toggleFallback(preset.id)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: preset.symbol)
+                                .frame(width: 14, height: 14)
+                            Text(preset.name)
+                            Spacer()
+                            if current.contains(preset.id) {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Color.dsAccent)
+                            }
+                        }
+                    }
+                }
+                if availableProviders.filter({ $0.id != provider }).isEmpty {
+                    Button("No other providers configured") {}.disabled(true)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(current.isEmpty
+                        ? "None — route only through the primary provider"
+                        : current.map { providerPreset($0)?.name ?? $0 }.joined(separator: " → "))
+                        .lineLimit(1)
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.dsTextSecondary)
+                }
+                .font(.system(size: DesignToken.captionSize))
+                .padding(8)
+                .background(Color.dsSurface)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.dsBorder, lineWidth: 1)
+                )
+            }
+            .menuStyle(.borderlessButton)
+            Text("If the active provider fails (bad model, auth error, rate limit), requests automatically retry each fallback in order.")
+                .font(.system(size: DesignToken.caption2Size))
+                .foregroundStyle(Color.dsTextTertiary)
+        }
+    }
+
     /// Providers whose local server JXProxy can launch in the background.
     /// (LM Studio runs itself, so it is excluded.)
     private var isLocalAutoProvider: Bool {
-        provider == "ollama" || provider == "llamacpp"
+        provider == "ollama" || provider == "llamaapp"
     }
 
     private var localModelQuickControl: some View {
@@ -1937,7 +2018,7 @@ struct SettingsView: View {
     private func fetchTierModels(for tier: TierKey) async {
         let pid = tierProviderId(for: tier)
         var baseUrl = config.baseUrl(for: pid).replacingOccurrences(of: "/v1", with: "")
-        if pid == "llamacpp" {
+        if pid == "llamaapp" {
             let mgr = LocalModelManager.shared
             if mgr.port != 8080 { baseUrl = "http://\(mgr.host):\(mgr.port)" }
         }
@@ -2016,6 +2097,22 @@ private struct LogEntryRow: View {
                         .foregroundStyle(Color.dsAccent)
                 }
                 
+                if let servedBy = entry.servedBy {
+                    HStack(spacing: 3) {
+                        if entry.usedFallback {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 9))
+                        }
+                        Text(providerDisplayName(servedBy))
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(entry.usedFallback ? Color.dsOrange : Color.dsGreen)
+                    .help(entry.usedFallback
+                        ? "Served by fallback provider \(providerDisplayName(servedBy))"
+                        : "Served by \(providerDisplayName(servedBy))")
+                }
+                
                 Text(actionString(entry.action))
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(actionColor(entry.action))
@@ -2024,7 +2121,7 @@ private struct LogEntryRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(entry.method) request to \(entry.host). \(entry.appProcessName != nil ? "From \(entry.appProcessName!)." : "") Status: \(actionString(entry.action))")
+        .accessibilityLabel("\(entry.method) request to \(entry.host). \(entry.appProcessName != nil ? "From \(entry.appProcessName!)." : "") Status: \(actionString(entry.action))\(entry.servedBy.map { ", served by \(providerDisplayName($0))\(entry.usedFallback ? " (fallback)" : "")" } ?? "")")
     }
     
     private func methodColor(_ method: String) -> Color {
@@ -2051,13 +2148,21 @@ private struct LogEntryRow: View {
         case .block: return "BLOCKED"
         }
     }
+
+    /// Friendly display name for a provider id (built-in presets, the legacy
+    /// "local" alias, and named custom providers).
+    private func providerDisplayName(_ id: String) -> String {
+        if id == "local" { return "Local LLM" }
+        if let preset = ProviderPreset.preset(for: id) { return preset.name }
+        if let def = ConfigManager.shared.customProviders.first(where: { $0.id == id }) { return def.name }
+        return id
+    }
 }
 
 // MARK: - Local Model Onboarding
 
-/// Step-by-step setup tutorial for running a local LLM (llama.cpp / Ollama).
-/// Shown when the user taps "Run Local Model" but the server binary or a model
-/// file is missing.
+/// Step-by-step setup tutorial for running a local LLM (llama.app / Ollama).
+/// Shown when the user taps "Run Local Model" but the app/binary is missing.
 private struct LocalModelOnboardingView: View {
     let provider: LocalModelManager.LocalProvider
     let onRetry: () -> Void
@@ -2067,14 +2172,14 @@ private struct LocalModelOnboardingView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
-                Image(systemName: provider == .llamacpp ? "server.rack" : "desktopcomputer")
+                Image(systemName: provider == .llamaapp ? "desktopcomputer" : "server.rack")
                     .font(.system(size: 22))
                     .foregroundStyle(Color.dsAccent)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Set Up \(provider == .llamacpp ? "llama.cpp" : "Ollama")")
+                    Text("Set Up \(provider == .llamaapp ? "Llama" : "Ollama")")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(Color.dsTextPrimary)
-                    Text("Run your own local LLM in the background")
+                    Text("Run your own local LLM")
                         .font(.system(size: DesignToken.captionSize))
                         .foregroundStyle(Color.dsTextTertiary)
                 }
@@ -2083,22 +2188,22 @@ private struct LocalModelOnboardingView: View {
 
             onboardingStep(
                 number: "1",
-                title: provider == .llamacpp ? "Install llama.cpp" : "Install Ollama",
-                body: provider == .llamacpp
-                    ? "llama-server runs local GGUF models. Install via Homebrew, or download from the llama.cpp releases page."
+                title: provider == .llamaapp ? "Install the Llama app" : "Install Ollama",
+                body: provider == .llamaapp
+                    ? "The Llama app (llama.app) runs open models locally and serves them with an OpenAI-compatible API on port 8080. Download it free from llama.com or the Mac App Store."
                     : "Ollama serves local models with a single command. Install via Homebrew or download the macOS app.",
-                actionTitle: provider == .llamacpp ? "brew install llama.cpp" : "brew install ollama",
-                actionURL: provider == .llamacpp ? "https://github.com/ggml-org/llama.cpp/releases" : "https://ollama.com/download"
+                actionTitle: provider == .llamaapp ? "Download llama.com" : "brew install ollama",
+                actionURL: provider == .llamaapp ? "https://llama.com" : "https://ollama.com/download"
             )
 
             onboardingStep(
                 number: "2",
-                title: provider == .llamacpp ? "Get a model (.gguf)" : "Pull a model",
-                body: provider == .llamacpp
-                    ? "Download a GGUF model (e.g. Qwen3 4B). In the app, click Auto-Detect or Browse to select the file."
+                title: provider == .llamaapp ? "Load a model & start its server" : "Pull a model",
+                body: provider == .llamaapp
+                    ? "Open the Llama app, download a model from its library, and make sure its local server is enabled (it listens on port 8080). Then come back and press Run."
                     : "Pull a model once — Ollama runs it on demand. Try qwen3:8b for a good balance of speed and quality.",
-                actionTitle: provider == .llamacpp ? "Browse GGUF models" : "ollama pull qwen3:8b",
-                actionURL: provider == .llamacpp ? "https://huggingface.co/models?library=gguf&sort=trending" : nil
+                actionTitle: provider == .llamaapp ? nil : "ollama pull qwen3:8b",
+                actionURL: provider == .llamaapp ? nil : nil
             )
 
             HStack(spacing: 10) {
@@ -2118,7 +2223,7 @@ private struct LocalModelOnboardingView: View {
         .background(Color.dsBackground)
     }
 
-    private func onboardingStep(number: String, title: String, body: String, actionTitle: String, actionURL: String?) -> some View {
+    private func onboardingStep(number: String, title: String, body: String, actionTitle: String?, actionURL: String?) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Text(number)
                 .font(.system(size: 12, weight: .bold))
@@ -2133,10 +2238,12 @@ private struct LocalModelOnboardingView: View {
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextSecondary)
                 HStack(spacing: 8) {
-                    Button(actionTitle) { copyCommand(actionTitle) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .font(.system(size: DesignToken.captionSize, design: .monospaced))
+                    if let actionTitle {
+                        Button(actionTitle) { copyCommand(actionTitle) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .font(.system(size: DesignToken.captionSize, design: .monospaced))
+                    }
                     if let url = actionURL {
                         Button("Open") {
                             if let u = URL(string: url) { NSWorkspace.shared.open(u) }

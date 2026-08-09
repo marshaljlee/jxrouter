@@ -65,8 +65,12 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
         
         let messagesRequest = MessagesRequest(json: requestJSON)
-        
-        let providerChain = providerChain()
+
+        // Route the request through the tier's own provider when Claude sent a
+        // model for a tier that has one configured (Opus / Sonnet / Haiku),
+        // otherwise the global primary — both followed by the fallback chain.
+        let tier = tierName(for: messagesRequest.model.lowercased())
+        let providerChain = providerChain(for: tier)
         var lastError: Error?
         let chainStart = CFAbsoluteTimeGetCurrent()
         let maxChainDuration: TimeInterval = 120.0 // Total fallback chain cap
@@ -88,7 +92,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
-                let response = try await routeToProvider(providerId: providerId, request: messagesRequest)
+                var response = try await routeToProvider(providerId: providerId, request: messagesRequest)
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                 
                 self.lastLatencyMs = elapsedMs
@@ -98,14 +102,20 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
                     continue
                 }
-                // Non-primary providers: 4xx client errors (400 model unavailable,
-                // 401 auth, 403 forbidden, 404 not found, 429 rate limit) mean this
-                // provider can't serve the request — continue the chain. The primary
-                // provider's 4xx response semantics stay unchanged (returned as-is).
-                if index > 0, [400, 401, 403, 404, 429].contains(response.statusCode) {
+                // 4xx client errors (400 model unavailable, 401 auth, 403 forbidden,
+                // 404 not found, 429 rate limit) mean this provider can't serve the
+                // request — continue the chain so a configured fallback is tried.
+                // Previously this only applied to non-primary providers, so the
+                // chain stopped dead on the primary's 4xx and the user had to
+                // switch models manually.
+                if [400, 401, 403, 404, 429].contains(response.statusCode) {
                     lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
                     continue
                 }
+                // Attach which provider served the request (and whether a
+                // fallback had to be used) so the Logs tab can show it.
+                response.servingProvider = providerId
+                response.usedFallback = index > 0
                 return response
             } catch {
                 lastError = error
@@ -137,7 +147,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
         let requestedModel = requestJSON["model"] as? String ?? ""
         let wantsStream = requestJSON["stream"] as? Bool ?? false
-        let chain = providerChain().filter { $0 != "direct" }
+        // OpenAI clients usually send gpt-* names, but when they send a Claude
+        // tier model the tier's own provider should be used, matching the
+        // Anthropic path.
+        let tier = tierName(for: requestedModel.lowercased())
+        let chain = providerChain(for: tier).filter { $0 != "direct" }
         guard !chain.isEmpty else {
             return errorResponse(statusCode: 503, type: "api_error", message: "No OpenAI-compatible provider configured")
         }
@@ -162,7 +176,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
-                let response = try await routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream)
+                var response = try await routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream)
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                 self.lastLatencyMs = elapsedMs
                 config.lastLatencyMs = elapsedMs
@@ -171,10 +185,14 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
                     continue
                 }
-                if index > 0, [400, 401, 403, 404, 429].contains(response.statusCode) {
+                // Same failover rule as Anthropic messages: a 4xx means this
+                // provider can't serve the request — try the next fallback.
+                if [400, 401, 403, 404, 429].contains(response.statusCode) {
                     lastError = ProviderError.providerUnavailable(providerId: providerId, statusCode: response.statusCode)
                     continue
                 }
+                response.servingProvider = providerId
+                response.usedFallback = index > 0
                 return response
             } catch {
                 lastError = error
@@ -231,15 +249,55 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
 
-    /// The primary provider plus the configured fallback chain.
-    private func providerChain() -> [String] {
-        let primary = ConfigManager.resolveProviderName(config.provider)
+    /// Whether a provider id is one the router can send requests to — a
+    /// built-in preset (or the legacy "local" alias) or a named custom provider.
+    private func providerIsValid(_ pid: String) -> Bool {
+        if config.customProviders.contains(where: { $0.id == pid }) { return true }
+        if pid == "local" { return true }
+        return ProviderPreset.preset(for: pid) != nil
+    }
+
+    /// The provider chain for a request. When the request targets a Claude tier
+    /// (Opus / Sonnet / Haiku) that has its own provider configured, that
+    /// provider becomes the primary of the chain; otherwise the global primary
+    /// is used. Both are followed by the configured fallbacks. Fallbacks that
+    /// can't possibly serve (built-in key-requiring providers with no API key)
+    /// are skipped so the chain reaches a working provider instead of burning
+    /// time on guaranteed 401s. Custom providers are always tried — many are
+    /// keyless local gateways.
+    private func providerChain(for tier: String? = nil) -> [String] {
+        var primary = ConfigManager.resolveProviderName(config.provider)
+        if let tier,
+           let pid = config.tierProvider(for: tier),
+           !pid.isEmpty {
+            let resolved = ConfigManager.resolveProviderName(pid)
+            if providerIsValid(resolved) {
+                primary = resolved
+            } else {
+                print("[ProviderRouter] Tier \(tier) provider \(pid) is no longer valid — using \(primary)")
+            }
+        }
+        var chain = [primary]
         let fallbacks = config.fallbackProviders
             .components(separatedBy: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .map { ConfigManager.resolveProviderName($0) }
-        return [primary] + fallbacks
+        for pid in fallbacks {
+            if pid == primary { continue }
+            if config.customProviders.contains(where: { $0.id == pid }) {
+                chain.append(pid)
+                continue
+            }
+            if let preset = ProviderPreset.preset(for: pid),
+               preset.requiresKey,
+               config.apiKey(for: pid).isEmpty {
+                print("[ProviderRouter] Skipping fallback \(pid) — requires an API key that isn't configured")
+                continue
+            }
+            chain.append(pid)
+        }
+        return chain
     }
 
     // MARK: - Routing
@@ -274,7 +332,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false)
         case "local", "ollama":
             return try await routeToOpenAICompatible(request: request, model: config.localLlmModel, providerId: providerId, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false)
-        case "lmstudio", "llamacpp":
+        case "lmstudio", "llamaapp", "llamacpp":
             return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: "", baseUrl: baseUrl, isOpenRouter: false)
         default:
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Unknown provider: \(providerId)")
@@ -468,7 +526,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     ///
     /// Rules:
     /// - `direct` (real Anthropic API): native names pass through untouched.
-    /// - Local providers (llamacpp, ollama, lmstudio, jan, local): a non-empty
+    /// - Local providers (llamaapp, ollama, lmstudio, jan, local): a non-empty
     ///   Default Model acts as a catch-all; otherwise tier mapping; else passthrough.
     /// - Provider-prefixed names (`opencode/big-pickle`) pass through.
     /// - Native Claude tier names → per-tier override when configured.
@@ -479,7 +537,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         // Direct Anthropic: native model names must reach the real API untouched.
         if providerId == "direct" { return incomingModel }
 
-        let localProviders = ["llamacpp", "lmstudio", "local", "ollama", "jan"]
+        let localProviders = ["llamaapp", "lmstudio", "local", "ollama", "jan"]
         if let pid = providerId, localProviders.contains(pid) {
             // A non-empty Default Model is a catch-all for local providers —
             // whatever the agent sends (opus, sonnet, big-pickle, …) is replaced
@@ -555,27 +613,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     private func handleModelList() -> ProviderResponse {
         let now = Int(Date().timeIntervalSince1970)
-        var models: [[String: Any]] = []
-
-        // Sanitize model IDs to remove newlines and excess whitespace.
-        let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
-
-        // Skip entries whose model id is empty or whitespace-only after sanitizing.
-        let addModel: (String, String) -> Void = { rawId, ownedBy in
-            let id = sanitize(rawId)
-            guard !id.isEmpty else { return }
-            models.append(["id": id, "object": "model", "created": now, "owned_by": ownedBy])
+        // Only models the user can actually reach — see ConfigManager.accessibleModels().
+        let accessible = config.accessibleModels()
+        let models: [[String: Any]] = accessible.map { entry in
+            ["id": entry.id, "object": "model", "created": now, "owned_by": entry.ownedBy]
         }
-
-        addModel(config.modelOpus, "jxproxy")
-        addModel(config.modelSonnet, "jxproxy")
-        addModel(config.modelHaiku, "jxproxy")
-        for preset in ProviderPreset.all {
-            for modelId in preset.models {
-                addModel(modelId, preset.id)
-            }
-        }
-        
         let result: [String: Any] = ["data": models]
         return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: result)) ?? Data())
     }

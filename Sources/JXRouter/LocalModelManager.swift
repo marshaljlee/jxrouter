@@ -1,8 +1,10 @@
 import Foundation
 import Observation
 
-/// Manages a local model server (llama-server or ollama) as a background process.
-/// Provides start/stop lifecycle and status tracking.
+/// Manages the local model servers JXProxy can start on this Mac: the Llama
+/// desktop app (llama.app) and Ollama. Provides start/stop lifecycle and
+/// status tracking. llama.app is launched as a GUI app whose built-in server
+/// serves on port 8080; Ollama runs as a background server process.
 @MainActor
 @Observable
 final class LocalModelManager {
@@ -18,19 +20,19 @@ final class LocalModelManager {
     }
 
     enum LocalProvider: String, CaseIterable {
-        case llamacpp = "llamacpp"
+        case llamaapp = "llamaapp"
         case ollama = "ollama"
 
         var serverName: String {
             switch self {
-            case .llamacpp: return "llama-server"
+            case .llamaapp: return "Llama"
             case .ollama: return "ollama"
             }
         }
 
         var defaultPort: Int {
             switch self {
-            case .llamacpp: return 8080
+            case .llamaapp: return 8080
             case .ollama: return 11434
             }
         }
@@ -39,144 +41,195 @@ final class LocalModelManager {
     }
 
     var status: ServerStatus = .stopped
-    var provider: LocalProvider = .llamacpp
+    var provider: LocalProvider = .llamaapp
 
     /// Whether the server is currently running (for UI state).
     var isRunning: Bool {
         if case .running = status { return true }
         return false
     }
-    var modelPath: String = ""
     var port: Int = 8080
     var host: String = "127.0.0.1"
 
-    /// Preferred model directory — used as the starting point for file picker.
-    var modelDirectory: String {
-        get { UserDefaults.standard.string(forKey: "localModelDir") ?? "~/.local/share/llama.cpp" }
-        set { UserDefaults.standard.set(newValue, forKey: "localModelDir") }
-    }
-
-    /// Custom path to the server binary. Empty = auto-search common locations.
+    /// Custom path to the Ollama binary. Empty = auto-search common locations.
     var customBinaryPath: String = ""
 
     private var process: Process?
-    private var stdoutPipe: Pipe?
 
     // MARK: - Lifecycle
 
-    /// Start the local model server.
+    /// Start the local model server — launch the Llama app, or run Ollama in
+    /// the background — and wait until its OpenAI-compatible endpoint answers.
     func start() async {
         guard process == nil || process?.isRunning != true else {
             print("[LocalModel] Already running")
             return
         }
 
-        guard !modelPath.isEmpty else {
-            status = .failed("No model file selected")
-            return
-        }
-
-        let resolvedPath = NSString(string: modelPath).expandingTildeInPath
-        guard FileManager.default.fileExists(atPath: resolvedPath) else {
-            status = .failed("Model file not found: \(resolvedPath)")
-            return
-        }
-
-        // Resolve the server binary. llama.cpp ships two ways: the standalone
-        // `llama-server` binary and the unified `llama` CLI whose `server`
-        // subcommand runs an identical server — either is accepted.
-        guard let binPath = binaryPath() else {
-            let installHint = provider == .llamacpp
-                ? "Install via: brew install llama.cpp (provides llama-server and the `llama` CLI), or use the Llama app."
-                : "Install via: brew install ollama."
-            status = .failed("\(provider.serverName) not found. \(installHint)")
-            return
-        }
-        print("[LocalModel] Using binary: \(binPath)")
-
         status = .starting
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-
-        // Build the server command line. Every argument (binary path, model
-        // path, flags) is passed to bash as a positional parameter expanded by
-        // "$@" — a path containing spaces or shell metacharacters can no
-        // longer inject commands (CWE-78); bash never re-parses them as script
-        // text.
-        var serverArgs: [String]
-        let binaryName = (binPath as NSString).lastPathComponent
         switch provider {
-        case .llamacpp:
-            let ctxSize = 8192
-            serverArgs = [binPath]
-            // The unified `llama` binary needs the `server` subcommand;
-            // `llama-server` takes the flags directly.
-            if binaryName == "llama" { serverArgs.append("server") }
-            serverArgs += ["--host", host, "--port", "\(port)", "--model", resolvedPath, "--ctx-size", "\(ctxSize)"]
-        case .ollama:
-            serverArgs = [binPath, "serve"]
-        }
-        proc.arguments = [
-            "-c", """
-            nohup "$@" > /tmp/\(provider.serverName)-stdout.log 2> /tmp/\(provider.serverName)-stderr.log &
-            echo $!
-            """,
-            provider.serverName, // $0
-        ] + serverArgs
-
-        let outPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = outPipe
-
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-
-            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let pidStr = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard let pid = Int32(pidStr), pid > 0 else {
-                status = .failed("Failed to get server PID")
+        case .llamaapp:
+            // If a server is already answering (the Llama app was started
+            // manually), adopt it instead of relaunching — relaunching can
+            // trigger the app to restart its server, which is exactly when
+            // the llama.cpp fit-crash loop starts.
+            if await healthCheck() {
+                status = .running(pid: 0)
+                print("[LocalModel] Llama local server already running (port \(port))")
                 return
             }
-
-            // Wait a moment for the server to bind
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            if await healthCheck() {
-                status = .running(pid: pid)
-                process = proc
-                print("[LocalModel] Server started (PID \(pid))")
-            } else {
-                status = .failed("Server started but health check failed — check /tmp/\(provider.serverName)-stderr.log")
-                kill(pid: pid)
+            guard appInstalled("Llama") || appInstalled("LlamaChat") else {
+                status = .failed("The Llama app is not installed. Install it from https://llama.com or the Mac App Store, then try again.")
+                return
             }
-        } catch {
-            status = .failed("Failed to start: \(error.localizedDescription)")
+            launchApp("Llama")
+            print("[LocalModel] Launched Llama app; waiting for its local server on \(host):\(port)")
+            if await waitForHealth(timeout: 30) {
+                status = .running(pid: 0)
+                print("[LocalModel] Llama local server is up (port \(port))")
+            } else {
+                status = .failed(diagnoseLlamaServerFailure())
+            }
+        case .ollama:
+            guard let binPath = binaryPath() else {
+                status = .failed("ollama not found. Install via: brew install ollama.")
+                return
+            }
+            print("[LocalModel] Using binary: \(binPath)")
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+
+            // Every argument (binary path, flags) is passed to bash as a
+            // positional parameter expanded by "$@" — a path containing spaces
+            // or shell metacharacters can no longer inject commands (CWE-78);
+            // bash never re-parses them as script text.
+            proc.arguments = [
+                "-c", """
+                nohup "$@" > /tmp/ollama-stdout.log 2> /tmp/ollama-stderr.log &
+                echo $!
+                """,
+                "ollama", // $0
+                binPath, "serve",
+            ]
+
+            let outPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = outPipe
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+
+                let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let pidStr = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard let pid = Int32(pidStr), pid > 0 else {
+                    status = .failed("Failed to get ollama PID")
+                    return
+                }
+
+                // Wait a moment for the server to bind
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if await healthCheck() {
+                    status = .running(pid: pid)
+                    process = proc
+                    print("[LocalModel] ollama started (PID \(pid))")
+                } else {
+                    status = .failed("ollama started but the health check failed — check /tmp/ollama-stderr.log")
+                    kill(pid: pid)
+                }
+            } catch {
+                status = .failed("Failed to start: \(error.localizedDescription)")
+            }
         }
     }
 
-    /// Stop the local model server.
+    /// Stop the local model server — quit the Llama app, or kill ollama.
     func stop() {
-        if case .running(let pid) = status {
+        if case .running(let pid) = status, pid > 0 {
             kill(pid: pid)
             print("[LocalModel] Server stopped (was PID \(pid))")
         }
 
-        // Also try pkill as a safety net — cover every binary name the server
-        // can run under (llama-server, the unified `llama server`, ollama).
-        let patterns = provider == .llamacpp
-            ? ["llama-server", "llama server"]
-            : [provider.serverName]
-        for pattern in patterns {
+        if provider == .llamaapp {
+            // Quit the Llama app gracefully; its local server goes down with it.
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            task.arguments = ["-e", "tell application \"Llama\" to quit"]
+            try? task.run()
+            task.waitUntilExit()
+        } else {
             let pkill = Process()
             pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            pkill.arguments = ["-f", pattern]
+            pkill.arguments = ["-f", provider.serverName]
             try? pkill.run()
             pkill.waitUntilExit()
         }
 
         process = nil
         status = .stopped
+    }
+
+    /// Build a specific, actionable failure message when the Llama app's local
+    /// server doesn't come up. llama.app shells out to the Homebrew llama.cpp
+    /// binary, which aborts on startup when the loaded model + context size
+    /// doesn't fit in available memory — that abort-loop shows up as a fresh
+    /// crash report and/or a "failed to fit" line in /tmp/llama-server.log.
+    private func diagnoseLlamaServerFailure() -> String {
+        let logTail = tailLog("/tmp/llama-server.log", lines: 40)
+        let recentCrash = recentCrashReport(for: "llama", within: 180)
+        let logText = logTail.joined(separator: "\n").lowercased()
+        let fitFailure = logText.contains("failed to fit")
+            || logText.contains("fit params")
+            || logText.contains("not enough memory")
+            || logText.contains("out of memory")
+            || logText.contains("ggml_assert")
+        let relevantLogLine = logTail.last { $0.lowercased().contains("fit")
+            || $0.lowercased().contains("memory")
+            || $0.lowercased().contains("error")
+            || $0.lowercased().contains("assert") }
+
+        if recentCrash || fitFailure {
+            var msg = "The Llama app's server crashed on startup — its loaded model (and context size) doesn't fit in available memory. "
+            if let line = relevantLogLine, !line.isEmpty {
+                msg += "Server log: \"\(line.trimmingCharacters(in: .whitespacesAndNewlines))\". "
+            }
+            msg += "Fix: in the Llama app, load a smaller model or reduce the context length, and quit other memory-heavy apps before starting. "
+            msg += "If it still crashes, update llama.cpp: `brew upgrade llama.cpp`."
+            return msg
+        }
+
+        if let line = relevantLogLine, !line.isEmpty {
+            return "The Llama app is running but its local server isn't answering on port \(port). Server log: \"\(line.trimmingCharacters(in: .whitespacesAndNewlines))\". Open the app, load a model, and make sure the local server is enabled."
+        }
+
+        return "The Llama app is running but its local server isn't answering on port \(port). Open the app, load a model, and make sure the local server is enabled."
+    }
+
+    /// Last N non-empty lines of a log file (best-effort, read-only).
+    private func tailLog(_ path: String, lines: Int) -> [String] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let all = text.split(separator: "\n").map(String.init)
+        return Array(all.suffix(lines))
+    }
+
+    /// Whether macOS recorded a crash report for the given process name in the
+    /// last `within` seconds — i.e. the server is crash-looping, not just slow.
+    private func recentCrashReport(for processName: String, within: TimeInterval) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = "\(home)/Library/Logs/DiagnosticReports"
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return false }
+        let cutoff = Date().addingTimeInterval(-within)
+        for file in files where file.hasPrefix(processName + "-") && file.hasSuffix(".ips") {
+            let url = URL(fileURLWithPath: "\(dir)/\(file)")
+            if let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+               mod > cutoff {
+                return true
+            }
+        }
+        return false
     }
 
     /// Health-check against the server's OpenAI-compatible endpoint.
@@ -198,73 +251,55 @@ final class LocalModelManager {
         return false
     }
 
+    /// Poll the health endpoint until it answers or the timeout elapses.
+    private func waitForHealth(timeout: Int) async -> Bool {
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        while Date() < deadline {
+            if await healthCheck() { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
     // MARK: - Readiness & Auto-Detect
 
     enum LocalModelReadiness {
-        /// Binary (and, for llama.cpp, a model file) available — can start now.
+        /// The app/binary is available — can start now.
         case ready
-        /// Server binary not installed — show the onboarding tutorial.
+        /// The Llama app or Ollama binary is not installed — show the onboarding tutorial.
         case needsInstall
-        /// Binary installed but no model file found (llama.cpp) — show the model step.
-        case needsModel
     }
 
-    /// Path to the server binary if present (custom override or common
-    /// locations). For llama.cpp, either the standalone `llama-server` binary
-    /// or the unified `llama` CLI (invoked with the `server` subcommand) is
-    /// accepted.
+    /// Path to the Ollama binary if present (custom override or common locations).
     func binaryPath() -> String? {
-        switch provider {
-        case .llamacpp:
-            if let p = which("llama-server") { return p }
-            return which("llama")
-        case .ollama:
-            return which("ollama")
-        }
+        which("ollama")
     }
 
     /// Whether the local LLM can be started right now.
     func readiness() -> LocalModelReadiness {
-        guard binaryPath() != nil else { return .needsInstall }
-        if provider == .llamacpp {
-            let resolved = modelPath.isEmpty ? (autoDetectModelFile() ?? "") : modelPath
-            let expanded = NSString(string: resolved).expandingTildeInPath
-            if resolved.isEmpty || !FileManager.default.fileExists(atPath: expanded) {
-                return .needsModel
-            }
+        switch provider {
+        case .llamaapp:
+            return (appInstalled("Llama") || appInstalled("LlamaChat")) ? .ready : .needsInstall
+        case .ollama:
+            return binaryPath() != nil ? .ready : .needsInstall
         }
-        return .ready
-    }
-
-    /// Find a usable .gguf in the preferred model directory (or common locations)
-    /// so "Run" can start llama.cpp with zero configuration.
-    func autoDetectModelFile() -> String? {
-        if let found = findGGUF(in: modelDirectory, depth: 3) { return found }
-        if let found = findGGUF(in: "~/Downloads", depth: 3) { return found }
-        // HF hub layout is <org>/<model>/snapshots/<hash>/file.gguf — 4 levels
-        // of subdirectories, so it needs a deeper (but still bounded) search.
-        if let found = findGGUF(in: "~/.cache/huggingface/hub", depth: 5) { return found }
-        return nil
-    }
-
-    /// Recursive (bounded) search for a .gguf file.
-    private func findGGUF(in root: String, depth: Int) -> String? {
-        let expanded = NSString(string: root).expandingTildeInPath
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: expanded) else { return nil }
-        for entry in entries {
-            let full = (expanded as NSString).appendingPathComponent(entry)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir) else { continue }
-            if !isDir.boolValue {
-                if entry.lowercased().hasSuffix(".gguf") { return full }
-            } else if depth > 0 {
-                if let found = findGGUF(in: full, depth: depth - 1) { return found }
-            }
-        }
-        return nil
     }
 
     // MARK: - Helpers
+
+    private func launchApp(_ name: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-a", name]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
+    private func appInstalled(_ name: String) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return FileManager.default.fileExists(atPath: "/Applications/\(name).app")
+            || FileManager.default.fileExists(atPath: "\(home)/Applications/\(name).app")
+    }
 
     private func kill(pid: Int32) {
         let task = Process()
@@ -274,7 +309,7 @@ final class LocalModelManager {
         task.waitUntilExit()
     }
 
-    /// Find the server binary. Checks custom path first, then common Homebrew
+    /// Find the Ollama binary. Checks custom path first, then common Homebrew
     /// and local install locations. macOS apps don't inherit the user's shell
     /// PATH, so `which` from a subprocess would miss Homebrew paths.
     private func which(_ name: String) -> String? {
@@ -317,15 +352,5 @@ final class LocalModelManager {
         }
 
         return nil
-    }
-
-    func setModelPathFromFile(_ path: String) {
-        modelPath = path
-        // Infer provider from file extension and location
-        if path.lowercased().hasSuffix(".gguf") {
-            provider = .llamacpp
-        }
-        // Save the directory for next time
-        modelDirectory = (path as NSString).deletingLastPathComponent
     }
 }

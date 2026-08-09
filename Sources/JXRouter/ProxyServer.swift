@@ -41,6 +41,9 @@ final class ProxyServer: @unchecked Sendable {
     var stats = ProxyStats()
     var connectedApps: [String] = []
     var onTrafficEntry: ((TrafficEntry) -> Void)?
+    /// Called once routing completes for a routed request — reports which
+    /// upstream provider served it and whether a fallback was used.
+    var onTrafficServed: ((UUID, String?, Bool) -> Void)?
 
     /// In-process provider router (replaces external jxproxy-proxy binary).
     var providerRouter: ProviderRouter?
@@ -531,7 +534,7 @@ final class ProxyServer: @unchecked Sendable {
                 return
             }
             if basePath == "/v1/messages" || basePath == "/v1/v1/messages" || basePath == "/messages" {
-                handleAIMessages(connection, method: method, initialData: initialData)
+                handleAIMessages(connection, method: method, initialData: initialData, connectedApp: connectedApp)
                 return
             }
         }
@@ -561,7 +564,7 @@ final class ProxyServer: @unchecked Sendable {
 
         switch finalAction {
         case .routeAI:
-            routeViaProviderRouter(connection, initialData: initialData, host: host, port: port)
+            routeViaProviderRouter(connection, initialData: initialData, host: host, port: port, entryId: entry.id)
         case .passthrough:
             forwardDirectly(connection, initialData: initialData, host: host, port: port)
         case .block:
@@ -634,28 +637,16 @@ final class ProxyServer: @unchecked Sendable {
     private func handleModelListEndpoint(_ connection: NWConnection) {
         let now = Int(Date().timeIntervalSince1970)
         let cfg = ConfigManager.shared
-        
-        // Sanitize model IDs to remove newlines and excess whitespace.
-        let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
-        
-        var models: [[String: Any]] = []
 
-        // Skip entries whose model id is empty or whitespace-only after sanitizing.
-        let addModel: (String, String) -> Void = { rawId, ownedBy in
-            let id = sanitize(rawId)
-            guard !id.isEmpty else { return }
-            models.append(["id": id, "object": "model", "created": now, "owned_by": ownedBy])
+        // Only models the user can actually reach — see
+        // ConfigManager.accessibleModels(). Previously every preset model from
+        // every provider was listed, so Claude Code's /model picker showed
+        // dozens of models the user has no access to.
+        let models: [[String: Any]] = cfg.accessibleModels().map { entry in
+            // Anthropic SDK requires type: "model", not object: "model"
+            ["id": entry.id, "type": "model", "display_name": entry.id, "created_at": Date().ISO8601Format()]
         }
-
-        addModel(cfg.modelOpus, "jxproxy")
-        addModel(cfg.modelSonnet, "jxproxy")
-        addModel(cfg.modelHaiku, "jxproxy")
-        for preset in ProviderPreset.all {
-            for modelId in preset.models {
-                addModel(modelId, preset.id)
-            }
-        }
-        let data = (try? JSONSerialization.data(withJSONObject: ["data": models])) ?? Data()
+        let data = (try? JSONSerialization.data(withJSONObject: ["type": "list", "data": models])) ?? Data()
         let body = String(data: data, encoding: .utf8) ?? "[]"
         let response = """
         HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)
@@ -678,9 +669,9 @@ final class ProxyServer: @unchecked Sendable {
         // so Claude Code doesn't reject prompts as "too long"
         let modelInfo: [String: Any] = [
             "id": modelId,
-            "object": "model",
-            "created": now,
-            "owned_by": "jxproxy",
+            "type": "model",
+            "display_name": modelId,
+            "created_at": Date().ISO8601Format(),
             "capabilities": [
                 "context_window": 200000,
                 "max_output_tokens": 4096,
@@ -706,13 +697,26 @@ final class ProxyServer: @unchecked Sendable {
         connection.send(content: respData, completion: .contentProcessed({ _ in connection.cancel() }))
     }
 
-    private func handleAIMessages(_ connection: NWConnection, method: String, initialData: Data) {
+    private func handleAIMessages(_ connection: NWConnection, method: String, initialData: Data, connectedApp: String) {
         if method == "HEAD" || method == "OPTIONS" {
             let response = "HTTP/1.1 204 No Content\r\nAllow: POST, HEAD, OPTIONS\r\nProxy-Agent: JXProxy\r\n\r\n"
             guard let data = response.data(using: .utf8) else { connection.cancel(); return }
             connection.send(content: data, completion: .contentProcessed({ _ in connection.cancel() }))
             return
         }
+
+        // Claude Code's loopback traffic is the app's primary workload — log it
+        // like any other routed request so the Logs tab shows it too.
+        let entry = TrafficEntry(
+            timestamp: Date(),
+            host: "127.0.0.1",
+            action: .routeAI,
+            method: method,
+            url: "/v1/messages",
+            appProcessName: connectedApp != "Unknown" ? connectedApp : nil,
+            duration: nil
+        )
+        Task { @MainActor in self.onTrafficEntry?(entry) }
 
         guard let requestStr = String(data: initialData, encoding: .utf8) else {
             sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
@@ -767,6 +771,13 @@ final class ProxyServer: @unchecked Sendable {
                 guard let response else {
                     sendHttpResponse(connection, statusCode: 502, message: "Provider Router unavailable")
                     return
+                }
+
+                // Report which upstream provider served the request.
+                if let serving = response.servingProvider {
+                    let entryId = entry.id
+                    let usedFallback = response.usedFallback
+                    Task { @MainActor in self.onTrafficServed?(entryId, serving, usedFallback) }
                 }
 
                 let statusLine = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"
@@ -955,7 +966,7 @@ final class ProxyServer: @unchecked Sendable {
 
     // MARK: - Upstream Routing
 
-    private func routeViaProviderRouter(_ connection: NWConnection, initialData: Data, host: String, port: UInt16) {
+    private func routeViaProviderRouter(_ connection: NWConnection, initialData: Data, host: String, port: UInt16, entryId: UUID) {
         guard let requestStr = String(data: initialData, encoding: .utf8) else {
             connection.cancel()
             return
@@ -1006,6 +1017,12 @@ final class ProxyServer: @unchecked Sendable {
                 guard let response else {
                     sendHttpResponse(connection, statusCode: 502, message: "Provider Router unavailable")
                     return
+                }
+
+                // Report which upstream provider served the request.
+                if let serving = response.servingProvider {
+                    let usedFallback = response.usedFallback
+                    Task { @MainActor in self.onTrafficServed?(entryId, serving, usedFallback) }
                 }
 
                 var headerString = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"

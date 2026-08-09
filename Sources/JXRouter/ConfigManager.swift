@@ -490,7 +490,7 @@ final class ConfigManager: @unchecked Sendable {
         case "ollama-cloud": return getApiKey(chainKey: KeychainKey.ollamaCloud)
         case "ai-gateway": return getApiKey(chainKey: KeychainKey.aiGateway)
         case "custom": return getApiKey(chainKey: KeychainKey.custom)
-        case "local", "ollama", "lmstudio", "llamacpp", "jan": return ""
+        case "local", "ollama", "lmstudio", "llamaapp", "jan": return ""
         default: return ""
         }
     }
@@ -565,6 +565,12 @@ final class ConfigManager: @unchecked Sendable {
                 defaults.removeObject(forKey: UDKey.authToken)
             }
             defaults.set(true, forKey: UDKey.authTokenResetDone)
+        }
+
+        // llama.cpp was replaced by the Llama desktop app — migrate the stored
+        // provider id so old installs keep routing to the same local server.
+        if provider == "llamacpp" {
+            provider = "llamaapp"
         }
     }
 
@@ -706,6 +712,8 @@ final class ConfigManager: @unchecked Sendable {
         case "ai-gateway": return "https://gateway.ai.vercel.ai/v1"
         case "local", "ollama": return localLlmBaseUrl
         case "lmstudio": return "http://127.0.0.1:1234/v1"
+        case "llamaapp": return "http://127.0.0.1:8080/v1"
+        // Legacy alias — old installs stored "llamacpp" as the provider id.
         case "llamacpp": return "http://127.0.0.1:8080/v1"
         case "jan": return "http://127.0.0.1:1337/v1"
         case "custom":
@@ -783,8 +791,95 @@ final class ConfigManager: @unchecked Sendable {
         switch name.lowercased() {
         case "nvidia": return "nvidia-nim"
         case "ollama": return "local"
+        // Legacy alias — llama.cpp was replaced by the Llama desktop app.
+        case "llamacpp", "llama.cpp": return "llamaapp"
         default: return name
         }
+    }
+
+    // MARK: - Accessible Model List (gateway model discovery)
+
+    /// Parse the stored `visibleModelsRaw` mapping ("provider=model,model;…")
+    /// into a dictionary of provider id → visible model ids.
+    private var parsedVisibleModels: [String: [String]] {
+        var result: [String: [String]] = [:]
+        for chunk in visibleModelsRaw.components(separatedBy: ";") {
+            let parts = chunk.components(separatedBy: "=")
+            if parts.count == 2 {
+                result[parts[0]] = parts[1].components(separatedBy: ",").filter { !$0.isEmpty }
+            }
+        }
+        return result
+    }
+
+    /// Whether a provider can actually serve requests right now. Keyless
+    /// providers and custom providers the user added are always reachable;
+    /// key-requiring providers need a non-empty API key.
+    private func providerIsAccessible(_ pid: String) -> Bool {
+        if customProviders.contains(where: { $0.id == pid }) { return true }
+        let lookup = pid == "local" ? "ollama" : pid
+        guard let preset = ProviderPreset.preset(for: lookup) else { return false }
+        if !preset.requiresKey { return true }
+        return !apiKey(for: pid).isEmpty
+    }
+
+    /// The model ids the user can actually reach — served by the proxy's
+    /// `/v1/models` endpoints (Claude Code's gateway model discovery) so the
+    /// model picker only lists models from providers that are configured and
+    /// accessible. Previously every preset model from every provider was
+    /// listed, so the picker showed dozens of models the user has no access to.
+    ///
+    /// Includes:
+    /// - the four tier models the user explicitly configured (Default / Opus /
+    ///   Sonnet / Haiku), and
+    /// - preset + visible (live-fetched) models from the primary provider,
+    ///   every configured fallback, every per-tier provider, and every custom
+    ///   provider — restricted to providers that are accessible.
+    func accessibleModels() -> [(id: String, ownedBy: String)] {
+        // Sanitize model ids (newlines + stray whitespace can sneak in from
+        // pasted values) and skip empty ones.
+        let sanitize: (String) -> String = { $0.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? $0 }
+        var ids = Set<String>()
+        var owned: [String: String] = [:]
+        let add: (String, String) -> Void = { rawId, owner in
+            let id = sanitize(rawId)
+            guard !id.isEmpty else { return }
+            ids.insert(id)
+            owned[id] = owner
+        }
+
+        // 1. Explicitly configured tier models — always listed.
+        for (m, owner) in [(model, "jxproxy"), (modelOpus, "jxproxy"), (modelSonnet, "jxproxy"), (modelHaiku, "jxproxy")] where !m.isEmpty {
+            add(m, owner)
+        }
+
+        // 2. Providers in the routing path: primary + fallbacks + per-tier + custom.
+        var providerIds = Set<String>()
+        providerIds.insert(Self.resolveProviderName(provider))
+        for fallback in fallbackProviders
+            .components(separatedBy: ",")
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .filter({ !$0.isEmpty }) {
+            providerIds.insert(Self.resolveProviderName(fallback))
+        }
+        for tier in ["opus", "sonnet", "haiku"] {
+            if let pid = tierProvider(for: tier) { providerIds.insert(pid) }
+        }
+        for def in customProviders { providerIds.insert(def.id) }
+
+        // 3. Each accessible provider contributes its preset + visible models.
+        let visible = parsedVisibleModels
+        for pid in providerIds where providerIsAccessible(pid) {
+            let lookup = pid == "local" ? "ollama" : pid
+            if let preset = ProviderPreset.preset(for: lookup) {
+                for m in preset.models { add(m, pid) }
+            }
+            for m in (visible[pid] ?? []) + (visible[lookup] ?? []) {
+                add(m, pid)
+            }
+        }
+
+        return ids.sorted().map { (id: $0, ownedBy: owned[$0] ?? "jxproxy") }
     }
 }
 

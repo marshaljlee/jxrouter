@@ -1,6 +1,6 @@
 # JXProxy (JXRouter)
 
-A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, Codex, OpenAI SDK clients — through **your** choice of LLM providers: remote (InferX, NVIDIA NIM, DeepSeek, OpenRouter, Groq, …) or local (Ollama, llama.cpp / `llama.app`). Native SwiftUI/AppKit app, no web admin, no `/etc/hosts` edits, no pf rules.
+A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, Codex, OpenAI SDK clients — through **your** choice of LLM providers: remote (InferX, NVIDIA NIM, DeepSeek, OpenRouter, Groq, …) or local (Ollama, `llama.app`). Native SwiftUI/AppKit app, no web admin, no `/etc/hosts` edits, no pf rules.
 
 > **Opt-in and additive.** Nothing on your system is modified until you press **Start** or enable system-wide routing, and everything the app writes is removed by `./uninstall.sh`.
 
@@ -10,7 +10,7 @@ A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, C
 - **System-wide routing** (optional): Settings → System → **Enable System-Wide Proxy** routes other apps' HTTP/HTTPS traffic through JXProxy. `api.anthropic.com` and `api.openai.com` requests are intercepted and sent to your configured providers; **every other connection passes through unmodified** (raw relay, no TLS termination).
 - HTTPS interception of those two AI hosts requires trusting the bundled CA certificate: menu-bar icon → **Security → Install CA Certificate**.
 - **Model-tier routing**: map Opus / Sonnet / Haiku (and OpenAI equivalents) to different models or providers, with automatic provider fallback chains.
-- **Local providers** are auto-detected — Ollama, and llama.cpp including `llama-server`, the unified `llama` binary, and the Llama / LlamaChat apps (`llama server` subcommand).
+- **Local providers** are auto-detected — Ollama, and the Llama desktop app (`llama.app`), whose built-in OpenAI-compatible server serves on port 8080.
 
 ## Quick start
 

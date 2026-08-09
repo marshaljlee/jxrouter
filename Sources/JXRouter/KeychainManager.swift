@@ -50,12 +50,16 @@ enum KeychainManager {
             return
         }
 
+        // NOTE: deliberately NOT using kSecUseDataProtectionKeychain. That flag
+        // requires the keychain-access-groups entitlement (errSecMissingEntitlement
+        // -34018 otherwise) and this app is non-sandboxed with no entitlements.
+        // Classic login-keychain storage works without any entitlement and is
+        // visible to reads (retrieve/getAll) and the `security` CLI.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
             kSecValueData as String: Data(value.utf8),
-            kSecUseDataProtectionKeychain as String: true,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
 
