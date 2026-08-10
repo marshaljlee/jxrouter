@@ -66,6 +66,19 @@ else
     echo "   WARNING: Resources/ directory not found at $RESOURCES_SRC"
 fi
 
+# Bundling resources AFTER Xcode signed the bundle invalidates its
+# code-signature seal ("a sealed resource is missing or invalid"). Re-sign
+# with the project's identity so the deployed copy verifies cleanly.
+SIGN_IDENTITY=$(grep -m1 'CODE_SIGN_IDENTITY =' JXRouter.xcodeproj/project.pbxproj | sed -E 's/.*= "?([^";]+)"?;.*/\1/')
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY="-"
+fi
+echo "   Re-signing bundle with identity: $SIGN_IDENTITY"
+if ! codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"; then
+    echo "   Warning: identity not found — falling back to ad-hoc signature"
+    codesign --force --deep --sign - "$APP_BUNDLE"
+fi
+
 echo ""
 echo "4. Deploying to /Applications..."
 APP_BUNDLE="/tmp/JXRouterBuild/Release/JXRouter.app"
