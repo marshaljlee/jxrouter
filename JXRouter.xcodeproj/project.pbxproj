@@ -11,6 +11,7 @@
 		00E1D37BC8999CDDC842E4E6 /* ProviderResponse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FF08A245FB79F171355EF26 /* ProviderResponse.swift */; };
 		047326E85DDBD68DF1E9F76F /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F6B6C8ABF1D3118CAC40AD3 /* SettingsView.swift */; };
 		0506470D889620DF73A11605 /* CustomLauncherService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E9D4C5DA498073AE8D14D69 /* CustomLauncherService.swift */; };
+		A1B2C3D4E5F60718293A4B5C /* WebControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6E7F8091A2B3C4D5E6F7081 /* WebControlServer.swift */; };
 		0E159ECD222E2E1AF710C4F0 /* BotIntegrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF71D4B064CE98F4D7EAB1B3 /* BotIntegrationService.swift */; };
 		1075EFEE4F2CCF51949A42F8 /* MessageTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0190A6E89400E44C03D081F /* MessageTranslator.swift */; };
 		2ACBEF2C9EBA8DCD0DB76FE2 /* MessagesRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BD785E9B46D2962B5506F4 /* MessagesRequest.swift */; };
@@ -64,6 +65,7 @@
 		5DF2D9AF320214520D4C1574 /* DNSRedirectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DNSRedirectionManager.swift; sourceTree = "<group>"; };
 		5F6B6C8ABF1D3118CAC40AD3 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		6494BDA04102B86380927DF7 /* HTTPUtils.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPUtils.swift; sourceTree = "<group>"; };
+		D6E7F8091A2B3C4D5E6F7081 /* WebControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebControlServer.swift; sourceTree = "<group>"; };
 		653E08473BE316F12894F44A /* LocalModelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelManager.swift; sourceTree = "<group>"; };
 		8A800A0BE3EA6E07C41EF95F /* SystemProxyManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemProxyManager.swift; sourceTree = "<group>"; };
 		99D143B7FA525428B8314F76B297E7CC /* ProviderValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderValidator.swift; sourceTree = "<group>"; };
@@ -163,6 +165,7 @@
 				F66EA7EEDA2A2293AD93371C /* ProxyServer.swift */,
 				B6C1EE86A391EF962270A170 /* RequestClassifier.swift */,
 				5F6B6C8ABF1D3118CAC40AD3 /* SettingsView.swift */,
+				D6E7F8091A2B3C4D5E6F7081 /* WebControlServer.swift */,
 				5CADC5FCE00C916BB2185C44 /* StatusItemManager.swift */,
 				8A800A0BE3EA6E07C41EF95F /* SystemProxyManager.swift */,
 				4BE4B9C28F58255BA6CC8E4E /* TrafficLog.swift */,
@@ -273,6 +276,7 @@
 				FA93735EFFD15B2ADAE2A61F /* ProxyServer.swift in Sources */,
 				48983216D9583B49E6303FAA /* RequestClassifier.swift in Sources */,
 				047326E85DDBD68DF1E9F76F /* SettingsView.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* WebControlServer.swift in Sources */,
 				30987DB4D2CA48EE56CA4356 /* StatusItemManager.swift in Sources */,
 				306D6937FFE787AA5B2F3CED /* SystemProxyManager.swift in Sources */,
 				E29B38844C6D2EC6E31B75F1 /* TrafficLog.swift in Sources */,

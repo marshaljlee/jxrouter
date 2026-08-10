@@ -147,6 +147,12 @@ struct ComboBox: NSViewRepresentable {
         let comboBox = NSComboBox()
         comboBox.isEditable = true
         comboBox.completes = true
+        // MUST be set before dataSource: assigning a data source while
+        // usesDataSource is NO logs "-[NSComboBox setDataSource:] should not
+        // be called when usesDataSource is set to NO" and leaves the box in an
+        // inconsistent state that throws an NSInternalInconsistencyException
+        // during window constraint layout — crashing the whole app.
+        comboBox.usesDataSource = true
         comboBox.dataSource = context.coordinator
         comboBox.delegate = context.coordinator
         comboBox.controlSize = .regular
@@ -158,14 +164,12 @@ struct ComboBox: NSViewRepresentable {
         // while the dropdown list is open, don't restore stringValue or rebuild
         // the item list. Doing so mid-edit / mid-selection was wiping the user's
         // model choice back to the old @State value ("reverts to big-pickle").
+        // The item list is dataSource-driven (Coordinator reads `options` live),
+        // so options changes propagate automatically — no manual rebuild needed.
         let isEditing = nsView.currentEditor() != nil
         let listOpen = context.coordinator.isListOpen
         if !isEditing, !listOpen, nsView.stringValue != text {
             nsView.stringValue = text
-        }
-        if !isEditing, !listOpen, nsView.numberOfItems != options.count {
-            nsView.removeAllItems()
-            nsView.addItems(withObjectValues: options)
         }
     }
 

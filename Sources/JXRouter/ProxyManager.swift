@@ -61,6 +61,11 @@ final class ProxyManager {
     var builtInProxyRunning = false
     var systemProxyEnabled = false
 
+    /// Remote web-control server for the iOS/Android web-wrapper apps and
+    /// LAN browsers. Only active when the user enables it in Settings and
+    /// while the proxy is running.
+    var webControlServer = WebControlServer()
+
     // MARK: - Provider Management
     var providers: [ProviderSettings] = [] {
         didSet { if autoSave { scheduleSave() } }
@@ -310,6 +315,16 @@ final class ProxyManager {
         systemProxyEnabled = false
     }
 
+    // MARK: - Remote Web Control (mobile wrappers)
+
+    /// Start/restart the remote web-control server after the Settings toggle
+    /// or port changes (only effective while the proxy is running).
+    func applyWebControl() {
+        webControlServer.stop()
+        guard config.webControlEnabled, builtInProxyRunning else { return }
+        webControlServer.start(port: UInt16(config.webControlPort))
+    }
+
     // MARK: - Controls
 
     func startProxy() async {
@@ -329,6 +344,11 @@ final class ProxyManager {
             builtInProxyRunning = true
             startTime = Date()
             isRunning = true
+
+            // Remote web control (mobile wrappers) — opt-in, LAN-accessible.
+            if config.webControlEnabled {
+                webControlServer.start(port: UInt16(config.webControlPort))
+            }
 
             // Consent gate: only touch macOS proxy settings when the
             // "Enable System-Wide Proxy" toggle is on. Otherwise the proxy
@@ -374,6 +394,7 @@ final class ProxyManager {
         defer { lockUI = false }
 
         proxyServer.stop()
+        webControlServer.stop()
         builtInProxyRunning = false
         isRunning = false
         startTime = nil

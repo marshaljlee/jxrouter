@@ -105,6 +105,10 @@ struct SettingsView: View {
     @State private var networkInterface: String = "Wi-Fi"
     @State private var appRoutes: [AppRouteRule] = []
     @State private var availableInterfaces: [String] = []
+
+    // Remote Web Control (mobile web-wrapper apps)
+    @State private var webControlEnabled: Bool = false
+    @State private var webControlPort: String = "5355"
     
     // Bot
     @State private var botIntegrationEnabled: Bool = false
@@ -1022,6 +1026,30 @@ struct SettingsView: View {
                 }
             }
 
+            sectionGroup("Remote Web Control") {
+                HStack(spacing: 8) {
+                    Toggle(isOn: $webControlEnabled) {
+                        Text("Enable Remote Web Control")
+                            .font(.system(size: DesignToken.bodySize))
+                    }
+                    .toggleStyle(.switch)
+                    savedFieldCheckmark("webControlEnabled")
+                }
+                .onChange(of: webControlEnabled) { _, _ in scheduleAutoSave() }
+
+                if webControlEnabled {
+                    labeledField("Web Port") {
+                        TextField("5355", text: $webControlPort)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                            .onChange(of: webControlPort) { _, _ in scheduleAutoSave() }
+                    }
+                    Text("Serves the JXProxy control panel + JSON API on your LAN for the iOS/Android web-wrapper apps. Point them at http://<this Mac's IP>:\(webControlPort.isEmpty ? "5355" : webControlPort) and sign in with the proxy auth token (Settings → General). Requests are token-authenticated, but the port is reachable on your network — only enable on trusted Wi-Fi.")
+                        .font(.system(size: DesignToken.captionSize))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+            }
+
             sectionGroup("Auto-Launch") {
                 Toggle(isOn: $manager.autoLaunchEnabled) {
                     Text("Launch at Login")
@@ -1267,6 +1295,8 @@ struct SettingsView: View {
         huggingfaceKey = config.apiKey(for: "huggingface")
         xaiKey = config.apiKey(for: "xai")
         enableSystemProxy = manager.systemProxyEnabled
+        webControlEnabled = config.webControlEnabled
+        webControlPort = String(config.webControlPort)
         botIntegrationEnabled = config.botIntegrationEnabled
         telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
         loadAppRoutesFromConfig()
@@ -1341,9 +1371,12 @@ struct SettingsView: View {
         config.setApiKey(chainKey: ConfigManager.KeychainKey.xai, value: xaiKey)
         config.botIntegrationEnabled = botIntegrationEnabled
         config.setApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken, value: telegramBotToken)
+        config.webControlEnabled = webControlEnabled
+        if let webPort = Int(webControlPort) { config.webControlPort = webPort }
 
         saveAppRoutesToConfig()
         manager.loadAllFromConfig()
+        manager.applyWebControl()
     }
 
     /// Auto-save: persist all settings shortly after the last edit so nothing
@@ -1411,6 +1444,8 @@ struct SettingsView: View {
         values["customUrl"] = customUrl
         values["customKey"] = customKey
         values["enableSystemProxy"] = String(enableSystemProxy)
+        values["webControlEnabled"] = String(webControlEnabled)
+        values["webControlPort"] = webControlPort
         values["botIntegration"] = String(botIntegrationEnabled)
         values["appRoutes"] = appRoutes.map { "\($0.bundleIdentifier ?? "")\($0.appName)\($0.enabled)" }.joined(separator: ",")
         // API keys — one id per provider.
@@ -1491,6 +1526,8 @@ struct SettingsView: View {
         xaiKey = ""
         enableSystemProxy = false
         appRoutes = []
+        webControlEnabled = false
+        webControlPort = "5355"
         botIntegrationEnabled = false
         telegramBotToken = ""
         // Reset persists immediately via the auto-save on the resulting

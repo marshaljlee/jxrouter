@@ -270,6 +270,21 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.authToken); publish() }
     }
 
+    /// Whether the remote web-control server (mobile web-wrapper apps) is
+    /// enabled. Off by default — the listener binds all interfaces, so it is
+    /// only exposed when the user explicitly turns it on.
+    var webControlEnabled: Bool {
+        get { defaults.object(forKey: "webControlEnabled") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "webControlEnabled"); publish() }
+    }
+
+    /// Port for the remote web-control server. Defaults to 5355 (the proxy's
+    /// own port is 5255). LAN clients reach it at http://<mac-ip>:<port>.
+    var webControlPort: Int {
+        get { defaults.integer(forKey: "webControlPort").nonzero ?? 5355 }
+        set { defaults.set(newValue, forKey: "webControlPort"); publish() }
+    }
+
     /// JSON-encoded app routing rules.
     var appRoutesJSON: String {
         get { defaults.string(forKey: UDKey.appRoutesJSON) ?? "" }

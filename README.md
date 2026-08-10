@@ -53,10 +53,39 @@ Default proxy port: **5255** (configurable).
 
 `./uninstall.sh` removes all of the above **and** strips any legacy DNS-hijack entries (old pre-2026 app versions wrote `JXProxy` / `ProxySwitch` marker blocks into `/etc/hosts`) plus any leftover pf anchor — so it can fully clean a machine that previously ran an old build.
 
+## Remote Web Control (iOS / Android web-wrapper apps)
+
+The app ships a small remote-control web panel — a JSON API + single-page app
+served on your LAN — so you can monitor and control JXProxy from your phone.
+
+1. **Settings → System → Remote Web Control** → enable it (off by default; the
+   port is reachable on your network, so only enable on trusted Wi-Fi).
+2. Note the port (default **5355**) and the proxy auth token (Settings → General).
+3. Open the web panel in any browser on the LAN, or use the bundled wrapper apps:
+   - **iOS** — open `ios/JXProxyMobile.xcodeproj` in Xcode, set your signing
+     team, run. In the Simulator the default URL `http://127.0.0.1:5355` reaches
+     the Mac directly; on a device enter the Mac's LAN IP.
+   - **Android** — open `android/` in Android Studio (or `gradle assembleDebug`)
+     and point it at `http://<mac-ip>:5355`.
+
+The panel shows live status, lets you start/stop the proxy, switch providers,
+and browse recent traffic with the serving provider + fallback badges.
+
 ## Development
 
 ```bash
 xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release build
+```
+
+### macOS Intel / universal build
+
+The app is a universal binary (arm64 + x86_64) — one build runs on Apple
+Silicon and Intel Macs:
+
+```bash
+xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release \
+  -derivedDataPath build build ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO
+# signed universal .app: build/Build/Products/Release/JXRouter.app
 ```
 
 Pure SwiftUI/AppKit, no third-party dependencies. Source lives in `Sources/JXRouter/`.
