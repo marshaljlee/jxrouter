@@ -143,6 +143,7 @@ final class StatusItemManager: NSObject {
     private func toggleWindow() {
         if window.isVisible {
             if let sw = settingsWindow {
+                NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
                 window.removeChildWindow(sw)
                 sw.orderOut(nil)
                 settingsWindow = nil
@@ -152,6 +153,7 @@ final class StatusItemManager: NSObject {
             // The two windows are paired — opening the dashboard closes
             // Settings so only one is visible at a time.
             if let sw = settingsWindow {
+                NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
                 window.removeChildWindow(sw)
                 sw.orderOut(nil)
                 settingsWindow = nil
@@ -358,6 +360,7 @@ final class StatusItemManager: NSObject {
             object: sw,
             queue: .main
         ) { [weak self] _ in
+            NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
             Task { @MainActor [weak self] in
                 if let sw = self?.settingsWindow {
                     self?.window.removeChildWindow(sw)
@@ -399,6 +402,9 @@ final class StatusItemManager: NSObject {
     }
 
     private func closeSettingsWithSlide() {
+        // Flush any pending edits immediately before beginning dismissal
+        NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
+
         guard let sw = settingsWindow, sw.isVisible else {
             if let sw = settingsWindow {
                 window.removeChildWindow(sw)
@@ -685,6 +691,7 @@ extension StatusItemManager: NSWindowDelegate {
         // Closing the dashboard also closes the Settings window — the two
         // windows are a paired UI; leaving Settings orphaned would confuse.
         if sender === window, let sw = settingsWindow {
+            NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
             window.removeChildWindow(sw)
             sw.orderOut(nil)
             settingsWindow = nil

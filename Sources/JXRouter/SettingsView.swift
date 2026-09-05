@@ -100,6 +100,10 @@ struct SettingsView: View {
     @State private var openaiBaseUrl: String = ""
     @State private var localBaseUrl: String = ""
     @State private var localModel: String = ""
+    // Local Endpoint Live State
+    @State private var localEndpointModels: [String] = []
+    @State private var localEndpointStatus: String = ""
+    @State private var isFetchingLocalEndpointModels = false
     // GGUF Direct
     @State private var ggufModelPath: String = ""
     @State private var ggufModelAlias: String = "local-model"
@@ -396,6 +400,9 @@ struct SettingsView: View {
             HStack(spacing: DesignToken.spacing6) {
                 SecureField("••••••••", text: text)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        saveConfigImmediately()
+                    }
                     .onChange(of: text.wrappedValue) {
                         // A key edit invalidates the old verification result —
                         // never show a stale red X (or a green tick) for a key
@@ -403,6 +410,7 @@ struct SettingsView: View {
                         providerChecks[providerId] = .unknown
                     }
                 Button("Verify") {
+                    saveConfigImmediately()
                     Task { await verifyProviderKey(providerId) }
                 }
                 .buttonStyle(.bordered)
@@ -573,14 +581,25 @@ struct SettingsView: View {
                     geminiOAuth.isAuthorized = true
                     await verifyProviderKey("gemini-oauth")
                 }
+                // Inspect live local endpoint models
+                await fetchLocalEndpointModels()
             }
         }
         .onDisappear {
-            // Final flush: persist anything still pending in the debounce.
-            autoSaveTask?.cancel()
-            savedFlashTask?.cancel()
-            savedFieldFlashTask?.cancel()
-            saveConfig()
+            // Final flush: persist anything still pending.
+            saveConfigImmediately()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .jxproxyFlushSettingsSave)) { _ in
+            saveConfigImmediately()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
+            saveConfigImmediately()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            saveConfigImmediately()
+        }
+        .onChange(of: selectedTab) { _, _ in
+            saveConfigImmediately()
         }
         .onChange(of: settingsHash) { _, _ in
             // Auto-save on every edit (debounced) — no Save button needed, so
@@ -635,7 +654,10 @@ struct SettingsView: View {
     private var tabBar: some View {
         HStack(spacing: 0) {
             ForEach(SettingsTab.allCases, id: \.self) { tab in
-                Button(action: { selectedTab = tab }) {
+                Button(action: {
+                    saveConfigImmediately()
+                    selectedTab = tab
+                }) {
                     VStack(spacing: 8) {
                         HStack(spacing: 6) {
                             Image(systemName: tab.icon)
@@ -1176,22 +1198,121 @@ struct SettingsView: View {
 
             Divider().padding(.vertical, DesignToken.spacing4)
 
-            sectionGroup("Default Fallback Endpoints") {
-                Text("Fallback endpoints used when routing through the built-in generic 'OpenAI' or 'Ollama (Local)' provider presets in the General tab. For other local runners (e.g. Llama.app on port 9931, LM Studio) or custom proxies, configure them in Custom Providers or Auto-Detected Local Providers below.")
+            sectionGroup("Endpoints (Local Runtime & Gateway)") {
+                Text("Configure your local model runtime (Llama.app, LM Studio, Ollama) and upstream OpenAI-compatible gateway. JXProxy auto-detects active local models and keeps them synced.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
 
-                labeledField("OpenAI Preset Base URL", caption: "Fallback endpoint for the generic OpenAI preset", savedID: "openaiBaseUrl") {
+                // Quick runtime selector chips
+                HStack(spacing: 8) {
+                    let livePort = LocalServerDiscovery.liveLlamaPort()
+                    Button {
+                        localBaseUrl = "http://127.0.0.1:\(livePort)/v1"
+                        saveConfigImmediately()
+                        Task { await fetchLocalEndpointModels() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "desktopcomputer")
+                            Text("Llama.app (:\(livePort))")
+                        }
+                        .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":\(livePort)") ? .bold : .regular))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(localBaseUrl.contains(":\(livePort)") ? Color.dsAccent : Color.secondary)
+
+                    Button {
+                        localBaseUrl = "http://127.0.0.1:1234/v1"
+                        saveConfigImmediately()
+                        Task { await fetchLocalEndpointModels() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "cpu")
+                            Text("LM Studio (:1234)")
+                        }
+                        .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":1234") ? .bold : .regular))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(localBaseUrl.contains(":1234") ? Color.dsAccent : Color.secondary)
+
+                    Button {
+                        localBaseUrl = "http://127.0.0.1:11434/v1"
+                        saveConfigImmediately()
+                        Task { await fetchLocalEndpointModels() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "shippingbox")
+                            Text("Ollama (:11434)")
+                        }
+                        .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":11434") ? .bold : .regular))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(localBaseUrl.contains(":11434") ? Color.dsAccent : Color.secondary)
+
+                    Spacer()
+
+                    if isFetchingLocalEndpointModels {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Button {
+                            Task { await fetchLocalEndpointModels() }
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                                .font(.system(size: DesignToken.caption2Size))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.dsAccent)
+                    }
+                }
+
+                if !localEndpointStatus.isEmpty {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(localEndpointStatus.hasPrefix("Connected") ? Color.dsGreen : Color.dsOrange)
+                            .frame(width: 6, height: 6)
+                        Text(localEndpointStatus)
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                labeledField("Local Inference Base URL", caption: "Active endpoint for local LLM inference (Llama.app, LM Studio, Ollama)", savedID: "localBaseUrl") {
+                    TextField("http://127.0.0.1:9931/v1", text: $localBaseUrl)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            saveConfigImmediately()
+                            Task { await fetchLocalEndpointModels() }
+                        }
+                }
+
+                labeledField("Local Inference Model", caption: "Active model served by the local runtime", savedID: "localModel") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !localEndpointModels.isEmpty {
+                            Picker("Discovered Models", selection: $localModel) {
+                                ForEach(localEndpointModels, id: \.self) { mid in
+                                    Text(mid).tag(mid)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .onChange(of: localModel) {
+                                saveConfigImmediately()
+                            }
+                        }
+                        TextField("e.g. local/ornith:Q8_0", text: $localModel)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit {
+                                saveConfigImmediately()
+                            }
+                    }
+                }
+
+                labeledField("OpenAI-Compatible Base URL", caption: "Fallback endpoint for upstream OpenAI-compatible calls", savedID: "openaiBaseUrl") {
                     TextField("https://api.openai.com/v1", text: $openaiBaseUrl)
                         .textFieldStyle(.roundedBorder)
-                }
-                labeledField("Ollama Preset Base URL", caption: "Fallback endpoint for the generic Ollama preset", savedID: "localBaseUrl") {
-                    TextField("http://127.0.0.1:11434/v1", text: $localBaseUrl)
-                        .textFieldStyle(.roundedBorder)
-                }
-                labeledField("Ollama Preset Model", caption: "Default model identifier for the generic Ollama preset", savedID: "localModel") {
-                    TextField("ollama/qwen3:latest", text: $localModel)
-                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            saveConfigImmediately()
+                        }
                 }
             }
 
@@ -2027,10 +2148,21 @@ struct SettingsView: View {
         tierProviders["haiku"] = config.tierProvider(for: "haiku")
         modelOpus = config.modelOpus
         modelSonnet = config.modelSonnet
-        modelHaiku = config.modelHaiku
         openaiBaseUrl = config.openaiBaseUrl
         localBaseUrl = config.localLlmBaseUrl
         localModel = config.localLlmModel
+        if localModel == "ollama/qwen3:latest" {
+            let active = config.model
+            if !active.isEmpty && (active.hasPrefix("local/") || active.hasPrefix("llamaapp/")) {
+                localModel = active
+            } else {
+                localModel = "local/ornith:Q8_0"
+            }
+        }
+        if localBaseUrl == "http://127.0.0.1:11434/v1" {
+            let livePort = LocalServerDiscovery.liveLlamaPort()
+            localBaseUrl = "http://127.0.0.1:\(livePort)/v1"
+        }
         ggufModelPath = config.ggufModelPath
         ggufModelAlias = config.ggufModelAlias
         ggufGpuLayers = config.ggufGpuLayers
@@ -2203,19 +2335,23 @@ struct SettingsView: View {
         ]
         for write in keyWrites {
             let value = current[write.field] ?? ""
-            if lastSavedValues[write.field] != value {
+            if lastSavedValues[write.field] != value || config.getApiKey(chainKey: write.chainKey) != value {
                 config.setApiKey(chainKey: write.chainKey, value: value)
             }
         }
-        if lastSavedValues["customKey"] != customKey {
+        if lastSavedValues["customKey"] != customKey || config.getApiKey(chainKey: ConfigManager.KeychainKey.custom) != customKey {
             config.setApiKey(chainKey: ConfigManager.KeychainKey.custom, value: customKey)
         }
         for def in customProviders {
             let value = customProviderKeys[def.id] ?? ""
             let field = "customProvider:\(def.id)"
-            if lastSavedValues[field] != "\(def.name)|\(def.baseUrl)|\(value)" {
-                config.setApiKey(chainKey: ConfigManager.customProviderKey(def.id), value: value)
+            let chainKey = ConfigManager.customProviderKey(def.id)
+            if lastSavedValues[field] != "\(def.name)|\(def.baseUrl)|\(value)" || config.getApiKey(chainKey: chainKey) != value {
+                config.setApiKey(chainKey: chainKey, value: value)
             }
+        }
+        if !geminiOAuthClientId.isEmpty {
+            GeminiOAuthManager.shared.setClientId(geminiOAuthClientId)
         }
         config.botIntegrationEnabled = botIntegrationEnabled
         if botIntegrationEnabled {
@@ -2236,37 +2372,43 @@ struct SettingsView: View {
         manager.applyWebControl()
     }
 
+    /// Immediately flush and persist all settings to ConfigManager and Keychain.
+    /// Cancels any debounced autoSaveTask, writes config, updates lastSavedValues,
+    /// and flushes UserDefaults to disk so changes are never lost on window close.
+    private func saveConfigImmediately() {
+        autoSaveTask?.cancel()
+        saveConfig()
+        let current = currentFieldValues()
+        let changed = Set(current.compactMap { key, value in
+            lastSavedValues[key] == value ? nil : key
+        })
+        lastSavedValues = current
+        if !changed.isEmpty {
+            savedFieldFlash = changed
+            savedFieldFlashTask?.cancel()
+            savedFieldFlashTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard !Task.isCancelled else { return }
+                savedFieldFlash = []
+            }
+        }
+        UserDefaults.standard.synchronize()
+    }
+
     /// Auto-save: persist all settings shortly after the last edit so nothing
     /// is ever lost between an edit and an explicit Save (there is none).
-    /// Re-verifies the active provider + default model only when they changed,
-    /// replacing the old Save button's post-save verification.
+    /// Uses a tight 200ms debounce and flushes immediately.
     private func scheduleAutoSave() {
         autoSaveTask?.cancel()
         let snapshotGeneration = saveGeneration
         autoSaveTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 600_000_000)
+            try? await Task.sleep(nanoseconds: 200_000_000)
             guard !Task.isCancelled else { return }
             // Skip this save if a newer edit arrived while the debounce was sleeping.
             guard saveGeneration == snapshotGeneration else { return }
-            saveConfig()
-            // Per-field checkmarks: diff current values against the last saved
-            // snapshot, so only the fields that actually changed get a ✓.
-            let current = currentFieldValues()
-            let changed = Set(current.compactMap { key, value in
-                lastSavedValues[key] == value ? nil : key
-            })
-            lastSavedValues = current
-            if !changed.isEmpty {
-                savedFieldFlash = changed
-                savedFieldFlashTask?.cancel()
-                savedFieldFlashTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    guard !Task.isCancelled else { return }
-                    savedFieldFlash = []
-                }
-            }
-            // Flash the "Saved ✓" indicator — a fresh flash each persist, even
-            // when one is already showing (rapid edits re-trigger it).
+            saveConfigImmediately()
+
+            // Flash the "Saved ✓" indicator
             savedFlashTask?.cancel()
             showSavedFlash = true
             savedFlashTask = Task { @MainActor in
@@ -2281,6 +2423,60 @@ struct SettingsView: View {
                     await verifyProviderKey(provider)
                 }
             }
+        }
+    }
+
+    /// Live query of local endpoint models (e.g. Llama.app :9931, LM Studio :1234, Ollama :11434).
+    private func fetchLocalEndpointModels() async {
+        guard !isFetchingLocalEndpointModels else { return }
+        isFetchingLocalEndpointModels = true
+        defer { isFetchingLocalEndpointModels = false }
+
+        let trimmedUrl = localBaseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmedUrl.hasSuffix("/") ? "\(trimmedUrl)models" : "\(trimmedUrl)/models") else {
+            localEndpointStatus = "Invalid URL"
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2.0
+        request.httpMethod = "GET"
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                localEndpointStatus = "Offline / Unreachable"
+                return
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let list = json["data"] as? [[String: Any]] {
+                var modelIds: [String] = []
+                var loadedModel: String?
+                for item in list {
+                    if let id = item["id"] as? String {
+                        modelIds.append(id)
+                        if let status = item["status"] as? [String: Any],
+                           (status["value"] as? String) == "loaded" {
+                            loadedModel = id
+                        }
+                    }
+                }
+                localEndpointModels = modelIds
+                if !modelIds.isEmpty {
+                    let count = modelIds.count
+                    localEndpointStatus = "Connected (\(count) model\(count == 1 ? "" : "s") found)"
+                    if localModel.isEmpty || localModel == "ollama/qwen3:latest" {
+                        localModel = loadedModel ?? modelIds.first ?? "local/ornith:Q8_0"
+                        saveConfigImmediately()
+                    }
+                } else {
+                    localEndpointStatus = "Connected (no models reported)"
+                }
+            } else {
+                localEndpointStatus = "Connected (unrecognized format)"
+            }
+        } catch {
+            localEndpointStatus = "Offline"
         }
     }
 
@@ -2360,8 +2556,8 @@ struct SettingsView: View {
         modelSonnet = ""
         modelHaiku = ""
         openaiBaseUrl = "https://api.openai.com/v1"
-        localBaseUrl = "http://127.0.0.1:11434/v1"
-        localModel = "ollama/qwen3:latest"
+        localBaseUrl = "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
+        localModel = "local/ornith:Q8_0"
         ggufModelPath = ""
         ggufModelAlias = "local-model"
         ggufGpuLayers = 0
@@ -2804,6 +3000,7 @@ struct SettingsView: View {
         // Immediately select it as the Default provider — onChange(of: provider)
         // syncs the Default tier's model and auto-fetches its model list.
         provider = id
+        saveConfigImmediately()
     }
 
     /// A saved custom provider row: name, endpoint, key field, verify + delete.
@@ -2833,6 +3030,7 @@ struct SettingsView: View {
                     if provider == def.id, let first = availableProviders.first {
                         provider = first.id
                     }
+                    saveConfigImmediately()
                 } label: {
                     Image(systemName: "trash")
                         .font(.system(size: 11))
@@ -2864,10 +3062,14 @@ struct SettingsView: View {
                     set: { customProviderKeys[def.id] = $0 }
                 ))
                 .textFieldStyle(.roundedBorder)
+                .onSubmit {
+                    saveConfigImmediately()
+                }
                 .onChange(of: customProviderKeys[def.id] ?? "") {
                     providerChecks[def.id] = .unknown
                 }
                 Button("Verify") {
+                    saveConfigImmediately()
                     Task { await verifyProviderKey(def.id) }
                 }
                 .buttonStyle(.bordered)

@@ -7,6 +7,7 @@ import Dispatch
 /// the Keychain keys that were newly imported (e.g. "NVIDIA_NIM_API_KEY").
 extension Notification.Name {
     static let jxproxyShellKeysImported = Notification.Name("JXProxyShellKeysImported")
+    static let jxproxyFlushSettingsSave = Notification.Name("JXProxyFlushSettingsSave")
 }
 
 /// Per-provider reasoning pass-through policy.
@@ -284,15 +285,32 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.openaiBaseUrl); publish() }
     }
 
-    /// Base URL for local LLM (Ollama, etc.).
+    /// Base URL for local LLM (Llama.app, LM Studio, Ollama, etc.).
     var localLlmBaseUrl: String {
-        get { defaults.string(forKey: UDKey.localLlmBaseUrl) ?? "http://127.0.0.1:11434/v1" }
+        get {
+            let saved = defaults.string(forKey: UDKey.localLlmBaseUrl) ?? ""
+            if !saved.isEmpty && saved != "http://127.0.0.1:11434/v1" {
+                return saved
+            }
+            let livePort = LocalServerDiscovery.liveLlamaPort()
+            return "http://127.0.0.1:\(livePort)/v1"
+        }
         set { defaults.set(newValue, forKey: UDKey.localLlmBaseUrl); publish() }
     }
 
     /// Model name for local LLM.
     var localLlmModel: String {
-        get { defaults.string(forKey: UDKey.localLlmModel) ?? "ollama/qwen3:latest" }
+        get {
+            let saved = defaults.string(forKey: UDKey.localLlmModel) ?? ""
+            if !saved.isEmpty && saved != "ollama/qwen3:latest" {
+                return saved
+            }
+            let active = defaults.string(forKey: UDKey.model) ?? ""
+            if !active.isEmpty && (active.hasPrefix("local/") || active.hasPrefix("llamaapp/")) {
+                return active
+            }
+            return "local/ornith:Q8_0"
+        }
         set { defaults.set(newValue, forKey: UDKey.localLlmModel); publish() }
     }
 
@@ -624,6 +642,14 @@ final class ConfigManager: @unchecked Sendable {
         "CUSTOM_PROVIDER_KEY_\(id)"
     }
 
+    /// Convert a provider name into a URL-friendly slug.
+    static func slugify(_ name: String) -> String {
+        let lowered = name.lowercased()
+        let allowed = lowered.filter { $0.isLetter || $0.isNumber || $0 == " " }
+        let slug = allowed.split(separator: " ").joined(separator: "-")
+        return slug.isEmpty ? "custom-provider" : slug
+    }
+
     /// The id of the key-requiring built-in provider that a custom provider at
     /// `baseUrl` inherits its key from — the first endpoint match whose key is
     /// actually available — or nil. Surfaced in Settings so the user can see
@@ -701,6 +727,11 @@ final class ConfigManager: @unchecked Sendable {
         if let def = customProviders.first(where: { $0.id == providerId }) {
             let key = getApiKey(chainKey: Self.customProviderKey(def.id))
             if !key.isEmpty { return key }
+            let nameSlug = "custom-" + Self.slugify(def.name)
+            if nameSlug != def.id {
+                let aliasKey = getApiKey(chainKey: Self.customProviderKey(nameSlug))
+                if !aliasKey.isEmpty { return aliasKey }
+            }
             if def.id == "custom" {
                 let legacy = getApiKey(chainKey: KeychainKey.custom)
                 if !legacy.isEmpty { return legacy }
