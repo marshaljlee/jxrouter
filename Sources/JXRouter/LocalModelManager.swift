@@ -75,6 +75,9 @@ final class LocalModelManager {
     /// Chat template override for llama-server (empty = auto-detect via LocalChatTemplateEngine).
     var ggufChatTemplate: String = ""
 
+    /// Path to a multimodal projector file (--mmproj). Empty = auto-detect matching projector.
+    var ggufMmprojPath: String = ""
+
     private var process: Process?
 
     // MARK: - Lifecycle
@@ -288,10 +291,26 @@ final class LocalModelManager {
         proc.executableURL = URL(fileURLWithPath: serverPath)
 
         var args: [String] = []
+        if serverPath.hasSuffix("/llama") && !serverPath.hasSuffix("llama-server") {
+            args.append("serve")
+        }
         args.append(contentsOf: ["-m", selectedGGUFPath])
         args.append(contentsOf: ["--host", "127.0.0.1"])
         args.append(contentsOf: ["--port", "\(port)"])
         args.append(contentsOf: ["-a", ggufModelAlias])
+
+        // Multimodal projector (mmproj) support for vision models
+        let effectiveMmproj = !ggufMmprojPath.isEmpty
+            ? ggufMmprojPath
+            : GGUFModelScanner.findMatchingMmproj(forModelPath: selectedGGUFPath)
+
+        if let mmproj = effectiveMmproj, !mmproj.isEmpty, FileManager.default.isReadableFile(atPath: mmproj) {
+            args.append(contentsOf: ["--mmproj", mmproj])
+            if ggufGpuLayers != 0 {
+                args.append("--mmproj-offload")
+            }
+            print("[LocalModel]   Multimodal projector (mmproj): \(mmproj)")
+        }
 
         // GPU offloading
         if ggufGpuLayers > 0 {

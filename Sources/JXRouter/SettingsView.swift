@@ -106,11 +106,13 @@ struct SettingsView: View {
     @State private var isFetchingLocalEndpointModels = false
     // GGUF Direct
     @State private var ggufModelPath: String = ""
+    @State private var ggufMmprojPath: String = ""
     @State private var ggufModelAlias: String = "local-model"
     @State private var ggufGpuLayers: Int = 0
     @State private var ggufContextSize: Int = 0
     @State private var ggufPort: String = "8081"
     @State private var ggufModels: [GGUFModelFile] = []
+    @State private var scannedMmprojFiles: [String] = []
     @State private var ggufScanState: String = ""
     @State private var ggufScanTask: Task<Void, Never>?
     // Custom backend URLs per provider (stored as JSON dict in ConfigManager)
@@ -879,6 +881,14 @@ struct SettingsView: View {
                         } icon: {
                             Image(systemName: "cpu")
                         }
+                        if selected.isMultimodal || !ggufMmprojPath.isEmpty {
+                            Label {
+                                Text("Multimodal / Vision")
+                            } icon: {
+                                Image(systemName: "eye.fill")
+                            }
+                            .foregroundStyle(Color.dsAccent)
+                        }
                         if selected.isLargeModel {
                             Label {
                                 Text("Large model")
@@ -892,6 +902,113 @@ struct SettingsView: View {
                     .font(.system(size: DesignToken.caption2Size))
                     .foregroundStyle(Color.dsTextSecondary)
                 }
+
+                // Multimodal Projector (mmproj) selector
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Multimodal Projector (mmproj)", systemImage: "photo.badge.checkmark")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                            .foregroundStyle(Color.dsTextPrimary)
+                        Spacer()
+                        if !ggufMmprojPath.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "eye.fill")
+                                Text("Vision Active")
+                            }
+                            .font(.system(size: 9, weight: .bold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.dsAccent.opacity(0.15))
+                            .foregroundStyle(Color.dsAccent)
+                            .clipShape(Capsule())
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        Menu {
+                            Button {
+                                let autoMatched = GGUFModelScanner.findMatchingMmproj(forModelPath: ggufModelPath, knownMmproj: scannedMmprojFiles) ?? ""
+                                ggufMmprojPath = autoMatched
+                                LocalModelManager.shared.ggufMmprojPath = autoMatched
+                                config.ggufMmprojPath = autoMatched
+                            } label: {
+                                HStack {
+                                    Text("Auto-detect Companion")
+                                    if ggufMmprojPath.isEmpty || ggufMmprojPath == (ggufModels.first(where: { $0.path == ggufModelPath })?.mmprojPath) {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            if !scannedMmprojFiles.isEmpty {
+                                ForEach(scannedMmprojFiles, id: \.self) { path in
+                                    Button {
+                                        ggufMmprojPath = path
+                                        LocalModelManager.shared.ggufMmprojPath = path
+                                        config.ggufMmprojPath = path
+                                    } label: {
+                                        HStack {
+                                            Text((path as NSString).lastPathComponent)
+                                            if ggufMmprojPath == path {
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                                Divider()
+                            }
+
+                            Button("Choose File…") {
+                                chooseMmprojFile()
+                            }
+
+                            Button("None (Disable Vision)") {
+                                ggufMmprojPath = ""
+                                LocalModelManager.shared.ggufMmprojPath = ""
+                                config.ggufMmprojPath = ""
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "eye")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(ggufMmprojPath.isEmpty ? Color.dsTextTertiary : Color.dsAccent)
+                                Text(selectedMmprojDisplayName)
+                                    .font(.system(size: DesignToken.captionSize))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(Color.dsTextSecondary)
+                            }
+                            .padding(8)
+                            .background(Color.dsSurface)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.dsBorder, lineWidth: 1)
+                            )
+                        }
+                        .menuStyle(.borderlessButton)
+                        .frame(maxWidth: .infinity)
+
+                        Button {
+                            chooseMmprojFile()
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Browse for an mmproj GGUF file")
+                    }
+
+                    Text("Enables image understanding for multimodal vision models (Ornith, MiniCPM-V, LLaVA, Qwen-VL) by passing --mmproj to llama-server.")
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+                .padding(.top, 2)
 
                 // Run/Stop control
                 HStack(spacing: 8) {
@@ -958,6 +1075,45 @@ struct SettingsView: View {
         return model.name
     }
 
+    /// The currently selected mmproj projector display name.
+    private var selectedMmprojDisplayName: String {
+        if ggufMmprojPath.isEmpty {
+            if let selected = ggufModels.first(where: { $0.path == ggufModelPath }),
+               let autoProj = selected.mmprojPath ?? GGUFModelScanner.findMatchingMmproj(forModelPath: selected.path, knownMmproj: scannedMmprojFiles) {
+                return "Auto: \((autoProj as NSString).lastPathComponent)"
+            }
+            return "None (Text Only)"
+        }
+        return (ggufMmprojPath as NSString).lastPathComponent
+    }
+
+    /// Open file dialog to choose a custom mmproj file.
+    private func chooseMmprojFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Multimodal Projector (mmproj .gguf)"
+        panel.allowedContentTypes = [.data]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if !ggufMmprojPath.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: ggufMmprojPath).deletingLastPathComponent()
+        } else if !ggufModelPath.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: ggufModelPath).deletingLastPathComponent()
+        }
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let path = url.path
+            self.ggufMmprojPath = path
+            let mgr = LocalModelManager.shared
+            mgr.ggufMmprojPath = path
+            self.config.ggufMmprojPath = path
+            if !self.scannedMmprojFiles.contains(path) {
+                self.scannedMmprojFiles.insert(path, at: 0)
+            }
+        }
+    }
+
     /// Status text for the GGUF llama-server.
     private var ggufStatusText: String {
         let mgr = LocalModelManager.shared
@@ -977,9 +1133,12 @@ struct SettingsView: View {
     private func selectGGUFModel(_ model: GGUFModelFile) {
         ggufModelPath = model.path
         ggufModelAlias = model.suggestedAlias
+        let matchedMmproj = model.mmprojPath ?? GGUFModelScanner.findMatchingMmproj(forModelPath: model.path, knownMmproj: scannedMmprojFiles) ?? ""
+        ggufMmprojPath = matchedMmproj
         let mgr = LocalModelManager.shared
         mgr.selectedGGUFPath = model.path
         mgr.ggufModelAlias = model.suggestedAlias
+        mgr.ggufMmprojPath = matchedMmproj
         // Auto-apply a sensible GPU default for large models: offload all
         // layers when the model is small enough, CPU for very large ones.
         mgr.ggufGpuLayers = model.isLargeModel ? 0 : -1
@@ -991,17 +1150,29 @@ struct SettingsView: View {
         // even before the debounced autosave fires.
         config.ggufModelPath = model.path
         config.ggufModelAlias = model.suggestedAlias
-        print("[Settings] Selected GGUF model: \(model.name) (\(model.path))")
+        config.ggufMmprojPath = matchedMmproj
+        print("[Settings] Selected GGUF model: \(model.name) (\(model.path)), mmproj: \(matchedMmproj)")
     }
 
-    /// Scan the default locations for GGUF models.
+    /// Scan the default locations for GGUF models and mmproj companion files.
     private func scanGGUFModels() async {
         ggufScanTask?.cancel()
         ggufScanState = "Scanning…"
-        ggufModels = await Task.detached(priority: .userInitiated) {
-            GGUFModelScanner.scan()
+        let (models, mmprojs) = await Task.detached(priority: .userInitiated) {
+            let m = GGUFModelScanner.scan()
+            let p = GGUFModelScanner.scanMmprojFiles()
+            return (m, p)
         }.value
-        ggufScanState = ggufModels.isEmpty ? "No GGUF models found in ~/Models, ~/Downloads, or /Volumes." : "Found \(ggufModels.count) model\(ggufModels.count == 1 ? "" : "s")."
+        ggufModels = models
+        scannedMmprojFiles = mmprojs
+        if ggufMmprojPath.isEmpty, !ggufModelPath.isEmpty {
+            if let matched = GGUFModelScanner.findMatchingMmproj(forModelPath: ggufModelPath, knownMmproj: mmprojs) {
+                ggufMmprojPath = matched
+                LocalModelManager.shared.ggufMmprojPath = matched
+                config.ggufMmprojPath = matched
+            }
+        }
+        ggufScanState = models.isEmpty ? "No GGUF models found in ~/Models, ~/Downloads, or /Volumes." : "Found \(models.count) model\(models.count == 1 ? "" : "s")\(mmprojs.isEmpty ? "" : ", \(mmprojs.count) mmproj")."
     }
 
     /// Run the selected GGUF model through llama-server, then make it the
@@ -1012,6 +1183,7 @@ struct SettingsView: View {
         mgr.provider = .gguf
         mgr.selectedGGUFPath = ggufModelPath
         mgr.ggufModelAlias = ggufModelAlias
+        mgr.ggufMmprojPath = ggufMmprojPath
         mgr.ggufGpuLayers = ggufGpuLayers
         mgr.ggufContextSize = ggufContextSize
         if let p = Int(ggufPort) { mgr.port = p }
@@ -2093,6 +2265,7 @@ struct SettingsView: View {
         hasher.combine(localBaseUrl)
         hasher.combine(localModel)
         hasher.combine(ggufModelPath)
+        hasher.combine(ggufMmprojPath)
         hasher.combine(ggufModelAlias)
         hasher.combine(ggufGpuLayers)
         hasher.combine(ggufContextSize)
@@ -2164,6 +2337,8 @@ struct SettingsView: View {
             localBaseUrl = "http://127.0.0.1:\(livePort)/v1"
         }
         ggufModelPath = config.ggufModelPath
+        ggufMmprojPath = config.ggufMmprojPath
+        LocalModelManager.shared.ggufMmprojPath = ggufMmprojPath
         ggufModelAlias = config.ggufModelAlias
         ggufGpuLayers = config.ggufGpuLayers
         ggufContextSize = config.ggufContextSize
@@ -2287,6 +2462,7 @@ struct SettingsView: View {
         config.localLlmBaseUrl = localBaseUrl
         config.localLlmModel = localModel
         config.ggufModelPath = ggufModelPath
+        config.ggufMmprojPath = ggufMmprojPath
         config.ggufModelAlias = ggufModelAlias
         config.ggufGpuLayers = ggufGpuLayers
         config.ggufContextSize = ggufContextSize
@@ -2495,6 +2671,7 @@ struct SettingsView: View {
         values["localBaseUrl"] = localBaseUrl
         values["localModel"] = localModel
         values["ggufModelPath"] = ggufModelPath
+        values["ggufMmprojPath"] = ggufMmprojPath
         values["ggufModelAlias"] = ggufModelAlias
         values["ggufGpuLayers"] = String(ggufGpuLayers)
         values["ggufContextSize"] = String(ggufContextSize)
@@ -2559,6 +2736,7 @@ struct SettingsView: View {
         localBaseUrl = "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
         localModel = "local/ornith:Q8_0"
         ggufModelPath = ""
+        ggufMmprojPath = ""
         ggufModelAlias = "local-model"
         ggufGpuLayers = 0
         ggufContextSize = 0

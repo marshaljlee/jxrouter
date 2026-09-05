@@ -10,6 +10,7 @@ struct GGUFModelFile: Identifiable, Hashable {
     let contextLength: Int   // model's native context size
     let quantization: String // e.g. "Q8_0", "Q4_K_M"
     let chatTemplate: String // Jinja2 chat template (from metadata)
+    var mmprojPath: String?  // Path to matched multimodal projector if any
 
     /// Human-readable file size string.
     var fileSizeFormatted: String {
@@ -27,6 +28,13 @@ struct GGUFModelFile: Identifiable, Hashable {
     /// Whether this model is likely too large for this machine.
     var isLargeModel: Bool {
         fileSizeBytes > 16_000_000_000 // 16 GB+
+    }
+
+    /// Whether this model has vision / multimodal capabilities (or matched mmproj).
+    var isMultimodal: Bool {
+        if let mm = mmprojPath, !mm.isEmpty { return true }
+        let lower = (name + " " + architecture + " " + path).lowercased()
+        return lower.contains("vl") || lower.contains("vision") || lower.contains("llava") || lower.contains("minicpmv") || lower.contains("minicpm-v") || lower.contains("ornith")
     }
 }
 
@@ -100,6 +108,105 @@ enum GGUFModelScanner {
         return found.sorted { $0.fileSizeBytes > $1.fileSizeBytes }
     }
 
+    /// Scan and discover multimodal projector (mmproj) files on disk.
+    static func scanMmprojFiles(timeBudget: TimeInterval = 3.0) -> [String] {
+        var found: [String] = []
+        let fm = FileManager.default
+        let deadline = Date().addingTimeInterval(timeBudget)
+        var paths = defaultSearchPaths
+        if let volumes = try? fm.contentsOfDirectory(atPath: "/Volumes") {
+            for volume in volumes where !volume.hasPrefix(".") {
+                paths.append("/Volumes/\(volume)/Models")
+            }
+        }
+        for basePath in paths {
+            guard Date() < deadline else { break }
+            guard fm.fileExists(atPath: basePath) else { continue }
+            guard let enumerator = fm.enumerator(
+                at: URL(fileURLWithPath: basePath),
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { continue }
+            for case let url as URL in enumerator {
+                guard Date() < deadline else { break }
+                guard url.pathExtension.lowercased() == "gguf" else { continue }
+                if url.lastPathComponent.range(of: #"mmproj"#, options: .caseInsensitive) != nil {
+                    found.append(url.path)
+                }
+            }
+        }
+        return Array(Set(found)).sorted()
+    }
+
+    /// Automatically find a matching mmproj file for a given GGUF model path.
+    /// Checks the same folder first, then parent folders, then scanned locations.
+    static func findMatchingMmproj(forModelPath modelPath: String, knownMmproj: [String]? = nil) -> String? {
+        guard !modelPath.isEmpty else { return nil }
+        let fm = FileManager.default
+        let modelUrl = URL(fileURLWithPath: modelPath)
+        let dir = modelUrl.deletingLastPathComponent()
+        let modelStem = modelUrl.deletingPathExtension().lastPathComponent.lowercased()
+
+        // 1. Check same directory for any mmproj files
+        if let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            let mmprojs = contents.filter {
+                $0.pathExtension.lowercased() == "gguf" &&
+                $0.lastPathComponent.range(of: #"mmproj"#, options: .caseInsensitive) != nil
+            }
+            if !mmprojs.isEmpty {
+                // If an mmproj explicitly matches the model stem, prefer it
+                if let direct = mmprojs.first(where: {
+                    let name = $0.lastPathComponent.lowercased()
+                    let clean = name.replacingOccurrences(of: "mmproj", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "-_ "))
+                    return name.contains(modelStem) || (!clean.isEmpty && modelStem.contains(clean))
+                }) {
+                    return direct.path
+                }
+                return mmprojs.first?.path
+            }
+        }
+
+        // 2. Check parent directory (e.g. ~/Models when model is in snapshot dir)
+        let parentDir = dir.deletingLastPathComponent()
+        if parentDir.path != "/Users" && parentDir.path != "/" {
+            if let contents = try? fm.contentsOfDirectory(at: parentDir, includingPropertiesForKeys: nil) {
+                let mmprojs = contents.filter {
+                    $0.pathExtension.lowercased() == "gguf" &&
+                    $0.lastPathComponent.range(of: #"mmproj"#, options: .caseInsensitive) != nil
+                }
+                if let direct = mmprojs.first(where: {
+                    let name = $0.lastPathComponent.lowercased()
+                    let modelTokens = modelStem.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                    return modelTokens.contains(where: { $0.count >= 4 && name.contains($0) })
+                }) {
+                    return direct.path
+                }
+            }
+        }
+
+        // 3. Match from known scanned mmproj files
+        let pool = knownMmproj ?? scanMmprojFiles(timeBudget: 1.5)
+        let modelTokens = modelStem.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        var bestMatch: (path: String, score: Int)? = nil
+        for candidate in pool {
+            let candName = (candidate as NSString).lastPathComponent.lowercased()
+            var score = 0
+            for token in modelTokens where token.count >= 3 {
+                if candName.contains(token) {
+                    score += token.count
+                }
+            }
+            if score > (bestMatch?.score ?? 0) {
+                bestMatch = (candidate, score)
+            }
+        }
+        if let best = bestMatch, best.score >= 4 {
+            return best.path
+        }
+
+        return nil
+    }
+
     /// Read GGUF metadata from a single model file by parsing the GGUF header
     /// natively. Falls back to filename-based parsing if the header can't be read.
     static func readGGUFMetadata(path: String, fileSize: Int64) -> GGUFModelFile {
@@ -125,6 +232,8 @@ enum GGUFModelScanner {
             contextLength = architectureContainsQwen(architecture) ? 32768 : 8192
         }
 
+        let mmproj = findMatchingMmproj(forModelPath: path)
+
         return GGUFModelFile(
             id: path,
             name: name,
@@ -133,7 +242,8 @@ enum GGUFModelScanner {
             architecture: architecture,
             contextLength: contextLength,
             quantization: quantization,
-            chatTemplate: chatTemplate
+            chatTemplate: chatTemplate,
+            mmprojPath: mmproj
         )
     }
 

@@ -79,6 +79,7 @@ final class ConfigManager: @unchecked Sendable {
         static let ggufGpuLayers = "ggufGpuLayers"
         static let ggufContextSize = "ggufContextSize"
         static let ggufPort = "ggufPort"
+        static let ggufMmprojPath = "ggufMmprojPath"
         static let authToken = "authToken"
         static let authTokenResetDone = "authTokenResetDone"
         static let appRoutesJSON = "appRoutesJSON"
@@ -344,6 +345,12 @@ final class ConfigManager: @unchecked Sendable {
     var ggufPort: Int {
         get { defaults.object(forKey: UDKey.ggufPort) as? Int ?? 8081 }
         set { defaults.set(newValue, forKey: UDKey.ggufPort); publish() }
+    }
+
+    /// Path to the multimodal projector (mmproj) GGUF file for vision models.
+    var ggufMmprojPath: String {
+        get { defaults.string(forKey: UDKey.ggufMmprojPath) ?? "" }
+        set { defaults.set(newValue, forKey: UDKey.ggufMmprojPath); publish() }
     }
 
     /// Auth token for proxy authentication. Defaults to the documented token
