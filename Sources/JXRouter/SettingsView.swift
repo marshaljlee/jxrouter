@@ -508,8 +508,9 @@ struct SettingsView: View {
                 .padding(.horizontal, DesignToken.spacing20)
                 .padding(.vertical, DesignToken.spacing12)
         }
-        // Tall window so the General and System tabs fit without scrollbars.
-        .frame(width: 560, height: 780)
+        // Match window width and expand to fill window height dynamically.
+        .frame(width: 560)
+        .frame(maxHeight: .infinity)
         .background(Color.dsBackground)
         .onAppear {
             // Re-scan the shell configs first so a key added to ~/.zshrc since

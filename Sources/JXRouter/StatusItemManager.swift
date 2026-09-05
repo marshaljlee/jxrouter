@@ -142,12 +142,20 @@ final class StatusItemManager: NSObject {
     /// Show or hide the main window.
     private func toggleWindow() {
         if window.isVisible {
+            if let sw = settingsWindow {
+                window.removeChildWindow(sw)
+                sw.orderOut(nil)
+                settingsWindow = nil
+            }
             window.orderOut(nil)
         } else {
             // The two windows are paired — opening the dashboard closes
             // Settings so only one is visible at a time.
-            settingsWindow?.orderOut(nil)
-            settingsWindow = nil
+            if let sw = settingsWindow {
+                window.removeChildWindow(sw)
+                sw.orderOut(nil)
+                settingsWindow = nil
+            }
             positionWindow()
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -275,17 +283,6 @@ final class StatusItemManager: NSObject {
             return
         }
 
-        let sw = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        sw.title = "JXProxy Settings"
-        sw.contentViewController = NSHostingController(rootView: SettingsView(manager: proxyManager))
-        sw.isReleasedWhenClosed = false
-        sw.backgroundColor = NSColor.windowBackgroundColor
-
         let dashboardVisible = window.isVisible
         let anchorFrame: NSRect
         if dashboardVisible {
@@ -295,21 +292,45 @@ final class StatusItemManager: NSObject {
             anchorFrame = NSRect(
                 x: b.midX - 190,
                 y: (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? b.minY,
-                width: 380, height: 780
+                width: 380, height: 785
             ).intersection((buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? .zero)
         } else {
             anchorFrame = window.frame
         }
 
+        let swWidth: CGFloat = 560
+        let swHeight = anchorFrame.height
+
+        let sw = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: swWidth, height: swHeight),
+            styleMask: [
+                .titled,
+                .closable,
+                .miniaturizable,
+                .fullSizeContentView,
+            ],
+            backing: .buffered,
+            defer: false
+        )
+        sw.titlebarAppearsTransparent = true
+        sw.titleVisibility = .hidden
+        sw.title = "JXProxy Settings"
+        sw.isMovableByWindowBackground = false
+        sw.backgroundColor = .clear
+        sw.isOpaque = false
+        sw.standardWindowButton(.closeButton)?.isHidden = true
+        sw.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        sw.standardWindowButton(.zoomButton)?.isHidden = true
+        sw.contentViewController = NSHostingController(rootView: SettingsView(manager: proxyManager))
+        sw.isReleasedWhenClosed = false
+
         // Determine available space on both sides of the anchor (main window)
-        let gap: CGFloat = 10
         let targetScreen = window.screen ?? statusItem.button?.window?.screen ?? NSScreen.main
         let screenFrame = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let swWidth = sw.frame.width   // 560
-        let swHeight = sw.frame.height // 780
 
-        let spaceOnRight = screenFrame.maxX - (anchorFrame.maxX + gap)
-        let spaceOnLeft = (anchorFrame.minX - gap) - screenFrame.minX
+        // Gap is 0 so the settings window remains seamlessly intact by the end border of the main interface
+        let spaceOnRight = screenFrame.maxX - anchorFrame.maxX
+        let spaceOnLeft = anchorFrame.minX - screenFrame.minX
 
         // Choose slide direction based on available space
         let slideToRight = spaceOnRight >= swWidth || (spaceOnRight >= spaceOnLeft && spaceOnLeft < swWidth)
@@ -317,18 +338,17 @@ final class StatusItemManager: NSObject {
         let finalX: CGFloat
         let startX: CGFloat
         if slideToRight {
-            finalX = min(anchorFrame.maxX + gap, screenFrame.maxX - swWidth)
+            finalX = min(anchorFrame.maxX, screenFrame.maxX - swWidth)
             // Start directly tucked behind the dashboard window
             startX = anchorFrame.minX
         } else {
-            finalX = max(anchorFrame.minX - gap - swWidth, screenFrame.minX)
+            finalX = max(anchorFrame.minX - swWidth, screenFrame.minX)
             // Start directly tucked behind the dashboard window
             startX = anchorFrame.maxX - swWidth
         }
 
-        // Align top of settings with top of anchor, clamped within screen bounds
-        let topAlignedY = anchorFrame.maxY - swHeight
-        let finalY = min(max(topAlignedY, screenFrame.minY + 20), screenFrame.maxY - swHeight)
+        // Align exactly with the anchor window vertically (flush top and bottom borders)
+        let finalY = anchorFrame.minY
         let finalFrame = NSRect(x: finalX, y: finalY, width: swWidth, height: swHeight)
         let startFrame = NSRect(x: startX, y: finalY, width: swWidth, height: swHeight)
 
@@ -339,6 +359,9 @@ final class StatusItemManager: NSObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                if let sw = self?.settingsWindow {
+                    self?.window.removeChildWindow(sw)
+                }
                 self?.settingsWindow = nil
             }
         }
@@ -348,6 +371,7 @@ final class StatusItemManager: NSObject {
         guard dashboardVisible else {
             sw.setFrame(finalFrame, display: false)
             sw.alphaValue = 1.0
+            window.addChildWindow(sw, ordered: .below)
             sw.makeKeyAndOrderFront(nil)
             return
         }
@@ -366,20 +390,28 @@ final class StatusItemManager: NSObject {
             sw.animator().setFrame(finalFrame, display: true)
             sw.animator().alphaValue = 1.0
         }, completionHandler: { [weak self, weak sw] in
-            // Slide complete: raise Settings to key window while keeping the main dashboard visible
-            sw?.makeKeyAndOrderFront(nil)
-            self?.isAnimatingSettings = false
+            guard let self, let sw else { return }
+            // Lock intact to the main interface as a child window
+            self.window.addChildWindow(sw, ordered: .below)
+            sw.makeKeyAndOrderFront(nil)
+            self.isAnimatingSettings = false
         })
     }
 
     private func closeSettingsWithSlide() {
         guard let sw = settingsWindow, sw.isVisible else {
-            settingsWindow?.close()
+            if let sw = settingsWindow {
+                window.removeChildWindow(sw)
+                sw.close()
+            }
             settingsWindow = nil
             return
         }
 
         guard !isAnimatingSettings else { return }
+
+        // Detach from parent window before running reverse slide
+        window.removeChildWindow(sw)
 
         let anchorFrame = window.frame
         let currentFrame = sw.frame
@@ -392,6 +424,7 @@ final class StatusItemManager: NSObject {
         let returnFrame = NSRect(x: targetX, y: currentFrame.origin.y, width: currentFrame.width, height: currentFrame.height)
 
         isAnimatingSettings = true
+        sw.order(.below, relativeTo: window.windowNumber)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.25
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
@@ -652,7 +685,9 @@ extension StatusItemManager: NSWindowDelegate {
         // Closing the dashboard also closes the Settings window — the two
         // windows are a paired UI; leaving Settings orphaned would confuse.
         if sender === window, let sw = settingsWindow {
+            window.removeChildWindow(sw)
             sw.orderOut(nil)
+            settingsWindow = nil
         }
         return true
     }
