@@ -145,4 +145,51 @@ final class SystemProxyManager {
             return false
         }
     }
+
+    /// Actor-free emergency cleanup for the uncaught-exception handler and
+    /// watchdog paths: turns the web + secure proxy OFF on EVERY network
+    /// service by spawning `networksetup` directly. Never touches @MainActor
+    /// state, so it is safe and synchronous to call from any thread while the
+    /// process is already dying. This is the last line of defense against a
+    /// crash stranding the system proxy on a dead port — the #1 cause of
+    /// system-wide internet loss until the app is relaunched.
+    nonisolated static func emergencyDisableAllInterfaces() {
+        let setupPath = "/usr/sbin/networksetup"
+
+        let list = Process()
+        list.executableURL = URL(fileURLWithPath: setupPath)
+        list.arguments = ["-listallnetworkservices"]
+        let pipe = Pipe()
+        list.standardOutput = pipe
+        do {
+            try list.run()
+            list.waitUntilExit()
+        } catch {
+            return
+        }
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        let services = output.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("An asterisk") }
+            // Disabled services come back as "*ServiceName" — strip the marker.
+            .map { $0.hasPrefix("*") ? String($0.dropFirst()) : $0 }
+
+        for service in services {
+            for args in [
+                ["-setwebproxystate", service, "off"],
+                ["-setsecurewebproxystate", service, "off"],
+            ] {
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: setupPath)
+                task.arguments = args
+                do {
+                    try task.run()
+                    task.waitUntilExit()
+                } catch {
+                    print("emergency networksetup \(args) failed: \(error)")
+                }
+            }
+        }
+    }
 }

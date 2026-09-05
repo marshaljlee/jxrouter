@@ -26,6 +26,7 @@ struct ProxyStats: Sendable {
     var aiRouted: Int = 0
     var passthrough: Int = 0
     var blocked: Int = 0
+    var errors: Int = 0
     var uptime: TimeInterval = 0
 }
 
@@ -33,12 +34,41 @@ struct ProxyStats: Sendable {
 final class ProxyServer: @unchecked Sendable {
     private var httpListener: NWListener?
     private let queue = DispatchQueue(label: "com.jxproxy.proxy", qos: .userInitiated)
-    private let classifier = RequestClassifier()
+    /// Classifier instance kept in sync with the "Route OpenAI connections"
+    /// switch (see syncConfigCache) so gating is consistent on every code path.
+    /// Lock protecting mutable state accessed from multiple queues (proxy
+    /// queue writes, MainActor reads). Using os_unfair_lock for the hot-path
+    /// stats counters — it's the cheapest synchronization primitive on macOS.
+    private let stateLock = NSLock()
 
     var isRunning = false
     var port: UInt16 = 5255
     var authToken: String = "jxproxy"
-    var stats = ProxyStats()
+    private var _stats = ProxyStats()
+
+    /// Thread-safe access to proxy stats. Reads/writes are serialized via
+    /// stateLock so the proxy queue (writer) and MainActor (reader) never
+    /// race on the same counters.
+    var stats: ProxyStats {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _stats
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _stats = newValue
+        }
+    }
+
+    /// Thread-safe in-place mutation of stats counters.
+    private func mutateStats(_ mutate: (inout ProxyStats) -> Void) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        mutate(&_stats)
+    }
+
     var connectedApps: [String] = []
     var onTrafficEntry: ((TrafficEntry) -> Void)?
     /// Called once routing completes for a routed request — reports which
@@ -60,22 +90,70 @@ final class ProxyServer: @unchecked Sendable {
     /// Error state for UI propagation.
     var lastError: String?
 
-    /// Cached config values for nonisolated access (updated via syncFromConfig).
-    var cachedProvider: String = "jxproxy"
-    var cachedModelOpus: String = "claude-opus-4-8-20250701"
-    var cachedModelSonnet: String = "claude-sonnet-5-20251001"
-    var cachedModelHaiku: String = "claude-haiku-4-5-20251001"
-    var cachedMitmHosts: Set<String> = ["api.anthropic.com"]
+    /// Cached config values for nonisolated access (updated via syncConfigCache).
+    /// Access is serialized behind stateLock: syncConfigCache() runs on the
+    /// MainActor while connection handlers read these on the proxy queue —
+    /// unsynchronized access was a data race on String/Set payloads.
+    private var _cachedProvider: String = "jxproxy"
+    private var _cachedModelOpus: String = "claude-opus-4-8-20250701"
+    private var _cachedModelSonnet: String = "claude-sonnet-5-20251001"
+    private var _cachedModelHaiku: String = "claude-haiku-4-5-20251001"
+    private var _cachedMitmHosts: Set<String> = ["api.anthropic.com"]
+    private var _classifier = RequestClassifier()
+
+    /// Thread-safe snapshot of the cached config for proxy-queue readers.
+    private struct ConfigSnapshot {
+        var provider: String
+        var modelOpus: String
+        var modelSonnet: String
+        var modelHaiku: String
+        var mitmHosts: Set<String>
+        var classifier: RequestClassifier
+    }
+
+    private func configSnapshot() -> ConfigSnapshot {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return ConfigSnapshot(
+            provider: _cachedProvider,
+            modelOpus: _cachedModelOpus,
+            modelSonnet: _cachedModelSonnet,
+            modelHaiku: _cachedModelHaiku,
+            mitmHosts: _cachedMitmHosts,
+            classifier: _classifier
+        )
+    }
 
     /// Sync cached config values from ConfigManager (call from MainActor).
     func syncConfigCache() {
-        cachedProvider = ConfigManager.shared.provider
-        cachedModelOpus = ConfigManager.shared.modelOpus
-        cachedModelSonnet = ConfigManager.shared.modelSonnet
-        cachedModelHaiku = ConfigManager.shared.modelHaiku
-        cachedMitmHosts = ConfigManager.shared.mitmHosts
-        cachedProvider = ConfigManager.shared.provider
+        let provider = ConfigManager.shared.provider
+        let modelOpus = ConfigManager.shared.modelOpus
+        let modelSonnet = ConfigManager.shared.modelSonnet
+        let modelHaiku = ConfigManager.shared.modelHaiku
+        var mitmHosts = ConfigManager.shared.mitmHosts
+        let routeOpenAI = ConfigManager.shared.routeOpenAI
+        let classifier = RequestClassifier(routeOpenAI: routeOpenAI)
+
+        // "Route OpenAI connections" switch: keep the classifier and the
+        // CONNECT-intercept host set in sync so api.openai.com is left alone
+        // when the user turns OpenAI routing off.
+        if !routeOpenAI {
+            mitmHosts = mitmHosts.filter { !RequestClassifier.isOpenAIHost($0) }
+        }
+
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        _cachedProvider = provider
+        _cachedModelOpus = modelOpus
+        _cachedModelSonnet = modelSonnet
+        _cachedModelHaiku = modelHaiku
+        _cachedMitmHosts = mitmHosts
+        _classifier = classifier
     }
+
+
+    /// Read-only passthrough for the cached provider name (thread-safe).
+    var cachedProvider: String { configSnapshot().provider }
 
     /// Whether auth enforcement is enabled.
     var authEnabled: Bool {
@@ -92,6 +170,8 @@ final class ProxyServer: @unchecked Sendable {
     private var userInitiatedStop = false
     /// Counter to prevent infinite auto-restart loops.
     private var autoRestartCount = 0
+    /// Unexpected-listener-death restarts this session (NOT reset by start()).
+    private var unexpectedRestarts = 0
     private let maxAutoRestarts = 10
 
     private var activeConnections: [UUID: NWConnection] = [:]
@@ -122,8 +202,12 @@ final class ProxyServer: @unchecked Sendable {
         let checkPipe = Pipe()
         check.standardOutput = checkPipe
         check.standardError = Pipe()
-        try? check.run()
-        check.waitUntilExit()
+        do {
+            try check.run()
+            check.waitUntilExit()
+        } catch {
+            print("[ProxyServer] Pre-flight lsof check could not run: \(error)")
+        }
         let checkData = checkPipe.fileHandleForReading.readDataToEndOfFile()
         let pids = String(data: checkData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !pids.isEmpty {
@@ -132,7 +216,10 @@ final class ProxyServer: @unchecked Sendable {
 
         // Start HTTP proxy listener — throws synchronously if params are invalid,
         // async failure (port conflict) is caught by the state handler above.
-        httpListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw ProxyError.listenerFailed("Invalid port: \(port)")
+        }
+        httpListener = try NWListener(using: params, on: nwPort)
         httpListener?.stateUpdateHandler = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -208,11 +295,22 @@ final class ProxyServer: @unchecked Sendable {
         lastError = nil
         userInitiatedStop = false
         autoRestartCount = 0
+        unexpectedRestarts = 0
         activeConnections.removeAll()
         connectedApps.removeAll()
         appConnectionCounts.removeAll()
         stats = ProxyStats()
         print("[ProxyServer] Reset for restart")
+    }
+
+    /// Clear the unexpected-death auto-restart cap. Called on USER-initiated
+    /// starts (Settings / menu-bar / web control): a user explicitly asking for
+    /// the proxy to run resets the failure budget, so a fresh transient failure
+    /// after their action still gets the bounded auto-restarts. start() itself
+    /// must NOT reset this (scheduleAutoRestart calls start() and would defeat
+    /// its own cap).
+    func resetUnexpectedRestartCount() {
+        unexpectedRestarts = 0
     }
 
     // MARK: - Direct TLS + DNS Management
@@ -234,8 +332,30 @@ final class ProxyServer: @unchecked Sendable {
 
     // MARK: - Auto-Restart
 
+    /// Bounded best-effort restart when the listener dies unexpectedly. A single
+    /// transient listener failure (port race, kernel hiccup) must never leave
+    /// the proxy dead until the user manually restarts — that silent death is
+    /// what makes Claude Code report "cannot connect" while the app process is
+    /// still running. Older builds disabled this to avoid osascript prompt
+    /// loops; this app never prompts, and the counter is capped so it cannot
+    /// loop forever. `unexpectedRestarts` is deliberately NOT reset by start()
+    /// (start() resets autoRestartCount), so the cap is a true per-session cap.
     private func scheduleAutoRestart() {
-        // Disabled to prevent infinite osascript prompt loops if the port fails to bind
+        guard unexpectedRestarts < 3 else {
+            print("[ProxyServer] Auto-restart cap reached (3) — proxy stays stopped; click Restart")
+            return
+        }
+        unexpectedRestarts += 1
+        let delay = Double(unexpectedRestarts) * 2.0
+        print("[ProxyServer] Listener died unexpectedly — auto-restart \(unexpectedRestarts)/3 in \(delay)s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            // Never clobber a proxy that a user action or earlier restart
+            // already brought back up.
+            guard !self.isRunning else { return }
+            print("[ProxyServer] Auto-restarting listener on port \(self.port)")
+            try? self.start(port: self.port)
+        }
     }
 
     // MARK: - Watchdog
@@ -274,6 +394,15 @@ final class ProxyServer: @unchecked Sendable {
         }
     }
 
+    /// Decode ONLY the header block (up to and including CRLFCRLF) of a
+    /// possibly-truncated first packet. The 64KB receive cap can cut a
+    /// multi-byte UTF-8 character in the body in half, so decoding the whole
+    /// buffer as UTF-8 must never be done — headers are ASCII and complete.
+    private func decodeHeaders(from initialData: Data) -> String? {
+        guard let range = initialData.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        return String(data: initialData[initialData.startIndex..<range.upperBound], encoding: .utf8)
+    }
+
     // MARK: - Connection Handling
 
     private func receiveFirstPacket(_ connection: NWConnection) {
@@ -282,13 +411,50 @@ final class ProxyServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
-            self.processRequest(connection, initialData: data)
+            self.receiveRequestHeaders(connection, accumulated: data)
+        }
+    }
+
+    /// Accumulate inbound bytes until the COMPLETE header block (terminated by
+    /// CRLF CRLF) has arrived, then hand everything to processRequest.
+    ///
+    /// The first TCP segment frequently carries only PART of the request line
+    /// + headers (real clients like Claude Code send large headers and bodies
+    /// that span segments). Processing the first packet immediately made the
+    /// parser see a partial header block: handleAIMessages returned
+    /// "400 Bad Request" with an EMPTY body — which Claude Code reports as
+    /// "API Error: 400 InvalidHTTPResponse" — and other paths silently dropped
+    /// the connection ("POST /v1/" doesn't match the "POST " prefix check).
+    /// The header terminator is the point where parsing is guaranteed correct.
+    private func receiveRequestHeaders(_ connection: NWConnection, accumulated: Data) {
+        let headerEnd = Data("\r\n\r\n".utf8)
+        if accumulated.range(of: headerEnd) != nil {
+            processRequest(connection, initialData: accumulated)
+            return
+        }
+        guard accumulated.count < 65536 else {
+            // Header block never terminated (or absurdly large) — drop it.
+            connection.cancel()
+            return
+        }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
+            guard let self = self, let data = data, error == nil else {
+                connection.cancel()
+                return
+            }
+            self.receiveRequestHeaders(connection, accumulated: accumulated + data)
         }
     }
 
     private func processRequest(_ connection: NWConnection, initialData: Data) {
-        guard let requestStr = String(data: initialData, encoding: .utf8) else {
-            connection.cancel()
+        // Decode ONLY the header block (up to and including CRLFCRLF). The body
+        // inside the first packet can be truncated mid-multibyte-UTF-8 at the
+        // 64KB receive cap — decoding the whole buffer as UTF-8 then fails
+        // whenever a multi-byte character straddles that boundary, which used to
+        // reset the connection (or send an empty-body 400) and made Claude Code
+        // report "API Error: 400 InvalidHTTPResponse" on real conversations.
+        guard let requestStr = decodeHeaders(from: initialData) else {
+            sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
             return
         }
 
@@ -347,19 +513,22 @@ final class ProxyServer: @unchecked Sendable {
             )
             Task { @MainActor in self.onTrafficEntry?(entry) }
             
-            handleConnect(connection, request: requestStr, initialData: initialData)
+            handleConnect(connection, request: requestStr, initialData: initialData, ruleAction: ruleAction)
             return
         }
 
         // Auth enforcement on direct HTTP calls — scoped to the internal
         // endpoints and AI-routed hosts only. Plain-HTTP requests to any OTHER
         // site pass through the system proxy untouched (no token needed), so
-        // the proxy never interferes with non-AI traffic.
+        // the proxy never interferes with non-AI traffic. Hosts a per-app rule
+        // forces to pass through (e.g. Pass Through OpenAI for Codex) are
+        // exempt — they're not being routed, so no token is needed.
         if authEnabled {
             let requestHost = requestTargetHost(requestStr)
             let isInternal = requestHost == "127.0.0.1" || requestHost == "localhost"
-            let isAI = classifier.isKnownAiHost(requestHost)
-            if isInternal || isAI {
+            let snap = configSnapshot()
+            let isAI = snap.classifier.isKnownAiHost(requestHost)
+            if (isInternal || isAI), !ruleForcesPassthrough(ruleAction, host: requestHost) {
                 let authResult = validateAuth(request: requestStr)
                 switch authResult {
                 case .denied(let reason):
@@ -533,18 +702,36 @@ final class ProxyServer: @unchecked Sendable {
                 handleModelDetailEndpoint(connection, path: basePath)
                 return
             }
-            if basePath == "/v1/messages" || basePath == "/v1/v1/messages" || basePath == "/messages" {
-                handleAIMessages(connection, method: method, initialData: initialData, connectedApp: connectedApp)
+            if basePath == "/v1/messages" || basePath == "/v1/v1/messages" || basePath == "/messages"
+                || basePath == "/v1/chat/completions" || basePath == "/v1/v1/chat/completions" || basePath == "/chat/completions"
+                || basePath == "/v1/responses" || basePath == "/v1/v1/responses" || basePath == "/responses" {
+                // Loopback AI requests (Claude Code's /v1/messages, OpenAI
+                // clients pointed at OPENAI_BASE_URL=http://127.0.0.1:<port>/v1
+                // → /v1/chat/completions or /v1/responses) all route through
+                // the provider chain. Previously only /v1/messages was
+                // special-cased, so OpenAI loopback requests fell through to a
+                // dead passthrough (127.0.0.1:80) and failed.
+                handleAIRouted(connection, method: method, initialData: initialData, connectedApp: connectedApp, path: basePath)
                 return
             }
         }
 
-        // Override action if an app-specific rule exists (e.g. Bypass)
+        // Override action if an app-specific rule exists: a "Pass Through"
+        // rule bypasses everything, and "Pass Through OpenAI" bypasses OpenAI
+        // hosts only (even when the global Route OpenAI switch is on) while
+        // every other host still classifies normally.
+        let snap = configSnapshot()
         let finalAction: RouteAction
-        if let ruleAction = ruleAction, ruleAction == .passthrough {
-            finalAction = .passthrough
+        if let ruleAction = ruleAction {
+            if ruleAction == .passthrough {
+                finalAction = .passthrough
+            } else if ruleAction == .passThroughOpenAI, RequestClassifier.isOpenAIHost(host) {
+                finalAction = .passthrough
+            } else {
+                finalAction = snap.classifier.classify(host: host)
+            }
         } else {
-            finalAction = classifier.classify(host: host)
+            finalAction = snap.classifier.classify(host: host)
         }
         
         updateStats(for: host, action: finalAction)
@@ -565,7 +752,7 @@ final class ProxyServer: @unchecked Sendable {
         switch finalAction {
         case .routeAI:
             routeViaProviderRouter(connection, initialData: initialData, host: host, port: port, entryId: entry.id)
-        case .passthrough:
+        case .passthrough, .passThroughOpenAI:
             forwardDirectly(connection, initialData: initialData, host: host, port: port)
         case .block:
             sendHttpResponse(connection, statusCode: 403, message: "Blocked by JXProxy")
@@ -635,7 +822,6 @@ final class ProxyServer: @unchecked Sendable {
     }
 
     private func handleModelListEndpoint(_ connection: NWConnection) {
-        let now = Int(Date().timeIntervalSince1970)
         let cfg = ConfigManager.shared
 
         // Only models the user can actually reach — see
@@ -663,7 +849,6 @@ final class ProxyServer: @unchecked Sendable {
     private func handleModelDetailEndpoint(_ connection: NWConnection, path: String) {
         let modelId = path.replacingOccurrences(of: "/v1/models/", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let now = Int(Date().timeIntervalSince1970)
         
         // Return model details with a generous context window (200K tokens)
         // so Claude Code doesn't reject prompts as "too long"
@@ -697,7 +882,7 @@ final class ProxyServer: @unchecked Sendable {
         connection.send(content: respData, completion: .contentProcessed({ _ in connection.cancel() }))
     }
 
-    private func handleAIMessages(_ connection: NWConnection, method: String, initialData: Data, connectedApp: String) {
+    private func handleAIRouted(_ connection: NWConnection, method: String, initialData: Data, connectedApp: String, path: String) {
         if method == "HEAD" || method == "OPTIONS" {
             let response = "HTTP/1.1 204 No Content\r\nAllow: POST, HEAD, OPTIONS\r\nProxy-Agent: JXProxy\r\n\r\n"
             guard let data = response.data(using: .utf8) else { connection.cancel(); return }
@@ -705,20 +890,24 @@ final class ProxyServer: @unchecked Sendable {
             return
         }
 
-        // Claude Code's loopback traffic is the app's primary workload — log it
+        // Loopback AI traffic (Claude Code, OpenAI-compatible clients) — log it
         // like any other routed request so the Logs tab shows it too.
         let entry = TrafficEntry(
             timestamp: Date(),
             host: "127.0.0.1",
             action: .routeAI,
             method: method,
-            url: "/v1/messages",
+            url: path,
             appProcessName: connectedApp != "Unknown" ? connectedApp : nil,
             duration: nil
         )
         Task { @MainActor in self.onTrafficEntry?(entry) }
 
-        guard let requestStr = String(data: initialData, encoding: .utf8) else {
+        // Decode the header block only — the first packet's body may end
+        // mid-multibyte-UTF-8 at the 64KB receive cap, and decoding the whole
+        // buffer used to send an empty-body 400 ("400 InvalidHTTPResponse" in
+        // Claude Code) whenever a multi-byte character straddled that boundary.
+        guard let requestStr = decodeHeaders(from: initialData) else {
             sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
             return
         }
@@ -760,10 +949,9 @@ final class ProxyServer: @unchecked Sendable {
                 }
 
                 try Task.checkCancellation()
-
                 let response = try await router?.route(
                     method: method,
-                    path: "/v1/messages",
+                    path: path,
                     headers: headers,
                     body: bodyData
                 )
@@ -785,6 +973,13 @@ final class ProxyServer: @unchecked Sendable {
                 for (key, value) in response.headers {
                     headerString += "\(key): \(value)\r\n"
                 }
+                if response.stream == nil {
+                    // Framing: a body without Content-Length/TE must be delimited
+                    // by connection close — state it explicitly so clients never
+                    // misparse a JSON error as an "InvalidHTTPResponse".
+                    headerString += "Content-Length: \(response.body.count)\r\n"
+                    headerString += "Connection: close\r\n"
+                }
                 headerString += "\r\n"
 
                 guard let headerData = headerString.data(using: .utf8) else {
@@ -792,9 +987,9 @@ final class ProxyServer: @unchecked Sendable {
                     return
                 }
 
-                connection.send(content: headerData, completion: .contentProcessed({ _ in
-                    if let stream = response.stream {
-                        // Streaming SSE: pump chunks from AsyncStream into the connection
+                if let stream = response.stream {
+                    // Streaming SSE: send headers, then pump chunks.
+                    sendWithWatchdog(connection, data: headerData) { _ in
                         Task {
                             for await chunk in stream {
                                 guard !chunk.isEmpty else { continue }
@@ -806,14 +1001,25 @@ final class ProxyServer: @unchecked Sendable {
                             }
                             connection.cancel()
                         }
-                    } else {
-                        connection.send(content: response.body, completion: .contentProcessed({ _ in
-                            connection.cancel()
-                        }))
                     }
-                }))
+                } else {
+                    // Non-streaming: headers + body in ONE atomic send. The old
+                    // two-stage send (headers, then body) could stall between
+                    // stages and leave the client hanging with 0 bytes received
+                    // — which is exactly what Claude Code reported as "cannot
+                    // connect" every time the router returned a 503 after the
+                    // fallback chain was exhausted. A single payload guarantees
+                    // the client sees a complete, framable response, and the
+                    // watchdog below guarantees the connection is torn down
+                    // even if the send completion never fires.
+                    var payload = headerData
+                    payload.append(response.body)
+                    sendWithWatchdog(connection, data: payload) { _ in
+                        connection.cancel()
+                    }
+                }
             } catch is CancellationError {
-                // Task was cancelled by the 90-second timeout
+                // Task was cancelled by the total-request timeout
                 sendHttpResponse(connection, statusCode: 504, message: "Request timed out")
             } catch let error as TimeoutError {
                 sendHttpResponse(connection, statusCode: 504, message: error.message)
@@ -822,11 +1028,45 @@ final class ProxyServer: @unchecked Sendable {
             }
         }
 
-        // FIX #2: 90-second total request timeout.
-        // Ensures every request terminates even if all other safeguards fail.
+        // FIX #2: total-request timeout. Sized so a large local prefill (60k+
+        // tokens can take 30s–4min on a local model) completes instead of being
+        // cancelled mid-generation; the router's own chain caps are tighter.
         Task {
-            try? await Task.sleep(nanoseconds: 90_000_000_000)
+            try? await Task.sleep(nanoseconds: 300_000_000_000)
             requestTask.cancel()
+        }
+    }
+
+    /// Send a response payload and GUARANTEE the connection is torn down even
+    /// if NWConnection never invokes the send completion (a wedged send would
+    /// otherwise leave the client waiting with zero bytes until its own
+    /// timeout). The completion fires at most once — on the real send
+    /// completion, or via the hard watchdog after 5 seconds.
+    private func sendWithWatchdog(_ connection: NWConnection, data: Data, completion: @escaping (Bool) -> Void) {
+        var finished = false
+        let lock = NSLock()
+        let finish: (Bool) -> Void = { success in
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return }
+            finished = true
+            completion(success)
+        }
+        connection.send(content: data, completion: .contentProcessed({ error in
+            finish(error == nil)
+        }))
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 5) { [weak connection] in
+            lock.lock()
+            let wasFinished = finished
+            lock.unlock()
+            // Only force-cancel when the send NEVER completed. A completed send
+            // must never have its connection torn down here — streaming
+            // responses legitimately live far past the 5s mark and the pump
+            // task owns the connection from then on.
+            if !wasFinished {
+                finish(false)
+                connection?.cancel()
+            }
         }
     }
 
@@ -835,17 +1075,15 @@ final class ProxyServer: @unchecked Sendable {
     // MARK: - Stats
 
     private func updateStats(for host: String, action: RouteAction) {
-        // updateStats runs on the NW DispatchQueue while JXRouterView reads
-        // `stats` on the MainActor — hop the mutation to the main actor to
-        // avoid a data race on the read-modify-write.
-        Task { @MainActor in
+        // Thread-safe mutation via stateLock — no MainActor hop needed.
+        mutateStats { stats in
             switch action {
             case .routeAI:
-                self.stats.aiRouted += 1
-            case .passthrough:
-                self.stats.passthrough += 1
+                stats.aiRouted += 1
+            case .passthrough, .passThroughOpenAI:
+                stats.passthrough += 1
             case .block:
-                self.stats.blocked += 1
+                stats.blocked += 1
             }
         }
     }
@@ -853,7 +1091,27 @@ final class ProxyServer: @unchecked Sendable {
     // MARK: - Connection Helpers
 
     private func sendHttpResponse(_ connection: NWConnection, statusCode: Int, message: String) {
-        let response = "HTTP/1.1 \(statusCode) \(message)\r\nContent-Length: 0\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n"
+        // Track error responses in stats for the analytics dashboard.
+        if statusCode >= 400 {
+            mutateStats { $0.errors += 1 }
+        }
+        // Always attach a parseable Anthropic-shaped JSON error body (with
+        // Content-Length). Empty-body errors made Claude Code report every
+        // 4xx/5xx as "InvalidHTTPResponse" because it couldn't decode them.
+        let type: String
+        switch statusCode {
+        case 400: type = "invalid_request_error"
+        case 401: type = "authentication_error"
+        case 403: type = "permission_error"
+        case 404: type = "not_found_error"
+        case 429: type = "rate_limit_error"
+        default: type = "api_error"
+        }
+        let escaped = message
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let body = "{\"type\":\"error\",\"error\":{\"type\":\"\(type)\",\"message\":\"\(escaped)\"}}"
+        let response = "HTTP/1.1 \(statusCode) \(message)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
         guard let data = response.data(using: .utf8) else {
             connection.cancel()
             return
@@ -912,12 +1170,12 @@ final class ProxyServer: @unchecked Sendable {
     @MainActor
     private var mitmHandler: MITMHandler {
         if let h = _mitmHandler { return h }
-        let h = MITMHandler(providerRouter: providerRouter, directTLSPort: port + 1)
+        let h = MITMHandler(directTLSPort: port + 1)
         _mitmHandler = h
         return h
     }
 
-    private func handleConnect(_ connection: NWConnection, request: String, initialData: Data) {
+    private func handleConnect(_ connection: NWConnection, request: String, initialData: Data, ruleAction: RouteAction?) {
         let lines = request.components(separatedBy: "\r\n")
         guard let requestLine = lines.first else {
             connection.cancel()
@@ -939,8 +1197,14 @@ final class ProxyServer: @unchecked Sendable {
         // Reject CONNECT to our own listening port (self-connection loop).
         if rejectIfSelfTarget(connection, host: connectHost, port: connectPort) { return }
 
+        // A per-app rule can force this host to pass through raw — e.g. a
+        // "Pass Through OpenAI" rule for Codex, which must hit the real API
+        // even when the global Route OpenAI switch is on.
+        let forcedPassthrough = ruleForcesPassthrough(ruleAction, host: connectHost)
+
         // For AI hosts, attempt MITM handler (which now does TCP relay, no actual MITM)
-        let isMITMHost = cachedMitmHosts.contains { host in
+        let snap = configSnapshot()
+        let isMITMHost = snap.mitmHosts.contains { host in
             if host == connectHost { return true }
             if host.hasPrefix("*.") {
                 let suffix = String(host.dropFirst(2))
@@ -949,7 +1213,7 @@ final class ProxyServer: @unchecked Sendable {
             return false
         }
 
-        if isMITMHost || classifier.isKnownAiHost(connectHost) {
+        if !forcedPassthrough, isMITMHost || snap.classifier.isKnownAiHost(connectHost) {
             print("[ProxyServer] AI CONNECT tunnel: \(connectHost):\(connectPort) → DirectTLS:5256")
             Task { @MainActor in
                 // Route AI CONNECT tunnels through DirectTLS → ProviderRouter
@@ -958,17 +1222,34 @@ final class ProxyServer: @unchecked Sendable {
             return
         }
 
-        // Non-AI CONNECT → standard TCP passthrough
+        // Non-AI CONNECT (or forced passthrough) → standard TCP passthrough
         Task { @MainActor in
-            mitmHandler.intercept(connection: connection, host: connectHost, port: connectPort)
+            mitmHandler.intercept(connection: connection, host: connectHost, port: connectPort, forcePassthrough: forcedPassthrough)
+        }
+    }
+
+    /// True when a per-app rule forces this host to pass through unmodified.
+    /// A `.passthrough` rule bypasses everything; `.passThroughOpenAI` bypasses
+    /// OpenAI hosts only (regardless of the global Route OpenAI switch).
+    private func ruleForcesPassthrough(_ ruleAction: RouteAction?, host: String) -> Bool {
+        guard let ruleAction else { return false }
+        switch ruleAction {
+        case .passthrough:
+            return true
+        case .passThroughOpenAI:
+            return RequestClassifier.isOpenAIHost(host)
+        case .routeAI, .block:
+            return false
         }
     }
 
     // MARK: - Upstream Routing
 
     private func routeViaProviderRouter(_ connection: NWConnection, initialData: Data, host: String, port: UInt16, entryId: UUID) {
-        guard let requestStr = String(data: initialData, encoding: .utf8) else {
-            connection.cancel()
+        // Header block only — the first packet's body may be truncated mid-UTF-8
+        // at the 64KB receive cap (see processRequest).
+        guard let requestStr = decodeHeaders(from: initialData) else {
+            sendHttpResponse(connection, statusCode: 400, message: "Bad Request")
             return
         }
         let lines = requestStr.components(separatedBy: "\r\n")
@@ -996,22 +1277,27 @@ final class ProxyServer: @unchecked Sendable {
         }
 
         let headers = parseHeaders(from: requestStr)
-        let bodyComponents = requestStr.components(separatedBy: "\r\n\r\n")
+        // Byte-accurate body extraction (never round-trip the body through a
+        // String — that corrupts binary content and can drop bytes).
+        let separator = Data("\r\n\r\n".utf8)
         let bodyData: Data
-        if bodyComponents.count >= 2 {
-            bodyData = Data(bodyComponents.dropFirst().joined(separator: "\r\n\r\n").utf8)
+        if let range = initialData.range(of: separator) {
+            bodyData = Data(initialData[range.upperBound...])
         } else {
             bodyData = Data()
         }
 
         let router = self.providerRouter
-        Task {
+        // F4: total-request timeout parity with handleAIRouted — a hung
+        // upstream must yield a 504 to the client, not an endless open
+        // connection. Local-model prefills need the long budget.
+        let requestTask = Task {
             do {
                 let response = try await router?.route(
                     method: method,
                     path: path,
                     headers: headers,
-                    body: bodyData
+                body: bodyData
                 )
 
                 guard let response else {
@@ -1029,7 +1315,7 @@ final class ProxyServer: @unchecked Sendable {
                 for (key, value) in response.headers {
                     headerString += "\(key): \(value)\r\n"
                 }
-                
+
                 if response.stream == nil {
                     headerString += "Content-Length: \(response.body.count)\r\n"
                 }
@@ -1042,29 +1328,53 @@ final class ProxyServer: @unchecked Sendable {
                     return
                 }
 
-                connection.send(content: headerData, completion: .contentProcessed({ _ in
-                    if let stream = response.stream {
+                if let stream = response.stream {
+                    sendWithWatchdog(connection, data: headerData) { _ in
                         Task {
                             for await chunk in stream {
-                                connection.send(content: chunk, completion: .contentProcessed({ _ in }))
+                                guard !chunk.isEmpty else { continue }
+                                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                                    connection.send(content: chunk, completion: .contentProcessed({ _ in
+                                        cont.resume()
+                                    }))
+                                }
                             }
                             connection.cancel()
                         }
-                    } else {
-                        connection.send(content: response.body, completion: .contentProcessed({ _ in
-                            connection.cancel()
-                        }))
                     }
-                }))
+                } else {
+                    // Single atomic send: headers + body in one payload so the
+                    // client always receives a framable response (parity with
+                    // the handleAIRouted fix).
+                    var payload = headerData
+                    payload.append(response.body)
+                    sendWithWatchdog(connection, data: payload) { _ in
+                        connection.cancel()
+                    }
+                }
+            } catch is CancellationError {
+                sendHttpResponse(connection, statusCode: 504, message: "Request timed out")
+            } catch let error as TimeoutError {
+                sendHttpResponse(connection, statusCode: 504, message: error.message)
             } catch {
                 sendHttpResponse(connection, statusCode: 502, message: "Upstream error")
             }
+        }
+
+        Task {
+            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            requestTask.cancel()
         }
     }
 
     private func forwardDirectly(_ connection: NWConnection, initialData: Data, host: String, port: UInt16) {
         if rejectIfSelfTarget(connection, host: host, port: port) { return }
-        let target = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            print("[ProxyServer] Invalid forward port \(port)")
+            connection.cancel()
+            return
+        }
+        let target = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         target.start(queue: queue)
 
         target.stateUpdateHandler = { [weak self] state in

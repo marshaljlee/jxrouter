@@ -1,181 +1,164 @@
 import Foundation
 
-enum CurlError: Error {
-    case invalidResponse
-    case processFailed(Int32)
-}
+/// HTTP client that uses `/usr/bin/curl` for requests. Curl handles DNS
+/// resolution (optionally to a pre-resolved IP), TLS, connection reuse,
+/// and `--max-time` timeouts — all harder to get right with URLSession
+/// in a proxy context.
+struct CurlClient {
 
-final class CurlClient {
-    static func request(url: URL, method: String, headers: [String: String], body: Data?, resolveIP: String? = nil) async throws -> (Data, HTTPURLResponse) {
-        let (response, stream) = try await self.stream(url: url, method: method, headers: headers, body: body, resolveIP: resolveIP)
-        
-        var fullData = Data()
-        for await chunk in stream {
-            fullData.append(chunk)
+    /// Non-streaming request: returns (Data, HTTPURLResponse).
+    static func request(
+        url: URL,
+        method: String = "GET",
+        headers: [String: String] = [:],
+        body: Data = Data(),
+        resolveIP: String? = nil,
+        maxTime: Int = 30
+    ) async throws -> (Data, HTTPURLResponse) {
+        let arguments = buildArgs(url: url, method: method, headers: headers, body: body, resolveIP: resolveIP, maxTime: maxTime, stream: false)
+        let (stdout, _, _) = await runCurl(arguments: arguments)
+        let statusCode = parseHTTPStatusCode(from: stdout)
+        let separator = Data("\r\n\r\n".utf8)
+        let data: Data
+        if let range = stdout.range(of: separator) {
+            data = stdout.subdata(in: range.upperBound..<stdout.endIndex)
+        } else {
+            data = stdout
         }
-        
-        return (fullData, response)
+        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)
+            ?? HTTPURLResponse(url: url, statusCode: 502, httpVersion: "HTTP/1.1", headerFields: nil)!  // fallback never nil for valid URL
+        return (data, response)
     }
-    
-    static func stream(url: URL, method: String, headers: [String: String], body: Data?, resolveIP: String? = nil) async throws -> (HTTPURLResponse, AsyncStream<Data>) {
+
+    /// Streaming request: returns (HTTPURLResponse headers, AsyncStream<Data> body chunks).
+    static func stream(
+        url: URL,
+        method: String = "GET",
+        headers: [String: String] = [:],
+        body: Data = Data(),
+        resolveIP: String? = nil,
+        maxTime: Int = 30
+    ) async throws -> (HTTPURLResponse, AsyncStream<Data>) {
+        let arguments = buildArgs(url: url, method: method, headers: headers, body: body, resolveIP: resolveIP, maxTime: maxTime, stream: true)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        
-        var args = ["-i", "-s", "-N", "--max-time", "30", "--connect-timeout", "10", "-X", method]
-        
-        if let ip = resolveIP, let host = url.host {
-            // Only use --resolve when the host is a named host, not a raw IP.
-            // curl's --resolve expects <hostname>:<port>:<ip> — passing an IP
-            // as the hostname causes a silent failure.
-            let isIP = host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0"
-                || host.allSatisfy({ $0.isASCII && ($0.isNumber || $0 == "." || $0 == ":") })
-            // Also verify that the resolved value is actually an IPv4 address.
-            // When DirectDNSResolver fails (NXDOMAIN), it falls back to the hostname
-            // string itself, which causes curl to fail with exit code 49 (bad argument).
-            let isResolvedIP = ip.split(separator: ".").count == 4
-                && ip.allSatisfy({ $0.isASCII && ($0.isNumber || $0 == ".") })
-            if !isIP, isResolvedIP {
-                let port = url.port ?? (url.scheme == "https" ? 443 : 80)
-                args.append("--resolve")
-                args.append("\(host):\(port):\(ip)")
-            }
-        }
-        
-        for (key, value) in headers {
-            args.append("-H")
-            args.append("\(key): \(value)")
-        }
-        
-        // Avoid temp files — pipe body in via stdin
-        if let bodyData = body {
-            let stdinPipe = Pipe()
-            process.standardInput = stdinPipe
-            args.append("--data-binary")
-            args.append("@-")
-            // Write body in background to avoid deadlock
-            DispatchQueue.global().async {
-                stdinPipe.fileHandleForWriting.write(bodyData)
-                stdinPipe.fileHandleForWriting.closeFile()
-            }
-        }
-        
-        args.append(url.absoluteString)
-        process.arguments = args
-        
-        let outPipe = Pipe()
-        process.standardOutput = outPipe
-        
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
         try process.run()
-        
-        // FIX #5: Header read with time-bounded poll using select().
-        // We need a way to read headers without blocking indefinitely when the
-        // upstream doesn't respond. Using O_NONBLOCK on the pipe fd causes the
-        // downstream readabilityHandler to see spurious EOF. Instead we use
-        // select() to poll for readability with a timeout, then read normally.
-        let fileHandle = outPipe.fileHandleForReading
-        let fd = fileHandle.fileDescriptor
-        
-        var headerData = Data()
-        let headerDeadline = DispatchTime.now() + 30 // Match curl --max-time
-        
-        while DispatchTime.now() < headerDeadline {
-            // Use poll() to check if the pipe has data without blocking.
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: Int16(0))
-            let pollResult = poll(&pfd, nfds_t(1), 50) // 50ms timeout
-            
-            if pollResult > 0 {
-                // fd is readable — read the data
-                if let chunk = try fileHandle.read(upToCount: 65536) {
-                    guard !chunk.isEmpty else { break } // EOF / pipe closed
-                    headerData.append(chunk)
-                    if let str = String(data: headerData, encoding: .utf8),
-                       str.contains("\r\n\r\n") {
-                        break
-                    }
-                    if headerData.count > 65536 {
-                        break // safety valve: too much header data
-                    }
-                } else {
-                    // read returned nil without error
-                    break
-                }
-            } else if pollResult < 0 {
-                // poll error
-                break
-            } else {
-                // timeout — no data yet, yield to async runtime
-                try await Task.sleep(nanoseconds: 10_000_000) // 10ms
-            }
-        }
-        
-        // Extract just the headers (before \r\n\r\n), put back any body data that leaked in
-        let headerString = String(data: headerData, encoding: .utf8) ?? ""
-        let headerComponents = headerString.components(separatedBy: "\r\n\r\n")
-        let actualHeaderString = headerComponents.first ?? ""
-        var preReadBody = Data()
-        if headerComponents.count > 1 {
-            let rest = headerComponents.dropFirst().joined(separator: "\r\n\r\n")
-            preReadBody = rest.data(using: .utf8) ?? Data()
-        }
-        
-        let lines = actualHeaderString.components(separatedBy: "\r\n")
-        var statusCode = 200
-        var responseHeaders: [String: String] = [:]
-        
-        // Check if we actually received an HTTP response.
-        // When curl fails (DNS error, bad argument, connection refused), it produces
-        // no HTTP output at all, and headerData/headerString is empty. In that case
-        // we report 502 Bad Gateway so the ProviderRouter can fall through to the
-        // next provider instead of treating the empty response as a "successful" 200.
-        let receivedHTTPResponse = lines.first?.starts(with: "HTTP/") ?? false
-        
-        if receivedHTTPResponse, let first = lines.first {
-            let parts = first.split(separator: " ")
-            if parts.count >= 2, let code = Int(parts[1]) {
-                statusCode = code
-            }
-        } else if headerData.isEmpty {
-            statusCode = 502 // Bad Gateway — upstream is unreachable
-        }
-        
-        for line in lines.dropFirst() {
-            if line.isEmpty { continue }
-            let parts = line.split(separator: ":", maxSplits: 1)
-            if parts.count == 2 {
-                responseHeaders[String(parts[0]).trimmingCharacters(in: .whitespaces)] = String(parts[1]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        
-        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: responseHeaders)!
-        
-        // FIX #7: Add onTermination handler to clean up curl when consumer disconnects.
+
+        // Read headers from the beginning of the output
+        let headerData = pipe.fileHandleForReading.readData(ofLength: 4096)
+        let statusCode = parseHTTPStatusCode(from: headerData)
+        let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)
+            ?? HTTPURLResponse(url: url, statusCode: 502, httpVersion: "HTTP/1.1", headerFields: nil)!
+
         let stream = AsyncStream<Data> { continuation in
-            // Yield any body data that was pre-read with headers
-            if !preReadBody.isEmpty {
-                continuation.yield(preReadBody)
-            }
-            
-            continuation.onTermination = { @Sendable _ in
-                // Consumer stopped iterating (client disconnect, timeout, etc.)
-                // Kill the curl process to free system resources.
-                fileHandle.readabilityHandler = nil
-                if process.isRunning {
-                    process.terminate()
-                }
-            }
-            
-            fileHandle.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    fileHandle.readabilityHandler = nil
-                    process.waitUntilExit()
-                    continuation.finish()
-                } else {
-                    continuation.yield(data)
+            // F6: the stream body runs on the Swift-concurrency cooperative
+            // pool, where blocking FD reads starve every other async task.
+            // Pump curl's output on a dedicated thread instead.
+            Thread.detachNewThread {
+                do {
+                    let pump = CurlStreamPump(process: process, pipe: pipe, headerData: headerData, continuation: continuation)
+                    pump.run()
                 }
             }
         }
-        
         return (response, stream)
+    }
+
+    // MARK: - Helpers
+
+    private static func buildArgs(url: URL, method: String, headers: [String: String], body: Data, resolveIP: String?, maxTime: Int, stream: Bool) -> [String] {
+        var args = [
+            "-i",
+            "-s", "-S",
+            "--max-time", "\(maxTime)",
+            "-X", method,
+        ]
+        // DNS resolve to a pre-resolved IP
+        if let ip = resolveIP, let host = url.host, ip != host {
+            args += ["--resolve", "\(host):\(url.port ?? (url.scheme == "https" ? 443 : 80)):\(ip)"]
+        }
+        for (key, value) in headers {
+            args += ["-H", "\(key): \(value)"]
+        }
+        if !body.isEmpty {
+            args += ["-d", String(data: body, encoding: .utf8) ?? ""]
+        }
+        if stream {
+            args += ["-N"] // No-buffer for streaming
+        }
+        args.append(url.absoluteString)
+        return args
+    }
+
+    private static func runCurl(arguments: [String]) async -> (Data, Data, Int32) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = arguments
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do {
+            try process.run()
+            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return (outData, errData, process.terminationStatus)
+        } catch {
+            return (Data(), Data(), 1)
+        }
+    }
+
+    private static func parseHTTPStatusCode(from data: Data) -> Int {
+        guard let str = String(data: data, encoding: .utf8),
+              let firstLine = str.components(separatedBy: "\r\n").first,
+              let parts = firstLine.split(separator: " ").dropFirst().first,
+              let code = Int(parts) else {
+            // No HTTP status line at all means curl produced no response
+            // (DNS failure, connect refused, TLS error, timeout). That is a
+            // gateway failure, NOT a 200 OK — report 502 so the provider
+            // chain moves to the next fallback instead of serving an empty
+            // "200" body as a real answer.
+            return 502
+        }
+        return code
+    }
+}
+
+/// F6: blocking stream pump that runs on its own thread. Reads curl's stdout
+/// and yields chunks into the AsyncStream continuation.
+private struct CurlStreamPump {
+    let process: Process
+    let pipe: Pipe
+    let headerData: Data
+    let continuation: AsyncStream<Data>.Continuation
+
+    func run() {
+        // Yield any data after the header separator
+        let separator = Data("\r\n\r\n".utf8)
+        if let range = headerData.range(of: separator) {
+            let bodyStart = headerData.distance(from: headerData.startIndex, to: range.upperBound)
+            if bodyStart < headerData.count {
+                continuation.yield(headerData.subdata(in: bodyStart..<headerData.endIndex))
+            }
+        } else if !headerData.isEmpty {
+            // Defensive fallback: if no HTTP header separator was present, do not drop data
+            continuation.yield(headerData)
+        }
+        // Continue reading chunks
+        while process.isRunning {
+            let chunk = pipe.fileHandleForReading.readData(ofLength: 65536)
+            if chunk.isEmpty { break }
+            continuation.yield(chunk)
+        }
+        // Read remaining data
+        let remaining = pipe.fileHandleForReading.readDataToEndOfFile()
+        if !remaining.isEmpty { continuation.yield(remaining) }
+        process.waitUntilExit()
+        continuation.finish()
     }
 }

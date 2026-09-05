@@ -76,7 +76,7 @@ elif [ -f "$CLAUDE_SETTINGS" ]; then
     python3 - "$CLAUDE_SETTINGS" << 'PY' 2>/dev/null || true
 import json, sys
 path = sys.argv[1]
-keys = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+keys = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
         "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"]
 try:
     with open(path) as f: data = json.load(f)

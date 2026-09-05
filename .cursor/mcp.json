@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "jetro": {
+      "type": "stdio",
+      "command": "/Users/joshua/.jetro/runtime/node-darwin-arm64",
+      "args": [
+        "/Users/joshua/.jetro/mcp-server/index.js"
+      ],
+      "env": {
+        "JET_WORKSPACE": "/Users/joshua/Library/Mobile Documents/com~apple~CloudDocs/Git/jxrouter",
+        "JET_API_URL": "https://api.jetro.ai",
+        "JET_JWT": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjI0N2Y4MDYwMDM5YjVmNDBkOTQ5NjkzOGJiMTg5NzA2ZWY4ODkzM2QiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3NlY3VyZXRva2VuLmdvb2dsZS5jb20vamV0cm8tY2RhZWYiLCJhdWQiOiJqZXRyby1jZGFlZiIsImF1dGhfdGltZSI6MTc4NDUwNDI3NSwidXNlcl9pZCI6IjZuT3VJbVE1UWpYbFE0RmJIalBTdmt2dUtoeDEiLCJzdWIiOiI2bk91SW1RNVFqWGxRNEZiSGpQU3ZrdnVLaHgxIiwiaWF0IjoxNzg4NjIzNDk1LCJleHAiOjE3ODg2MjcwOTUsImVtYWlsIjoiam9zaHVheHhAZHVjay5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiZmlyZWJhc2UiOnsiaWRlbnRpdGllcyI6eyJlbWFpbCI6WyJqb3NodWF4eEBkdWNrLmNvbSJdfSwic2lnbl9pbl9wcm92aWRlciI6InBhc3N3b3JkIn19.XH3I06j2EBQoRHJTmCy3TGVTRQEIYw-_m2QPy4TrwMGXSbiCP10vo_ATgUqCXrH0bwJ9lvvduDeteBtOj3rBe5AtzDUZpVBxzlZZok3P417AnQraq8c3JimJW438zZJuNSNuJeGq19cDzoV6wg5XzHwJHCp5uz3DGuLanBf0VVXlOE7Gn0aB8_sD9wCBKFXqkidi1NmyvAGDuvTeME0WDZtKyB8lh2ce6wpseRI0cP9x1Sly7GEjoSsRkvWUaIJxP-LpkNfbmGLoBoaOmWPG1DSVtjQNr5NnIJZ_L8p9RPt2cFbXnThsx1D_59X75iijtaMxvkUeAGwL9VAwmq8SBg",
+        "PATH": "/Users/joshua/.jetro/runtime:/Users/joshua/.local/bin:/Users/joshua/.bun/bin:/Users/joshua/.opencode/bin:/Users/joshua/.kilo/bin:/Users/joshua/.grok/bin:/Users/joshua/Downloads/google-cloud-sdk/bin:/Users/joshua/superset/bin:/Users/joshua/go/bin:/Users/joshua/.local/bin:/Users/joshua/Library/Python/3.9/bin:/opt/homebrew/bin:/opt/homebrew/opt/python@3.11/libexec/bin:/Users/joshua/bin:/Users/joshua/.local/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin://Applications/Topaz Photo.app/Contents/Resources/bin:/Library/Apple/usr/bin:/Applications/Little Snitch.app/Contents/Components:/opt/homebrew/bin"
+      }
+    }
+  }
+}

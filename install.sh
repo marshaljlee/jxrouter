@@ -43,8 +43,13 @@ echo "1. Cleaning previous builds..."
 rm -rf /tmp/JXRouterBuild 2>/dev/null
 
 echo ""
-echo "3. Building JXProxy..."
-xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release SYMROOT="/tmp/JXRouterBuild" > /dev/null
+echo "3. Building JXProxy (universal: Apple Silicon + Intel)..."
+# ARCHS="arm64 x86_64" + ONLY_ACTIVE_ARCH=NO produces a universal binary so
+# the same build runs on Apple Silicon AND Intel Macs. A pure Swift/AppKit
+# app, so the two slices are byte-for-byte the same code.
+xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release \
+    ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+    SYMROOT="/tmp/JXRouterBuild" > /dev/null
 
 if [ $? -ne 0 ]; then
     echo "Build failed! Check xcodebuild output."
@@ -58,25 +63,37 @@ RESOURCES_SRC="$(dirname "$0")/JXRouter/Resources"
 RESOURCES_DST="$APP_BUNDLE/Contents/Resources"
 
 if [ -d "$RESOURCES_SRC" ]; then
-    cp "$RESOURCES_SRC/AGENTS.md" "$RESOURCES_DST/AGENTS.md"
+    [ -f "$RESOURCES_SRC/AGENTS.md" ] && cp "$RESOURCES_SRC/AGENTS.md" "$RESOURCES_DST/AGENTS.md"
     mkdir -p "$RESOURCES_DST/skills"
-    cp -R "$RESOURCES_SRC/skills/"* "$RESOURCES_DST/skills/"
-    echo "   Bundled AGENTS.md + 5 skill SKILL.md files"
+    if [ -d "$RESOURCES_SRC/skills" ] && [ -n "$(ls -A "$RESOURCES_SRC/skills" 2>/dev/null)" ]; then
+        cp -R "$RESOURCES_SRC/skills/." "$RESOURCES_DST/skills/" 2>/dev/null || true
+        echo "   Bundled AGENTS.md + skill SKILL.md files"
+    else
+        echo "   Bundled AGENTS.md"
+    fi
 else
     echo "   WARNING: Resources/ directory not found at $RESOURCES_SRC"
 fi
 
 # Bundling resources AFTER Xcode signed the bundle invalidates its
-# code-signature seal ("a sealed resource is missing or invalid"). Re-sign
-# with the project's identity so the deployed copy verifies cleanly.
+# code-signature seal ("a sealed resource is missing or invalid") — but only
+# when the bundled resources actually changed. Re-sign ONLY when the seal no
+# longer verifies, so reinstalls of identical content keep the previous
+# signature: the one-time Keychain "Always Allow" grant (bound to the
+# code-signature identity) stays valid across reinstalls instead of forcing a
+# new permission prompt every time.
 SIGN_IDENTITY=$(grep -m1 'CODE_SIGN_IDENTITY =' JXRouter.xcodeproj/project.pbxproj | sed -E 's/.*= "?([^";]+)"?;.*/\1/')
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY="-"
 fi
-echo "   Re-signing bundle with identity: $SIGN_IDENTITY"
-if ! codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"; then
-    echo "   Warning: identity not found — falling back to ad-hoc signature"
-    codesign --force --deep --sign - "$APP_BUNDLE"
+if codesign --verify --deep --strict "$APP_BUNDLE" 2>/dev/null; then
+    echo "   Bundle signature intact — skipping re-sign (Keychain access grant stays valid)"
+else
+    echo "   Re-signing bundle with identity: $SIGN_IDENTITY"
+    if ! codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"; then
+        echo "   Warning: identity not found — falling back to ad-hoc signature"
+        codesign --force --deep --sign - "$APP_BUNDLE"
+    fi
 fi
 
 echo ""
@@ -129,7 +146,7 @@ JXPROXY_PORT="${JXPROXY_PORT:-5255}"
 JXPROXY_AUTH_TOKEN="${JXPROXY_AUTH_TOKEN:-jxproxy}"
 
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${JXPROXY_PORT}"
-export ANTHROPIC_AUTH_TOKEN="${JXPROXY_AUTH_TOKEN}"
+export ANTHROPIC_API_KEY="${JXPROXY_AUTH_TOKEN}"
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=190000
 export DISABLE_AUTOUPDATER=1
@@ -307,7 +324,7 @@ echo ""
 echo " For VS Code Claude Code extension, add to settings.json:"
 echo '   "claudeCode.environmentVariables": ['
 echo '     { "name": "ANTHROPIC_BASE_URL", "value": "http://127.0.0.1:'${JXPROXY_PORT}'" },'
-echo '     { "name": "ANTHROPIC_AUTH_TOKEN", "value": "'${JXPROXY_AUTH_TOKEN}'" },'
+echo '     { "name": "ANTHROPIC_API_KEY", "value": "'${JXPROXY_AUTH_TOKEN}'" },'
 echo '     { "name": "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "value": "1" }'
 echo '   ]'
 echo ""

@@ -50,8 +50,12 @@ struct ProviderPreset: Identifiable, Hashable {
         ProviderPreset(id: "ai-gateway", name: "Vercel AI Gateway", symbol: "arrow.triangle.branch", defaultUrl: "https://gateway.ai.vercel.ai/v1", models: ["vercel/openai/gpt-5.5"], requiresKey: true),
         ProviderPreset(id: "ollama", name: "Ollama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:11434/v1", models: ["qwen3:latest", "qwen2.5:latest", "llama3.2:latest", "mistral:latest"], requiresKey: false),
         ProviderPreset(id: "lmstudio", name: "LM Studio (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1234/v1", models: ["lmstudio/<model-id>"], requiresKey: false),
-        ProviderPreset(id: "llamaapp", name: "Llama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8080/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "llamaapp", name: "Llama (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:9931/v1", models: [], requiresKey: false),
         ProviderPreset(id: "jan", name: "Jan (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:1337/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "unsloth", name: "Unsloth (Local)", symbol: "desktopcomputer", defaultUrl: "http://127.0.0.1:8000/v1", models: [], requiresKey: false),
+        ProviderPreset(id: "gguf", name: "GGUF (Direct)", symbol: "cpu.fill", defaultUrl: "http://127.0.0.1:8081/v1", models: ["local-model"], requiresKey: false),
+        ProviderPreset(id: "gemini-oauth", name: "Gemini Web (OAuth)", symbol: "sparkle", defaultUrl: "https://generativelanguage.googleapis.com/v1beta/openai", models: ["gemini/gemini-2.5-flash", "gemini/gemini-2.5-pro", "gemini/gemini-2.0-flash"], requiresKey: false),
+        ProviderPreset(id: "antigravity", name: "Antigravity", symbol: "airplane", defaultUrl: "https://api.antigravity.dev/v1", models: ["antigravity/gravity-1", "antigravity/gravity-lite"], requiresKey: true),
         ProviderPreset(id: "custom", name: "Custom (OpenAI-compatible)", symbol: "puzzlepiece.extension", defaultUrl: "https://api.openai.com/v1", models: [], requiresKey: true),
     ]
 
@@ -69,7 +73,7 @@ struct ProviderPreset: Identifiable, Hashable {
         "gemini/", "mistral/", "codestral/", "cohere/", "groq/", "fireworks/",
         "sambanova/", "cerebras/", "huggingface/", "github_models/", "wafer/",
         "kimi/", "kimi_code/", "minimax/", "zai/", "ollama_cloud/", "vercel/",
-        "nvidia_nim/", "lmstudio/", "llamaapp/",
+        "nvidia_nim/", "lmstudio/", "llamaapp/", "unsloth/", "antigravity/", "gguf/",
     ]
 
     /// The routing prefix for a provider id ("opencode/" for opencode-zen, …).
@@ -100,6 +104,9 @@ struct ProviderPreset: Identifiable, Hashable {
         case "ai-gateway": return "vercel/"
         case "ollama": return "ollama/"
         case "lmstudio": return "lmstudio/"
+        case "unsloth": return "unsloth/"
+        case "gguf": return "gguf/"
+        case "antigravity": return "antigravity/"
         default: return ""
         }
     }
@@ -120,6 +127,57 @@ struct ProviderPreset: Identifiable, Hashable {
             return model
         }
         return remainder
+    }
+}
+
+/// Free-tier model knowledge per provider.
+///
+/// Two shapes of "free tier" exist across the supported providers:
+/// 1. **Explicit free models** inside a larger catalog — OpenRouter prices
+///    them at 0 (and mostly suffixes `:free`), OpenCode Zen suffixes `-free`.
+///    These are filtered out of a bigger list.
+/// 2. **The whole catalog is free** (rate-limited) — Groq, Cerebras,
+///    SambaNova, OpenCode Zen's listed free models: every model the account
+///    serves costs nothing per token. No filtering applies.
+enum ProviderFreeTier {
+    /// Providers whose /models endpoint is PUBLIC — fetchable without an API
+    /// key, so their free catalog can be auto-fetched even before the user
+    /// pastes a key. Verified live: OpenRouter serves 425+ models with
+    /// per-model pricing keylessly; OpenCode Zen serves its catalog keylessly.
+    static let publicModelsEndpoints: Set<String> = ["openrouter", "opencode-zen"]
+
+    /// Extract the FREE models from a raw /models JSON payload for the given
+    /// provider. Returns the full id list when the provider has no per-model
+    /// free/paid distinction (whole catalog is free-tier).
+    static func freeModels(providerId: String, rawModels: [[String: Any]]) -> [String] {
+        switch providerId {
+        case "openrouter":
+            // Authoritative: pricing.prompt/completion == "0". Fallback to the
+            // ":free" suffix convention (covers entries missing pricing).
+            let priced = rawModels.filter { m in
+                guard let pricing = m["pricing"] as? [String: Any] else { return false }
+                let prompt = pricing["prompt"] as? String
+                let completion = pricing["completion"] as? String
+                return prompt == "0" && completion == "0"
+            }
+            let ids = priced.compactMap { $0["id"] as? String }
+            if !ids.isEmpty { return ids }
+            return rawModels.compactMap { $0["id"] as? String }.filter { $0.hasSuffix(":free") }
+        case "opencode-zen", "opencode-go":
+            // OpenCode's convention: "-free" suffix on free-tier models.
+            return rawModels.compactMap { $0["id"] as? String }.filter { $0.hasSuffix("-free") }
+        default:
+            // Whole catalog is the free tier (Groq, Cerebras, …) or unknown —
+            // no per-model filter, return everything.
+            return rawModels.compactMap { $0["id"] as? String }
+        }
+    }
+
+    /// Whether a provider has a free tier worth auto-fetching (every remote
+    /// provider does — the only exclusions are local runtimes and the legacy
+    /// custom slot).
+    static func hasFreeTier(providerId: String) -> Bool {
+        !["local", "ollama", "lmstudio", "llamaapp", "llamacpp", "jan", "unsloth", "gguf", "custom"].contains(providerId)
     }
 }
 

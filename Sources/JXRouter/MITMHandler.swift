@@ -10,19 +10,21 @@ import Network
 ///
 /// Non-AI hosts get standard TCP passthrough.
 final class MITMHandler: @unchecked Sendable {
-    let providerRouter: ProviderRouter?
     /// Port the DirectTLS listener is on (port+1, e.g. 5256).
     let directTLSPort: UInt16
 
-    init(providerRouter: ProviderRouter?, directTLSPort: UInt16) {
-        self.providerRouter = providerRouter
+    init(directTLSPort: UInt16) {
         self.directTLSPort = directTLSPort
     }
 
     /// Handle a CONNECT tunnel request.
     /// Returns true if handled.
-    func intercept(connection: NWConnection, host: String, port: UInt16) -> Bool {
-        if isAIHost(host) {
+    ///
+    /// - Parameter forcePassthrough: when true the tunnel is relayed raw even
+    ///   for AI hosts — used by per-app rules like "Pass Through OpenAI",
+    ///   which override the global routing switch for a specific app.
+    func intercept(connection: NWConnection, host: String, port: UInt16, forcePassthrough: Bool = false) -> Bool {
+        if !forcePassthrough, isAIHost(host) {
             print("[MITM] Routing AI CONNECT \(host):\(port) → DirectTLS:127.0.0.1:\(directTLSPort)")
             Task {
                 await routeAITunnel(connection: connection, host: host, port: port)
@@ -30,7 +32,7 @@ final class MITMHandler: @unchecked Sendable {
             return true
         }
 
-        // Non-AI hosts: standard TCP passthrough
+        // Non-AI hosts (or forced passthrough): standard TCP passthrough
         print("[MITM] Passthrough CONNECT \(host):\(port)")
         startPassthrough(connection, host: host, port: port)
         return true
@@ -49,9 +51,14 @@ final class MITMHandler: @unchecked Sendable {
             guard let self else { return }
 
             // Pipe to DirectTLS listener instead of the real destination
+            guard let directTLSPort = NWEndpoint.Port(rawValue: self.directTLSPort) else {
+                print("[MITM] Invalid DirectTLS port \(self.directTLSPort)")
+                connection.cancel()
+                return
+            }
             let target = NWConnection(
                 host: NWEndpoint.Host("127.0.0.1"),
-                port: NWEndpoint.Port(rawValue: self.directTLSPort)!,
+                port: directTLSPort,
                 using: .tcp
             )
 
@@ -62,9 +69,13 @@ final class MITMHandler: @unchecked Sendable {
                 } else if case .failed = state {
                     print("[MITM] DirectTLS unavailable, raw passthrough for \(host):\(port)")
                     // "200" already sent above — just relay raw bytes without re-sending
+                    guard let fallbackPort = NWEndpoint.Port(rawValue: port) else {
+                        connection.cancel()
+                        return
+                    }
                     let fallback = NWConnection(
                         host: NWEndpoint.Host(host),
-                        port: NWEndpoint.Port(rawValue: port)!,
+                        port: fallbackPort,
                         using: .tcp
                     )
                     fallback.stateUpdateHandler = { state in
@@ -95,9 +106,13 @@ final class MITMHandler: @unchecked Sendable {
             guard let self else { return }
 
             // Connect to the actual destination
+            guard let targetPort = NWEndpoint.Port(rawValue: port) else {
+                connection.cancel()
+                return
+            }
             let target = NWConnection(
                 host: NWEndpoint.Host(host),
-                port: NWEndpoint.Port(rawValue: port)!,
+                port: targetPort,
                 using: .tcp
             )
 
@@ -120,8 +135,10 @@ final class MITMHandler: @unchecked Sendable {
     }
 
     /// Check if a hostname is a known AI API host.
+    /// Honors the "Route OpenAI connections" switch: with it off, OpenAI hosts
+    /// get raw TCP passthrough here instead of a trip through DirectTLS.
     private func isAIHost(_ host: String) -> Bool {
-        RequestClassifier().isKnownAiHost(host)
+        RequestClassifier(routeOpenAI: ConfigManager.shared.routeOpenAI).isKnownAiHost(host)
     }
 
     private let queue = DispatchQueue(label: "com.jxproxy.mitm", qos: .userInitiated)

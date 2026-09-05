@@ -12,6 +12,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let manager = ProxyManager.shared
 
+        // Capture uncaught NSExceptions (e.g. the recurring window-layout
+        // crash) with their actual reason before the process dies, so the
+        // crash is diagnosable from the log alone.
+        NSSetUncaughtExceptionHandler { exception in
+            let reason = "\(exception.name.rawValue): \(exception.reason ?? "(no reason)")"
+            let stack = exception.callStackSymbols.prefix(20).joined(separator: "\n")
+            let entry = "\(ISO8601DateFormatter().string(from: Date())) EXCEPTION \(reason)\n\(stack)\n"
+            // FileHandle(forWritingAtPath:) requires the file to already exist —
+            // create it first so the FIRST crash is always captured.
+            let logURL = URL(fileURLWithPath: "/tmp/jxproxy-crash.log")
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            if let data = entry.data(using: .utf8),
+               let handle = try? FileHandle(forWritingTo: logURL) {
+                defer { try? handle.close() }
+                handle.seekToEndOfFile()
+                handle.write(data)
+            }
+
+            // Permanent fix: a crash must NOT strand the System-Wide Proxy on
+            // a dead port — that kills internet for every app on the machine
+            // until a relaunch (the launch sweep clears it). emergencyDisable-
+            // AllInterfaces is nonisolated and spawns networksetup directly,
+            // so it is safe to call from this C-context handler on the
+            // crashing thread (best-effort — the process is dying anyway).
+            SystemProxyManager.emergencyDisableAllInterfaces()
+        }
+
+        // Menu-bar agent (LSUIElement = true): macOS may auto-terminate an
+        // "inactive" background-only app — but this app must keep serving the
+        // proxy (Claude Code & co. route through it continuously), so opt out
+        // of automatic termination explicitly.
+        ProcessInfo.processInfo.disableAutomaticTermination("com.jxproxy.proxy-server")
+
         // Create the status-bar + window manager (replaces MenuBarExtra).
         statusItemManager = StatusItemManager(proxyManager: manager)
 
@@ -21,6 +56,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // scripted kill leaves the system proxy pointing at a dead port and
         // ALL internet breaks until the app is relaunched.
         installSignalHandlers()
+
+        // Register for NSWorkspace sleep/wake notifications to suspend and
+        // resume the proxy around system sleep — prevents stale connections
+        // from piling up during sleep and avoids the watchdog thinking the
+        // proxy is dead while the machine is actually asleep.
+        NotificationCenter.default.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            print("[AppDelegate] System going to sleep — pausing proxy")
+            // queue: .main guarantees main-thread execution; use assumeIsolated
+            // to satisfy @MainActor isolation without async overhead.
+            MainActor.assumeIsolated {
+                manager.stopProxy()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            if UserDefaults.standard.bool(forKey: "autoStartProxy") {
+                print("[AppDelegate] System woke — auto-restarting proxy")
+                Task { @MainActor in
+                    await manager.startProxy()
+                }
+            }
+        }
 
         // Stale-state sweep: if the app was force-killed last time, the system
         // proxy may still point at a dead port on ANY network interface. Clear
@@ -59,7 +123,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// actually installed.) stopProxy() already disables the system proxy on
     /// every interface, so no separate emergency cleanup is needed here.
     func applicationWillTerminate(_ notification: Notification) {
-        ProxyManager.shared.stopProxy()
+        // Cancel signal dispatch sources so they don't fire after the proxy
+        // has stopped — they hold strong references to `self` through the
+        // closure, so failing to cancel leaks the AppDelegate and prevents
+        // deallocation until the process exits.
+        for source in signalSources {
+            source.cancel()
+        }
+        signalSources.removeAll()
+        // applicationWillTerminate is always called on the main thread by AppKit,
+        // so MainActor.assumeIsolated is safe here and eliminates the
+        // "call to main actor-isolated instance method in nonisolated context"
+        // warning without adding async/Task overhead at process-exit time.
+        MainActor.assumeIsolated {
+            ProxyManager.shared.stopProxy()
+        }
     }
 
     // MARK: - Termination Signal Handling
@@ -104,11 +182,10 @@ struct JXRouterApp: App {
         // No MenuBarExtra or WindowGroup scene here — the app lives in the
         // menu bar with an NSStatusItem and shows/hides a real window.
 
-        Settings {
-            SettingsView(manager: ProxyManager.shared)
-        }
-        .windowResizability(.contentSize)
-        .defaultSize(width: 560, height: 780)
+        Settings { EmptyView() }
+        // SwiftUI Settings scene is required for .commands to compile.
+        // The real Settings window is a standalone NSWindow in
+        // StatusItemManager.openSettingsWindow().
 
         // MARK: - Keyboard Shortcuts (registered via the invisible menu bar)
 
@@ -125,14 +202,23 @@ struct JXRouterApp: App {
 
                 Button("Toggle Proxy") {
                     Task {
+                        // stopProxy() is synchronous — no await needed (the Task
+                        // inherits this MainActor context).
                         if ProxyManager.shared.isRunning {
-                            await ProxyManager.shared.stopProxy()
+                            ProxyManager.shared.stopProxy()
                         } else {
                             await ProxyManager.shared.startProxy()
                         }
                     }
                 }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Open Vault Workspace") {
+                    openVaultWorkspace()
+                }
+                .keyboardShortcut("v", modifiers: [.command, .shift])
 
                 Divider()
 
@@ -160,9 +246,14 @@ struct JXRouterApp: App {
         NSWorkspace.shared.open(tempURL)
     }
 
-    /// Open the settings window programmatically via the standard Settings scene.
+    /// Open the settings window — posts a notification that StatusItemManager
+    /// handles (creates a standalone NSWindow, positions it, pairs it).
     private func openSettingsWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: NSApp, from: nil)
+        NotificationCenter.default.post(name: .jxproxyOpenSettings, object: nil)
+    }
+
+    /// Open the Vault workspace window.
+    private func openVaultWorkspace() {
+        NotificationCenter.default.post(name: .jxproxyOpenVault, object: nil)
     }
 }

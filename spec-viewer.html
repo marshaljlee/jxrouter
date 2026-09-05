@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vault — Unified AI Development Workspace Spec</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --card: #161b22;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --muted: #8b949e;
+    --code-bg: #1c2128;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+  h1 { font-size: 2rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h2 { font-size: 1.5rem; margin: 2rem 0 0.75rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+  h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; color: var(--green); }
+  h4 { font-size: 1.05rem; margin: 1.2rem 0 0.4rem; }
+  p { margin: 0.6rem 0; }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    padding: 0.5rem 1rem;
+    margin: 1rem 0;
+    background: var(--card);
+    border-radius: 6px;
+    color: var(--muted);
+  }
+  blockquote strong { color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
+  th, td { border: 1px solid var(--border); padding: 0.4rem 0.7rem; text-align: left; }
+  th { background: var(--card); font-weight: 600; }
+  tr:nth-child(even) { background: rgba(22,27,34,0.5); }
+  code {
+    background: var(--code-bg);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.88em;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; }
+  ul, ol { padding-left: 1.5rem; margin: 0.5rem 0; }
+  li { margin: 0.25rem 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  strong { color: #f0f6fc; }
+  em { color: var(--muted); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 0; }
+  .toc ol { padding-left: 1.2rem; }
+  .toc li { margin: 0.3rem 0; }
+  .feature-check { color: var(--green); }
+  .header-bar {
+    background: linear-gradient(135deg, #1a1e2e 0%, #0d1117 100%);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    margin-bottom: 2rem;
+    text-align: center;
+  }
+  .header-bar h1 { border: none; margin: 0 0 0.5rem; font-size: 2.2rem; }
+  .header-bar p { color: var(--muted); font-size: 1rem; }
+  .badge {
+    display: inline-block;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 0.2rem 0.7rem;
+    font-size: 0.8rem;
+    margin: 0.3rem;
+  }
+  .badge.green { border-color: var(--green); color: var(--green); }
+  .badge.blue { border-color: var(--accent); color: var(--accent); }
+  .badge.orange { border-color: var(--orange); color: var(--orange); }
+</style>
+</head>
+<body>
+
+<div class="header-bar">
+  <h1>🔐 Vault</h1>
+  <p>The Unified AI Development Workspace</p>
+  <div>
+    <span class="badge green">91 Features</span>
+    <span class="badge blue">Tauri 2 + Rust + React</span>
+    <span class="badge orange">Cross-Platform</span>
+  </div>
+</div>
+
+<div id="content"><em>Loading spec…</em></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script>
+fetch('Hybrid-App-Spec.md')
+  .then(r => r.text())
+  .then(md => {
+    document.getElementById('content').innerHTML = marked.parse(md);
+    document.title = md.match(/^#\s+(.+)/m)?.[1] || 'Spec Viewer';
+  })
+  .catch(e => {
+    document.getElementById('content').innerHTML =
+      '<p style="color:#f85149">Failed to load spec: ' + e.message + '</p>' +
+      '<p>Ensure Hybrid-App-Spec-Unified.md or Hybrid-App-Spec.md is in the same directory.</p>';
+  });
+</script>
+</body>
+</html>

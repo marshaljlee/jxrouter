@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8203F9A49ABF4435A8F9D1DF /* DataStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE0F166858794D32B762D2D8 /* DataStore.swift */; };
 		005E1D54998220DBD0E30BDA /* ProviderRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA828981BFD6756A2D91E18E /* ProviderRouter.swift */; };
 		00E1D37BC8999CDDC842E4E6 /* ProviderResponse.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FF08A245FB79F171355EF26 /* ProviderResponse.swift */; };
 		047326E85DDBD68DF1E9F76F /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F6B6C8ABF1D3118CAC40AD3 /* SettingsView.swift */; };
@@ -14,6 +15,7 @@
 		A1B2C3D4E5F60718293A4B5C /* WebControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6E7F8091A2B3C4D5E6F7081 /* WebControlServer.swift */; };
 		0E159ECD222E2E1AF710C4F0 /* BotIntegrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF71D4B064CE98F4D7EAB1B3 /* BotIntegrationService.swift */; };
 		1075EFEE4F2CCF51949A42F8 /* MessageTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0190A6E89400E44C03D081F /* MessageTranslator.swift */; };
+		A175EFEE4F2CCF51949A42F9 /* LocalChatTemplateEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1190A6E89400E44C03D081E /* LocalChatTemplateEngine.swift */; };
 		2ACBEF2C9EBA8DCD0DB76FE2 /* MessagesRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BD785E9B46D2962B5506F4 /* MessagesRequest.swift */; };
 		2AF9D1C072EEB63E909B888D /* SSEFormatter.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA91F517DBC8BE667E5DEDD2 /* SSEFormatter.swift */; };
 		2E1A3237E5A6AD3F4669F17B /* ProviderPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA65EC69A4CA99019C74386C /* ProviderPresets.swift */; };
@@ -46,9 +48,18 @@
 		E347064ABA398AD9E64766FC /* KeychainManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 433F516E6CE02006AA2E8C9E /* KeychainManager.swift */; };
 		FA93735EFFD15B2ADAE2A61F /* ProxyServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F66EA7EEDA2A2293AD93371C /* ProxyServer.swift */; };
 		FA98C92DE7E808860EC13C3F /* CurlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF377AA9143DD21D2221F09A /* CurlClient.swift */; };
+		2C3EC5B4C505D0B7770EA45E /* VaultWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60A8DAFF7F926E6BDADC79B2 /* VaultWorkspaceView.swift */; };
+		0D5F848AB8CBD9DC822B83D4 /* ClaudeChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 565A18D114A06501A00BE762 /* ClaudeChatView.swift */; };
+		4F66559D4279FADA0C3FB353 /* VaultViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = F93DF1016875CAE54A642AE9 /* VaultViews.swift */; };
+		DA04697F5A1427E0635FEC97 /* ProviderChainError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0048E436C7777AD0555162B0 /* ProviderChainError.swift */; };
+		69B2F3AD7D9A66F75D049CF9 /* ResponsesTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07037E439C1CBCAE806B1CE1 /* ResponsesTranslator.swift */; };
+		CEC59D3C109392F3ED8080AB /* GeminiOAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F333DDF28921593E2D9DEC46 /* GeminiOAuthManager.swift */; };
+		A1B2C3D4E5F6A7B8C9D0E1F2 /* GGUFModelScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2A1B2C3D4E5F6A7B8C9D0E1 /* GGUFModelScanner.swift */; };
+		B1E7E5C0D3F4A5968702B3C4 /* ThemeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4D5E6F7A8B9C0D1E2F3A4B5 /* ThemeEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		EE0F166858794D32B762D2D8 /* DataStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DataStore.swift; path = Sources/JXRouter/DataStore.swift; sourceTree = SOURCE_ROOT; };
 		18514E0CAE378F88E9D495BC /* AppIdentifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppIdentifier.swift; path = Sources/JXRouter/Services/AppIdentifier.swift; sourceTree = SOURCE_ROOT; };
 		24F5B2F00F9D92ED2CEAB2AE /* NetworkRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkRelay.swift; sourceTree = "<group>"; };
 		2669665B900523D61FAA1426 /* ConfigManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigManager.swift; sourceTree = "<group>"; };
@@ -72,6 +83,7 @@
 		9CFE43496DD733D595F057A1 /* CertificateAuthority.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CertificateAuthority.swift; sourceTree = "<group>"; };
 		A8AFF278008CA0C9CEB3F915 /* JXRouter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JXRouter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B0190A6E89400E44C03D081F /* MessageTranslator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageTranslator.swift; sourceTree = "<group>"; };
+		B1190A6E89400E44C03D081E /* LocalChatTemplateEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalChatTemplateEngine.swift; sourceTree = "<group>"; };
 		B6C1EE86A391EF962270A170 /* RequestClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestClassifier.swift; sourceTree = "<group>"; };
 		B7BD785E9B46D2962B5506F4 /* MessagesRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesRequest.swift; sourceTree = "<group>"; };
 		B94B23D08EA44978FD41A4AE /* AppDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDetector.swift; sourceTree = "<group>"; };
@@ -90,6 +102,14 @@
 		F66EA7EEDA2A2293AD93371C /* ProxyServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyServer.swift; sourceTree = "<group>"; };
 		FD77D0F71F44F565AE592ED5 /* MITMHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MITMHandler.swift; sourceTree = "<group>"; };
 		FFCB1B614E1F299AAD4F9E0E /* DirectDNSResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectDNSResolver.swift; sourceTree = "<group>"; };
+		60A8DAFF7F926E6BDADC79B2 /* VaultWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultWorkspaceView.swift; sourceTree = "<group>"; };
+		565A18D114A06501A00BE762 /* ClaudeChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeChatView.swift; sourceTree = "<group>"; };
+		F93DF1016875CAE54A642AE9 /* VaultViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VaultViews.swift; sourceTree = "<group>"; };
+		0048E436C7777AD0555162B0 /* ProviderChainError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderChainError.swift; sourceTree = "<group>"; };
+		07037E439C1CBCAE806B1CE1 /* ResponsesTranslator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponsesTranslator.swift; sourceTree = "<group>"; };
+		F333DDF28921593E2D9DEC46 /* GeminiOAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeminiOAuthManager.swift; sourceTree = "<group>"; };
+		F2A1B2C3D4E5F6A7B8C9D0E1 /* GGUFModelScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUFModelScanner.swift; sourceTree = "<group>"; };
+		C4D5E6F7A8B9C0D1E2F3A4B5 /* ThemeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -179,11 +199,20 @@
 				EA91F517DBC8BE667E5DEDD2 /* SSEFormatter.swift */,
 				B7BD785E9B46D2962B5506F4 /* MessagesRequest.swift */,
 				B0190A6E89400E44C03D081F /* MessageTranslator.swift */,
+				B1190A6E89400E44C03D081E /* LocalChatTemplateEngine.swift */,
 				FFCB1B614E1F299AAD4F9E0E /* DirectDNSResolver.swift */,
 				BF377AA9143DD21D2221F09A /* CurlClient.swift */,
 				4391178C4A51E6DB7CAAE010 /* SettingsHelpers.swift */,
 				E9C2B90A5DCA5D29F2BEC039 /* Assets.xcassets */,
 				653E08473BE316F12894F44A /* LocalModelManager.swift */,
+				60A8DAFF7F926E6BDADC79B2 /* VaultWorkspaceView.swift */,
+				565A18D114A06501A00BE762 /* ClaudeChatView.swift */,
+				F93DF1016875CAE54A642AE9 /* VaultViews.swift */,
+				0048E436C7777AD0555162B0 /* ProviderChainError.swift */,
+				07037E439C1CBCAE806B1CE1 /* ResponsesTranslator.swift */,
+				F333DDF28921593E2D9DEC46 /* GeminiOAuthManager.swift */,
+				F2A1B2C3D4E5F6A7B8C9D0E1 /* GGUFModelScanner.swift */,
+				C4D5E6F7A8B9C0D1E2F3A4B5 /* ThemeEngine.swift */,
 			);
 			name = JXRouter;
 			path = Sources/JXRouter;
@@ -254,6 +283,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8203F9A49ABF4435A8F9D1DF /* DataStore.swift in Sources */,
 				89504D0D0E8918A22A53F19B86771C65 /* ClaudeSettingsWriter.swift in Sources */,
 				315B552649CAE9972AD4A8D80014A28D /* ProviderValidator.swift in Sources */,
 				787F19D30B1129115B86CBFB8FC3E234 /* LocalProviderDetector.swift in Sources */,
@@ -288,10 +318,19 @@
 				2AF9D1C072EEB63E909B888D /* SSEFormatter.swift in Sources */,
 				2ACBEF2C9EBA8DCD0DB76FE2 /* MessagesRequest.swift in Sources */,
 				1075EFEE4F2CCF51949A42F8 /* MessageTranslator.swift in Sources */,
+				A175EFEE4F2CCF51949A42F9 /* LocalChatTemplateEngine.swift in Sources */,
 				62C2FD6E44F848D3DAFBEB67 /* DirectDNSResolver.swift in Sources */,
 				FA98C92DE7E808860EC13C3F /* CurlClient.swift in Sources */,
 				C796461322E36E7FF33A2155 /* SettingsHelpers.swift in Sources */,
 				86CD8560AA5A99FF00DF0F00 /* LocalModelManager.swift in Sources */,
+				2C3EC5B4C505D0B7770EA45E /* VaultWorkspaceView.swift in Sources */,
+				0D5F848AB8CBD9DC822B83D4 /* ClaudeChatView.swift in Sources */,
+				4F66559D4279FADA0C3FB353 /* VaultViews.swift in Sources */,
+				DA04697F5A1427E0635FEC97 /* ProviderChainError.swift in Sources */,
+				69B2F3AD7D9A66F75D049CF9 /* ResponsesTranslator.swift in Sources */,
+				CEC59D3C109392F3ED8080AB /* GeminiOAuthManager.swift in Sources */,
+				A1B2C3D4E5F6A7B8C9D0E1F2 /* GGUFModelScanner.swift in Sources */,
+				B1E7E5C0D3F4A5968702B3C4 /* ThemeEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

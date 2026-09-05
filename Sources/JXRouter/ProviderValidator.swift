@@ -78,7 +78,11 @@ struct ProviderValidator {
             // Custom (named) providers always require a key — preset lookup
             // returns nil for them, which is treated as "needs a key".
             if (preset?.requiresKey ?? true), !isLocalEndpoint(baseUrl) {
-                return ProviderCheckResult(ok: false, message: "No API key entered — add it in Settings → Providers")
+                // Name the provider: on the General tab the tier may be routed
+                // to a provider the user never entered a key for, and a bare
+                // "no API key entered" reads as if the app lost their key.
+                let name = preset?.name ?? providerId
+                return ProviderCheckResult(ok: false, message: "No API key entered for \(name) — add it in Settings → Providers")
             }
         }
         let urlStr = baseUrl.hasSuffix("/v1") ? baseUrl : baseUrl + "/v1"

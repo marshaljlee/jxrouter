@@ -1,53 +1,60 @@
-# Xcode
+# ShipStudio metadata
+.shipstudio/
+
+# macOS Finder & System
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode & Swift Build Artifacts
 build/
 Build/
+Debug/
+Release/
 DerivedData/
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
+*.xcuserstate
+project.xcworkspace/xcuserdata/
 xcuserdata/
+*.xcscmblueprint
 *.xccheckout
 *.moved-aside
-DerivedData
-*.hmap
 *.ipa
-*.xcuserstate
+*.dSYM.zip
+*.dSYM
+*.noindex
+CompilationCache.noindex/
+ModuleCache.noindex/
+SDKStatCaches.noindex/
+Logs/
+default.profraw
+*.profdata
+*.profraw
+info.plist
 
-# Swift Package Manager
-.build/
+# Android & Gradle
+.gradle/
+**/build/
+captures/
+*.apk
+*.aab
+.kotlin/
 
-# CocoaPods
-Pods/
-.TerMinal/backlog/.next-id.lock
-.TerMinal/sessions/.next-id.lock
-.status.md
+# Output & Dist
+dist/
+tmp/
+repomix-output.xml
 
-# MCP / Credentials
-.mcp.json
-
-# IDE / agent configs
-.cursor/
-.codex/
-.agents/
+# Ephemeral state & caches
 .TerMinal/
-.claude/
-.zcode/
-.gitlab/
-
-# Agent runtime & scratch dirs (recreated on demand)
-.freebuff/
 .app-lifecycle/
-.omo/
-data/
-deepfork-out/
-projects/
-*.duckdb
-
-# Legacy Jetro extension data (different product; was accidentally tracked)
+.context-bridge/
+.session-state/
 .jetro/
+.freebuff/
+.omo/
+settings.local*.json
+.claude/settings.local*.json
+handoff.md

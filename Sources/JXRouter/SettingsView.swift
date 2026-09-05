@@ -2,6 +2,33 @@ import SwiftUI
 import ServiceManagement
 import AppKit
 
+/// Lifecycle of a tier's model-list auto-fetch, surfaced under the model
+/// dropdown so a slow or failed fetch is never silent.
+private enum TierFetchState: Equatable {
+    case idle
+    case fetching
+    case loaded
+    case failed(String)
+}
+
+/// Result of a single model health check.
+struct ModelHealthResult: Identifiable {
+    let id = UUID()
+    let providerId: String
+    let providerName: String
+    let model: String
+    let status: ModelHealthStatus
+    let latencyMs: Double?
+    let errorMessage: String?
+}
+
+enum ModelHealthStatus: Equatable {
+    case checking
+    case healthy
+    case unhealthy(String)
+    case rateLimited
+}
+
 // MARK: - Settings View (Tabbed)
 
 struct SettingsView: View {
@@ -29,7 +56,12 @@ struct SettingsView: View {
     /// Provider/model used by the last verification — re-verify only on change.
     @State private var lastVerifiedProvider = ""
     @State private var lastVerifiedModel = ""
-    
+    /// Monotonically increasing counter bumped on every user edit. The auto-save
+    /// snapshot carries the generation at which it was taken; if the counter has
+    /// advanced by the time the debounce fires, the snapshot is stale and the
+    /// save is skipped (a fresher save will follow).
+    @State private var saveGeneration = 0
+
     @State private var config = ConfigManager.shared
     // General
     @State private var port: String = "5255"
@@ -43,6 +75,9 @@ struct SettingsView: View {
     @State private var onboardingProvider: LocalModelManager.LocalProvider = .llamaapp
     /// Free API key guide sheet (OpenCode Zen / NVIDIA NIM) for non-technical users.
     @State private var showApiKeyGuide = false
+    /// Transient feedback after a ~/.zshrc key detection (button or live watcher).
+    @State private var shellImportFlash: String?
+    @State private var shellImportFlashTask: Task<Void, Never>?
     @State private var provider: String = "opencode-zen"
     @State private var fallbackProviders: String = "nvidia,local"
     /// Per-tier provider overrides (tier key → provider id). The Default pair
@@ -50,6 +85,13 @@ struct SettingsView: View {
     @State private var tierProviders: [String: String] = [:]
     /// Per-tier live model lists auto-fetched from each pair's provider.
     @State private var tierLiveModels: [String: [String]] = [:]
+    /// App-wide live model lists per provider id (non-local providers) —
+    /// fetched once when Settings opens so every provider's dropdown carries
+    /// the provider's FULL live model list (free tier included), not just the
+    /// curated preset subset.
+    @State private var providerLiveModels: [String: [String]] = [:]
+    /// Whether the app-wide provider model fetch is still running.
+    @State private var isFetchingAllProviderModels = false
     // Model Overrides
     @State private var modelOpus: String = ""
     @State private var modelSonnet: String = ""
@@ -58,6 +100,15 @@ struct SettingsView: View {
     @State private var openaiBaseUrl: String = ""
     @State private var localBaseUrl: String = ""
     @State private var localModel: String = ""
+    // GGUF Direct
+    @State private var ggufModelPath: String = ""
+    @State private var ggufModelAlias: String = "local-model"
+    @State private var ggufGpuLayers: Int = 0
+    @State private var ggufContextSize: Int = 0
+    @State private var ggufPort: String = "8081"
+    @State private var ggufModels: [GGUFModelFile] = []
+    @State private var ggufScanState: String = ""
+    @State private var ggufScanTask: Task<Void, Never>?
     // Custom backend URLs per provider (stored as JSON dict in ConfigManager)
     @State private var providerUrlOverrides: [String: String] = [:]
     // API keys
@@ -77,6 +128,7 @@ struct SettingsView: View {
     @State private var cerebrasKey: String = ""
     @State private var huggingfaceKey: String = ""
     @State private var xaiKey: String = ""
+    @State private var antigravityKey: String = ""
     // Custom (OpenAI-compatible) provider — legacy single entry
     @State private var customUrl: String = ""
     @State private var customKey: String = ""
@@ -89,11 +141,25 @@ struct SettingsView: View {
     @State private var newCustomUrl = ""
     @State private var newCustomKey = ""
 
+    // Model Health Check state
+    @State private var modelHealthResults: [ModelHealthResult] = []
+    @State private var isRunningHealthCheck = false
+    @State private var healthCheckProgress: String = ""
+    // Gemini OAuth
+    @State private var geminiOAuth = GeminiOAuthManager.shared
+    /// User-supplied OAuth client ID for Gemini Web — Google blocks the
+    /// bundled community client ID ("This app is blocked"); the user's own
+    /// Google Cloud client is never blocked.
+    @State private var geminiOAuthClientId: String = ""
+
     // Credential / model verification (green ticks)
     @State private var providerChecks: [String: ProviderCheckState] = [:]
-    @State private var defaultModelCheck: ProviderCheckState = .unknown
     /// Per-tier model connectivity results from the "Test All Models" button.
     @State private var tierModelChecks: [String: ProviderCheckState] = [:]
+    /// Per-tier model-list fetch lifecycle — a spinner while the dropdown
+    /// auto-fetches, and a clear error + Retry when the provider can't be
+    /// reached, so the user always knows what the fetch is doing.
+    @State private var tierFetchStates: [String: TierFetchState] = [:]
 
     // Auto-detected local runtimes (Ollama, llama.app, LM Studio, Jan)
     @State private var localRuntimes: [LocalRuntime] = []
@@ -102,6 +168,9 @@ struct SettingsView: View {
     
     // System
     @State private var enableSystemProxy: Bool = false
+    /// Whether OpenAI connections (api.openai.com) are routed through JXProxy.
+    /// Independent of Anthropic: off → OpenAI traffic passes through unmodified.
+    @State private var routeOpenAI: Bool = true
     @State private var networkInterface: String = "Wi-Fi"
     @State private var appRoutes: [AppRouteRule] = []
     @State private var availableInterfaces: [String] = []
@@ -113,10 +182,6 @@ struct SettingsView: View {
     // Bot
     @State private var botIntegrationEnabled: Bool = false
     @State private var telegramBotToken: String = ""
-
-    /// Live models fetched from the provider's /v1/models API (e.g., llama.app
-    /// only exposes its loaded models when the server is actually running).
-    @State private var liveModels: [String] = []
 
     /// Providers the user can pick — local-only providers are always available,
     /// remote providers require a non-empty API key. The legacy single "custom"
@@ -151,9 +216,14 @@ struct SettingsView: View {
     /// Return the reactive @State key value for a provider, falling back to the
     /// Keychain for providers without a dedicated secure field in the UI.
     private func apiKeyForProvider(_ id: String) -> String {
-        // Named custom providers keep their key in a reactive per-id field.
+        // Named custom providers keep their key in a reactive per-id field; an
+        // empty field falls back to the persisted key (Keychain, plus the
+        // endpoint-matched built-in inheritance in ConfigManager), so a custom
+        // provider at a built-in endpoint resolves the user's verified key
+        // even before the debounced save flushes it.
         if customProviders.contains(where: { $0.id == id }) {
-            return customProviderKeys[id] ?? ""
+            let key = customProviderKeys[id] ?? ""
+            return key.isEmpty ? config.apiKey(for: id) : key
         }
         switch id {
         case "direct":       return anthropicKey
@@ -172,89 +242,11 @@ struct SettingsView: View {
         case "cerebras":     return cerebrasKey
         case "huggingface":  return huggingfaceKey
         case "xai":          return xaiKey
+        case "antigravity":  return antigravityKey
         case "custom":       return customKey
         default:
             // Providers without a @State binding — check Keychain directly
             return config.apiKey(for: id)
-        }
-    }
-
-    /// Models for the currently selected provider — used in the Default Model and
-    /// Model Override dropdowns so they only show relevant options.
-    /// Merges preset models with live models from the provider's API.
-    var modelsForProvider: [String] {
-        var models = Set<String>()
-
-        // Preset models (always available)
-        let matchingPreset = providerPreset(provider)
-        if let preset = matchingPreset {
-            for m in preset.models { models.insert(ProviderPreset.bareModel(m, for: provider)) }
-        }
-        // User-configured visible models
-        if let p = manager.providers.first(where: { $0.id == provider }) {
-            for m in p.visibleModelIds { models.insert(ProviderPreset.bareModel(m, for: provider)) }
-        }
-        // Live models fetched from the provider's API
-        for m in liveModels { models.insert(ProviderPreset.bareModel(m, for: provider)) }
-
-        return Array(models).sorted()
-    }
-
-
-    /// Fetch available models from a provider's /v1/models API.
-    /// For local providers (llamaapp, ollama, lmstudio) this discovers models
-    /// loaded by the running server. For remote providers (e.g. NVIDIA) the
-    /// API key is included in the request when available. Non-fatal on failure.
-    private func fetchLiveModels(for providerId: String? = nil) async {
-        let pid = providerId ?? provider
-        var baseUrl = config.baseUrl(for: pid).replacingOccurrences(of: "/v1", with: "")
-        // For llamaapp, honour the port configured in LocalModelManager so
-        // that a server started with a custom port is still discovered.
-        if pid == "llamaapp" {
-            let mgr = LocalModelManager.shared
-            if mgr.port != 8080 {
-                baseUrl = "http://\(mgr.host):\(mgr.port)"
-            }
-        }
-        guard let url = URL(string: "\(baseUrl)/v1/models") else { return }
-        // Clear stale models from the previous provider immediately so the
-        // dropdown never shows another provider's list while this fetch is in
-        // flight (e.g. switching opencode → nvidia). Only the Default tier's
-        // list is cleared — Opus/Sonnet/Haiku pairs have their own providers
-        // and manage their own cached lists.
-        await MainActor.run {
-            liveModels = []
-            if providerId != nil {
-                tierLiveModels[TierKey.defaultModel.rawValue] = []
-            }
-        }
-        do {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 5
-            // Use the reactive @State key — a freshly typed key is in the UI
-            // before the debounced auto-save flushes it to the Keychain, and
-            // config.apiKey() would read an empty Keychain value (401 → no
-            // models).
-            let key = apiKeyForProvider(pid)
-            if !key.isEmpty {
-                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            }
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let modelList = json["data"] as? [[String: Any]] else { return }
-            let names = modelList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
-            if !names.isEmpty {
-                await MainActor.run {
-                    liveModels = names
-                    // Persist the fetched list so it survives relaunches — the
-                    // user has no manual way to re-fetch after changing keys.
-                    if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
-                        manager.providers[idx].visibleModelIds.formUnion(names)
-                    }
-                }
-            }
-        } catch {
-            print("[SettingsView] Failed to fetch models from \(url): \(error)")
         }
     }
 
@@ -268,46 +260,43 @@ struct SettingsView: View {
         providerChecks[pid] = result.ok ? .valid : .invalid(key.isEmpty ? "No key entered" : result.message)
     }
 
-    /// Check that the selected default model answers a tiny chat completion.
-    private func verifyDefaultModel() async {
-        defaultModelCheck = .checking
-        guard !model.isEmpty else {
-            defaultModelCheck = .invalid("No model selected")
-            return
-        }
-        let pid = provider
-        let result = await ProviderValidator.validateModel(
-            providerId: pid, model: ProviderPreset.bareModel(model, for: pid),
-            apiKey: apiKeyForProvider(pid), baseUrl: config.baseUrl(for: pid)
-        )
-        defaultModelCheck = result.ok ? .valid : .invalid(result.message)
+    /// Test every Claude tier's model (Default / Opus / Sonnet / Haiku) against
+    /// its own provider — one result per tier under the button. All four tiers
+    /// run concurrently (each child hops to the main actor only to record its
+    /// own result), so the check finishes in ~one round-trip instead of four
+    /// sequential ones.
+    private func verifyAllTierModels() async {
+        async let defaultCheck: Void = verifyTierModel(.defaultModel)
+        async let opusCheck: Void = verifyTierModel(.opus)
+        async let sonnetCheck: Void = verifyTierModel(.sonnet)
+        async let haikuCheck: Void = verifyTierModel(.haiku)
+        _ = await (defaultCheck, opusCheck, sonnetCheck, haikuCheck)
     }
 
-    /// Test every Claude tier's model (Default / Opus / Sonnet / Haiku) against
-    /// its own provider — one result per tier under the button.
-    private func verifyAllTierModels() async {
-        for tier in TierKey.allCases {
-            tierModelChecks[tier.rawValue] = .checking
-            // Local/custom providers (e.g. llama.app) expose their models only
-            // via the live fetch — if a tier has no model yet, fetch the list
-            // first so "Test All Models" can pick up the available model.
-            if tierModelValue(tier).isEmpty {
-                await fetchTierModels(for: tier)
-            }
-            let pid = tierProviderId(for: tier)
-            let modelName = tierModelValue(tier)
-            guard !modelName.isEmpty else {
-                tierModelChecks[tier.rawValue] = .invalid("No model selected")
-                continue
-            }
-            let result = await ProviderValidator.validateModel(
-                providerId: pid,
-                model: ProviderPreset.bareModel(modelName, for: pid),
-                apiKey: apiKeyForProvider(pid),
-                baseUrl: config.baseUrl(for: pid)
-            )
-            tierModelChecks[tier.rawValue] = result.ok ? .valid : .invalid(result.message)
+    /// Run one tier's model check against its own provider and record the
+    /// result. Model-list fetches and network round-trips run off the main
+    /// actor; only the result is written back to the UI state.
+    private func verifyTierModel(_ tier: TierKey) async {
+        tierModelChecks[tier.rawValue] = .checking
+        // Local/custom providers (e.g. llama.app) expose their models only
+        // via the live fetch — if a tier has no model yet, fetch the list
+        // first so "Test All Models" can pick up the available model.
+        if tierModelValue(tier).isEmpty {
+            await fetchTierModels(for: tier)
         }
+        let pid = tierProviderId(for: tier)
+        let modelName = tierModelValue(tier)
+        guard !modelName.isEmpty else {
+            tierModelChecks[tier.rawValue] = .invalid("No model selected")
+            return
+        }
+        let result = await ProviderValidator.validateModel(
+            providerId: pid,
+            model: ProviderPreset.bareModel(modelName, for: pid),
+            apiKey: apiKeyForProvider(pid),
+            baseUrl: config.baseUrl(for: pid)
+        )
+        tierModelChecks[tier.rawValue] = result.ok ? .valid : .invalid(result.message)
     }
 
     /// The model id currently bound to a tier.
@@ -407,6 +396,12 @@ struct SettingsView: View {
             HStack(spacing: DesignToken.spacing6) {
                 SecureField("••••••••", text: text)
                     .textFieldStyle(.roundedBorder)
+                    .onChange(of: text.wrappedValue) {
+                        // A key edit invalidates the old verification result —
+                        // never show a stale red X (or a green tick) for a key
+                        // the user just changed.
+                        providerChecks[providerId] = .unknown
+                    }
                 Button("Verify") {
                     Task { await verifyProviderKey(providerId) }
                 }
@@ -414,6 +409,18 @@ struct SettingsView: View {
                 .controlSize(.small)
                 .font(.system(size: DesignToken.caption2Size))
                 .help("Check this API key against the provider")
+
+                // Dedicated remove button — deletes the key from the Keychain
+                // and uninstalls every model that was installed with it.
+                Button("Remove") {
+                    confirmRemoveApiKey(providerId: providerId, label: label)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .font(.system(size: DesignToken.caption2Size))
+                .foregroundStyle(Color.dsRed)
+                .disabled(text.wrappedValue.isEmpty)
+                .help("Remove this API key and uninstall all models installed with it")
             }
         }
     }
@@ -505,6 +512,9 @@ struct SettingsView: View {
         .frame(width: 560, height: 780)
         .background(Color.dsBackground)
         .onAppear {
+            // Re-scan the shell configs first so a key added to ~/.zshrc since
+            // launch (or since this panel last opened) shows up immediately.
+            config.importKeysFromShellConfigs()
             loadFromConfig()
             // Ensure the saved provider is still configured; fall back to the
             // first available one if its key was cleared outside this session.
@@ -512,6 +522,14 @@ struct SettingsView: View {
                 if let first = availableProviders.first {
                     provider = first.id
                 }
+            }
+            // Repair provider/model desync saved by older builds: if a tier's
+            // stored model belongs to a *different* provider (e.g. an NVIDIA
+            // model left selected after switching the Default pair to DeepSeek),
+            // reselect the provider's own first model so routing and "Test All
+            // Models" are never tested against a mismatched pair.
+            for tier in TierKey.allCases {
+                sanitizeTierModel(for: tier)
             }
             lastVerifiedProvider = provider
             lastVerifiedModel = model
@@ -523,28 +541,36 @@ struct SettingsView: View {
             hasLoaded = true
             detectNetworkInterfaces()
             Task {
-                await fetchLiveModels()
-                // Auto-populate model for local providers on first load
-                if model.isEmpty, !liveModels.isEmpty {
-                    model = liveModels[0]
-                }
-                // Programmatic auto-population above is not a user edit —
-                // refresh the checkmark baseline so first open doesn't flash
-                // a spurious "model" checkmark.
-                lastSavedValues = currentFieldValues()
                 // Autofetch model lists for all four tier pairs so the
                 // dropdowns are populated the moment they open.
                 for tier in TierKey.allCases {
                     await fetchTierModels(for: tier)
                 }
+                // Programmatic auto-population above is not a user edit —
+                // refresh the checkmark baseline so first open doesn't flash
+                // a spurious "model" checkmark.
+                lastSavedValues = currentFieldValues()
                 // Detect local runtimes and show their status.
                 localRuntimes = await LocalProviderDetector.detect()
+                // Sync the General tab's local-model quick control with the
+                // live server (llama.app may be running on its own port).
+                await LocalModelManager.shared.refreshStatus()
+                // Auto-scan for GGUF models from the background.
+                await scanGGUFModels()
+                // Auto-fetch every configured provider's full live model list
+                // (free tier included) so dropdowns populate app-wide.
+                await fetchAllProviderModels()
                 // Auto-verify stored keys so green ticks appear without clicks.
                 if !apiKeyForProvider(provider).isEmpty {
                     await verifyProviderKey(provider)
                 }
                 if !customKey.isEmpty {
                     await verifyProviderKey("custom")
+                }
+                // Check Gemini OAuth status on appear
+                if geminiOAuth.hasStoredToken {
+                    geminiOAuth.isAuthorized = true
+                    await verifyProviderKey("gemini-oauth")
                 }
             }
         }
@@ -559,22 +585,36 @@ struct SettingsView: View {
             // Auto-save on every edit (debounced) — no Save button needed, so
             // model/provider changes can never be lost between edit and save.
             guard hasLoaded else { return }
+            saveGeneration += 1
             scheduleAutoSave()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .jxproxyShellKeysImported)) { note in
+            // The live watcher re-imported keys from ~/.zshrc while the panel
+            // was open — refresh the fields so the new keys appear immediately.
+            reloadApiKeysFromConfig()
+            let imported = (note.userInfo?["imported"] as? [String]) ?? []
+            flashShellImport("Auto-detected in ~/.zshrc: \(imported.joined(separator: ", "))")
+        }
         .onChange(of: provider) { _, newProvider in
-            Task {
-                await fetchLiveModels(for: newProvider)
-                // Auto-populate the default model only when nothing is selected
-                // yet — a model the user chose is never overwritten by switching
-                // the provider (that would silently revert their pick).
-                guard model.isEmpty else { return }
-                let preset = providerPreset(newProvider)
-                if let preset, !preset.models.isEmpty {
-                    model = ProviderPreset.bareModel(preset.models.first ?? "", for: newProvider)
-                } else if !liveModels.isEmpty {
-                    model = liveModels[0]
-                }
-            }
+            // The Default tier follows the primary provider: clear the previous
+            // provider's cached models, reselect the model if it no longer
+            // belongs to the new provider, and auto-fetch the new list — so the
+            // model dropdown always reflects the selected provider immediately.
+            syncTierToProvider(.defaultModel, newProvider)
+        }
+        .onChange(of: model) {
+            // A changed model invalidates the previous test result: clear the
+            // row so a stale red error from the old model never lingers.
+            tierModelChecks[TierKey.defaultModel.rawValue] = .unknown
+        }
+        .onChange(of: modelOpus) {
+            tierModelChecks[TierKey.opus.rawValue] = .unknown
+        }
+        .onChange(of: modelSonnet) {
+            tierModelChecks[TierKey.sonnet.rawValue] = .unknown
+        }
+        .onChange(of: modelHaiku) {
+            tierModelChecks[TierKey.haiku.rawValue] = .unknown
         }
         .sheet(isPresented: $showLocalOnboarding) {
             LocalModelOnboardingView(provider: onboardingProvider) {
@@ -636,23 +676,6 @@ struct SettingsView: View {
             }
 
             sectionGroup("Model") {
-                HStack(alignment: .top, spacing: 8) {
-                    labeledField("Default Model", savedID: "model") {
-                        // Auto-fetch the provider's model list whenever the
-                        // dropdown opens — no manual refresh needed.
-                        ComboBox(text: $model, options: scopedOptions(modelsForProvider, current: model)) {
-                            Task { await fetchLiveModels() }
-                        }
-                        .frame(height: 22)
-                    }
-                    Button(action: { Task { await fetchLiveModels() } }) {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.dsAccent)
-                    .help("Refresh models from \(providerPreset(provider)?.name ?? provider)")
-                    .accessibilityLabel("Refresh models")
-                }
                 HStack(spacing: 8) {
                     Button("Test All Models") {
                         Task { await verifyAllTierModels() }
@@ -670,15 +693,15 @@ struct SettingsView: View {
                                 .font(.system(size: DesignToken.caption2Size))
                                 .foregroundStyle(Color.dsTextSecondary)
                                 .frame(width: 58, alignment: .leading)
+                            Text(providerPreset(tierProviderId(for: tier))?.name ?? tierProviderId(for: tier))
+                                .font(.system(size: DesignToken.caption2Size))
+                                .foregroundStyle(Color.dsTextTertiary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                             Spacer()
                             compactVerificationIndicator(tierModelChecks[tier.rawValue] ?? .unknown)
                         }
                     }
-                }
-                if !liveModels.isEmpty {
-                    Text("\(liveModels.count) model\(liveModels.count == 1 ? "" : "s") auto-fetched from \(providerPreset(provider)?.name ?? provider)")
-                        .font(.system(size: DesignToken.caption2Size))
-                        .foregroundStyle(Color.dsTextTertiary)
                 }
                 HStack(spacing: 8) {
                     Toggle(isOn: $enableThinking) {
@@ -733,6 +756,264 @@ struct SettingsView: View {
                     localModelQuickControl
                 }
             }
+
+            // Direct GGUF hosting — select a local .gguf model, load it into
+            // llama-server, and route Claude through it. Model metadata (chat
+            // template, context length, architecture) is read from the GGUF
+            // header so the server applies the correct chat settings.
+            sectionGroup("Local GGUF Model (Direct)") {
+                Text("Pick a GGUF model on disk — JXRouter launches llama-server with it and routes requests to it, like Unsloth's model picker. The model's embedded chat template and context length are applied automatically.")
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextTertiary)
+
+                // Model selection
+                HStack(spacing: 8) {
+                    Menu {
+                        if ggufModels.isEmpty {
+                            Button("No models found — scan first") {}.disabled(true)
+                        }
+                        ForEach(ggufModels) { model in
+                            Button {
+                                selectGGUFModel(model)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(model.name)
+                                            .font(.system(size: DesignToken.captionSize))
+                                            .lineLimit(1)
+                                        Text("\(model.fileSizeFormatted) · \(model.quantization) · \(model.contextLength) ctx")
+                                            .font(.system(size: DesignToken.caption2Size))
+                                            .foregroundStyle(Color.dsTextTertiary)
+                                    }
+                                    Spacer()
+                                    if ggufModelPath == model.path {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(Color.dsAccent)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "cpu")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.dsAccent)
+                            Text(selectedGGUFDisplayName)
+                                .font(.system(size: DesignToken.captionSize))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Color.dsTextSecondary)
+                        }
+                        .padding(8)
+                        .background(Color.dsSurface)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.dsBorder, lineWidth: 1)
+                        )
+                    }
+                    .menuStyle(.borderlessButton)
+                    .frame(maxWidth: .infinity)
+
+                    Button {
+                        Task { await scanGGUFModels() }
+                    } label: {
+                        if ggufScanState == "Scanning…" {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Rescan for GGUF models")
+                }
+
+                if !ggufScanState.isEmpty {
+                    Text(ggufScanState)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+
+                // Selected model details
+                if let selected = ggufModels.first(where: { $0.path == ggufModelPath }) {
+                    HStack(spacing: 12) {
+                        Label {
+                            Text(selected.quantization.isEmpty ? "GGUF" : selected.quantization)
+                        } icon: {
+                            Image(systemName: "shippingbox")
+                        }
+                        Label {
+                            Text("\(selected.contextLength) ctx")
+                        } icon: {
+                            Image(systemName: "text.alignleft")
+                        }
+                        Label {
+                            Text(selected.architecture)
+                        } icon: {
+                            Image(systemName: "cpu")
+                        }
+                        if selected.isLargeModel {
+                            Label {
+                                Text("Large model")
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle")
+                            }
+                            .foregroundStyle(Color.orange)
+                        }
+                        Spacer()
+                    }
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextSecondary)
+                }
+
+                // Run/Stop control
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(localModelStatusColor(LocalModelManager.shared))
+                        .frame(width: 8, height: 8)
+                    Text(ggufStatusText)
+                        .font(.system(size: DesignToken.captionSize))
+                        .foregroundStyle(Color.dsTextSecondary)
+                        .lineLimit(1)
+                    Spacer()
+                    if LocalModelManager.shared.isRunning && LocalModelManager.shared.provider == .gguf {
+                        Button("Stop") { stopGGUFModel() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else {
+                        Button(action: { runGGUFModel() }) {
+                            Label("Load Model", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(ggufModelPath.isEmpty)
+                    }
+                }
+
+                // Advanced settings
+                Divider().padding(.vertical, 2)
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Port")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        TextField("8081", text: $ggufPort)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 70)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("GPU Layers")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Picker("", selection: $ggufGpuLayers) {
+                            Text("CPU").tag(0)
+                            Text("GPU (All)").tag(-1)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 160)
+                    }
+                    Spacer()
+                }
+                Text("GPU (All) offloads every layer to the Metal GPU — fastest on Apple Silicon. CPU runs purely on the processor and uses far less memory.")
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextTertiary)
+            }
+        }
+    }
+
+    // MARK: - GGUF Helpers
+
+    /// The currently selected GGUF model's display name.
+    private var selectedGGUFDisplayName: String {
+        guard let model = ggufModels.first(where: { $0.path == ggufModelPath }) else {
+            return ggufModelPath.isEmpty ? "Select a GGUF model…" : (ggufModelPath as NSString).lastPathComponent
+        }
+        return model.name
+    }
+
+    /// Status text for the GGUF llama-server.
+    private var ggufStatusText: String {
+        let mgr = LocalModelManager.shared
+        switch mgr.status {
+        case .stopped: return "llama-server not running"
+        case .starting: return "Loading model…"
+        case .running(let pid):
+            if mgr.provider == .gguf {
+                return "llama-server running\(pid > 0 ? " (PID \(pid))" : "")"
+            }
+            return "llama-server not running"
+        case .failed(let msg): return "Failed: \(msg)"
+        }
+    }
+
+    /// Select a GGUF model and sync it to the manager + config.
+    private func selectGGUFModel(_ model: GGUFModelFile) {
+        ggufModelPath = model.path
+        ggufModelAlias = model.suggestedAlias
+        let mgr = LocalModelManager.shared
+        mgr.selectedGGUFPath = model.path
+        mgr.ggufModelAlias = model.suggestedAlias
+        // Auto-apply a sensible GPU default for large models: offload all
+        // layers when the model is small enough, CPU for very large ones.
+        mgr.ggufGpuLayers = model.isLargeModel ? 0 : -1
+        ggufGpuLayers = mgr.ggufGpuLayers
+        // The server port is shared with the provider routing.
+        mgr.provider = .gguf
+        mgr.port = Int(ggufPort) ?? 8081
+        // Persist immediately so the router always resolves the right alias,
+        // even before the debounced autosave fires.
+        config.ggufModelPath = model.path
+        config.ggufModelAlias = model.suggestedAlias
+        print("[Settings] Selected GGUF model: \(model.name) (\(model.path))")
+    }
+
+    /// Scan the default locations for GGUF models.
+    private func scanGGUFModels() async {
+        ggufScanTask?.cancel()
+        ggufScanState = "Scanning…"
+        ggufModels = await Task.detached(priority: .userInitiated) {
+            GGUFModelScanner.scan()
+        }.value
+        ggufScanState = ggufModels.isEmpty ? "No GGUF models found in ~/Models, ~/Downloads, or /Volumes." : "Found \(ggufModels.count) model\(ggufModels.count == 1 ? "" : "s")."
+    }
+
+    /// Run the selected GGUF model through llama-server, then make it the
+    /// active routed provider so Claude Code routes through it immediately —
+    /// select a model, load it, ready to use (like Unsloth's model picker).
+    private func runGGUFModel() {
+        let mgr = LocalModelManager.shared
+        mgr.provider = .gguf
+        mgr.selectedGGUFPath = ggufModelPath
+        mgr.ggufModelAlias = ggufModelAlias
+        mgr.ggufGpuLayers = ggufGpuLayers
+        mgr.ggufContextSize = ggufContextSize
+        if let p = Int(ggufPort) { mgr.port = p }
+        // Set the routed provider/model so this model becomes active.
+        if provider != "gguf" {
+            provider = "gguf"
+        }
+        // Set the default model to the alias the server will report.
+        model = mgr.ggufModelAlias
+        Task {
+            await mgr.start()
+            await fetchTierModels(for: .defaultModel)
+            // After the server is up, make sure the model id matches what the
+            // server actually reports (the alias we registered).
+            if let first = tierLiveModels[TierKey.defaultModel.rawValue]?.first, !first.isEmpty {
+                setTierModel(.defaultModel, first)
+            }
+        }
+    }
+
+    /// Stop the GGUF llama-server.
+    private func stopGGUFModel() {
+        let mgr = LocalModelManager.shared
+        if mgr.provider == .gguf {
+            mgr.stop()
         }
     }
 
@@ -754,15 +1035,34 @@ struct SettingsView: View {
                 .font(.system(size: DesignToken.caption2Size))
                 .foregroundStyle(Color.dsTextTertiary)
 
-            Button {
-                showApiKeyGuide = true
-            } label: {
-                Label("Get a free API key — step-by-step", systemImage: "sparkles")
-                    .font(.system(size: DesignToken.captionSize, weight: .medium))
+            HStack(spacing: DesignToken.spacing12) {
+                Button {
+                    showApiKeyGuide = true
+                } label: {
+                    Label("Get a free API key — step-by-step", systemImage: "sparkles")
+                        .font(.system(size: DesignToken.captionSize, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.dsAccent)
+                .help("Open the step-by-step guide for free providers (OpenCode Zen, NVIDIA NIM)")
+
+                Button {
+                    detectKeysFromShellConfigs()
+                } label: {
+                    Label("Detect keys from ~/.zshrc", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: DesignToken.captionSize, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.dsAccent)
+                .help("Scan ~/.zshrc for exported API keys and import any that aren't saved yet")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.dsAccent)
-            .help("Open the step-by-step guide for free providers (OpenCode Zen, NVIDIA NIM)")
+
+            if let flash = shellImportFlash {
+                Text(flash)
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             keyField("Anthropic API Key", providerId: "direct", text: $anthropicKey)
             keyField("OpenAI API Key", providerId: "openai", text: $openaiKey)
@@ -780,42 +1080,117 @@ struct SettingsView: View {
             keyField("Cerebras API Key", providerId: "cerebras", text: $cerebrasKey)
             keyField("HuggingFace API Key", providerId: "huggingface", text: $huggingfaceKey)
             keyField("xAI Grok API Key", providerId: "xai", text: $xaiKey)
+            keyField("Antigravity API Key", providerId: "antigravity", text: $antigravityKey)
 
             Divider().padding(.vertical, DesignToken.spacing4)
 
-            sectionGroup("Endpoints") {
-                labeledField("OpenAI-Compatible Base URL", savedID: "openaiBaseUrl") {
-                    TextField("https://integrate.api.nvidia.com/v1", text: $openaiBaseUrl)
-                        .textFieldStyle(.roundedBorder)
+            // Gemini Web OAuth — no API key needed; authenticates via browser OAuth.
+            sectionGroup("Gemini Web (OAuth)") {
+                Text("Gemini Web OAuth uses Google's web-based PKCE flow — no API key needed. Click Authorize to open the Google consent screen.")
+                    .font(.system(size: DesignToken.captionSize))
+                    .foregroundStyle(Color.dsTextTertiary)
+                @ObservedObject var oauth = geminiOAuth
+                HStack(spacing: 8) {
+                    if geminiOAuth.isAuthorized {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.dsGreen)
+                        Text("Authorized")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsGreen)
+                    } else if geminiOAuth.isAuthorizing {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for Google consent…")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextTertiary)
+                    } else {
+                        verificationIndicator(providerChecks["gemini-oauth"] ?? .unknown)
+                    }
+
+                    if geminiOAuth.isAuthorized {
+                        Button("Sign Out") {
+                            geminiOAuth.signOut()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .font(.system(size: DesignToken.caption2Size))
+                    } else {
+                        Button("Authorize with Google") {
+                            Task { await geminiOAuth.authorize() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .disabled(geminiOAuth.isAuthorizing)
+                    }
+
+                    if provider == "gemini-oauth" {
+                        Text("Default")
+                            .font(.system(size: DesignToken.caption2Size, weight: .semibold))
+                            .foregroundStyle(Color.dsGreen)
+                    }
                 }
-                labeledField("Local LLM Base URL", savedID: "localBaseUrl") {
-                    TextField("http://127.0.0.1:11434/v1", text: $localBaseUrl)
-                        .textFieldStyle(.roundedBorder)
+                if let error = geminiOAuth.authError {
+                    Text(error)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsRed)
+                        .lineLimit(2)
                 }
-                labeledField("Local LLM Model", savedID: "localModel") {
-                    TextField("ollama/qwen", text: $localModel)
+
+                // Custom OAuth client ID — Google blocks the shared community
+                // client ID ("This app is blocked"). A client the user creates
+                // in their own Google Cloud project is never blocked.
+                labeledField("OAuth Client ID (optional)", caption: "Google blocks the bundled community client ID. Create your own Desktop-app OAuth client in Google Cloud Console and paste it here — your own client is never blocked.", savedID: "geminiOAuthClientId") {
+                    TextField("619142661668-….apps.googleusercontent.com", text: $geminiOAuthClientId)
                         .textFieldStyle(.roundedBorder)
+                        .font(.system(size: DesignToken.caption2Size, design: .monospaced))
+                        .onChange(of: geminiOAuthClientId) { _, newValue in
+                            GeminiOAuthManager.shared.setClientId(newValue)
+                        }
+                    HStack(spacing: 8) {
+                        Button("Open Google Cloud Console") {
+                            if let url = URL(string: "https://console.cloud.google.com/apis/credentials") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsAccent)
+                        .help("Open Cloud Console → APIs & Services → Credentials to create an OAuth client ID")
+
+                        Button("Reset to Default") {
+                            geminiOAuthClientId = ""
+                            GeminiOAuthManager.shared.setClientId("")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsRed)
+                        .help("Reset to the bundled community client ID (may be blocked by Google)")
+                    }
+                    Text("Steps: Create OAuth client ID → Desktop app → copy the client ID → paste above. The Generative Language API must be enabled in your Google Cloud project.")
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
                 }
             }
 
             Divider().padding(.vertical, DesignToken.spacing4)
 
-            sectionGroup("Provider Backend URLs") {
-                Text("Override the default API endpoint for any provider.")
+            sectionGroup("Default Fallback Endpoints") {
+                Text("Fallback endpoints used when routing through the built-in generic 'OpenAI' or 'Ollama (Local)' provider presets in the General tab. For other local runners (e.g. Llama.app on port 9931, LM Studio) or custom proxies, configure them in Custom Providers or Auto-Detected Local Providers below.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
-                ForEach(ProviderPreset.all.filter { $0.id != "local" && $0.id != "ollama" && $0.id != "lmstudio" && $0.id != "llamaapp" && $0.id != "custom" }) { preset in
-                    labeledField(preset.name) {
-                        TextField(
-                            preset.defaultUrl,
-                            text: Binding(
-                                get: { providerUrlOverrides[preset.id] ?? "" },
-                                set: { providerUrlOverrides[preset.id] = $0 }
-                            )
-                        )
+
+                labeledField("OpenAI Preset Base URL", caption: "Fallback endpoint for the generic OpenAI preset", savedID: "openaiBaseUrl") {
+                    TextField("https://api.openai.com/v1", text: $openaiBaseUrl)
                         .textFieldStyle(.roundedBorder)
-                        .font(.system(size: DesignToken.caption2Size, design: .monospaced))
-                    }
+                }
+                labeledField("Ollama Preset Base URL", caption: "Fallback endpoint for the generic Ollama preset", savedID: "localBaseUrl") {
+                    TextField("http://127.0.0.1:11434/v1", text: $localBaseUrl)
+                        .textFieldStyle(.roundedBorder)
+                }
+                labeledField("Ollama Preset Model", caption: "Default model identifier for the generic Ollama preset", savedID: "localModel") {
+                    TextField("ollama/qwen3:latest", text: $localModel)
+                        .textFieldStyle(.roundedBorder)
                 }
             }
 
@@ -897,15 +1272,260 @@ struct SettingsView: View {
                     Spacer()
                 }
             }
+
+            Divider().padding(.vertical, DesignToken.spacing4)
+
+            // Model Health Check — test all registered providers' models
+            sectionGroup("Model Health Check") {
+                Text("Test every model from your configured providers for connectivity. Results are sorted by response speed (fastest first).")
+                    .font(.system(size: DesignToken.captionSize))
+                    .foregroundStyle(Color.dsTextTertiary)
+
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await runModelHealthCheck() }
+                    } label: {
+                        Label(isRunningHealthCheck ? "Testing…" : "Test All Models",
+                              systemImage: isRunningHealthCheck ? "hourglass" : "bolt.circle.fill")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isRunningHealthCheck)
+
+                    if isRunningHealthCheck {
+                        ProgressView().controlSize(.small)
+                        Text(healthCheckProgress)
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextTertiary)
+                    } else if !modelHealthResults.isEmpty {
+                        Text("\(modelHealthResults.filter { $0.status == .healthy || $0.status == .rateLimited }.count)/\(modelHealthResults.count) healthy")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsGreen)
+                    }
+                    Spacer()
+                }
+
+                if !modelHealthResults.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(modelHealthResults) { result in
+                            modelHealthRow(result)
+                            if result.id != modelHealthResults.last?.id {
+                                Divider().overlay(Color.dsSeparator.opacity(0.5))
+                            }
+                        }
+                    }
+                    .background(Color.dsSurface)
+                    .clipShape(RoundedRectangle(cornerRadius: DesignToken.radiusCard))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DesignToken.radiusCard)
+                            .stroke(Color.dsBorder, lineWidth: 1)
+                    )
+                } else if !isRunningHealthCheck {
+                    Text("Click \"Test All Models\" to check connectivity for every configured provider.")
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+            }
         }
     }
 
-    // MARK: - Routing Tab
+    // MARK: - Model Health Check
+
+    /// Test every model from configured providers for connectivity.
+    /// Results are sorted by latency (fastest first).
+    private func runModelHealthCheck() async {
+        isRunningHealthCheck = true
+        modelHealthResults = []
+        healthCheckProgress = "Collecting models…"
+
+        // Gather all unique (provider, model) pairs from presets + live fetches.
+        var targets: [(pid: String, name: String, model: String)] = []
+        var seen = Set<String>()
+
+        for preset in ProviderPreset.all where preset.requiresKey || preset.id == "opencode-zen" || preset.id == "opencode-go" {
+            let key = apiKeyForProvider(preset.id)
+            if !preset.requiresKey || !key.isEmpty {
+                let base = config.baseUrl(for: preset.id)
+                guard !base.isEmpty else { continue }
+                for m in preset.models {
+                    let bare = ProviderPreset.bareModel(m, for: preset.id)
+                    let key2 = "\(preset.id)|\(bare)"
+                    if !seen.contains(key2) {
+                        seen.insert(key2)
+                        targets.append((preset.id, preset.name, bare))
+                    }
+                }
+            }
+        }
+        // Include custom providers
+        for def in customProviders {
+            let key = apiKeyForProvider(def.id)
+            guard !key.isEmpty || !config.baseUrl(for: def.id).isEmpty else { continue }
+            // Try to fetch models for custom providers
+            if let models = tierLiveModels["custom-\(def.id)"], !models.isEmpty {
+                for m in models {
+                    let bare = ProviderPreset.bareModel(m, for: def.id)
+                    let key2 = "\(def.id)|\(bare)"
+                    if !seen.contains(key2) {
+                        seen.insert(key2)
+                        targets.append((def.id, def.name, bare))
+                    }
+                }
+            }
+        }
+
+        guard !targets.isEmpty else {
+            isRunningHealthCheck = false
+            healthCheckProgress = ""
+            return
+        }
+
+        // Test each model concurrently (max 8 at a time to avoid hammering).
+        let semaphore = AsyncSemaphore(count: 8)
+        var results: [ModelHealthResult] = []
+        let resultsLock = NSLock()
+
+        // Snapshot the per-target auth data on the main actor BEFORE fanning
+        // out: apiKeyForProvider and config are MainActor-isolated and cannot
+        // be touched from the task-group closures (an error in the Swift 6
+        // language mode).
+        let authedTargets = targets.map { target -> (pid: String, name: String, model: String, key: String, base: String) in
+            (target.pid, target.name, target.model, apiKeyForProvider(target.pid), config.baseUrl(for: target.pid))
+        }
+
+        await withTaskGroup(of: ModelHealthResult?.self) { group in
+            for target in authedTargets {
+                group.addTask {
+                    await semaphore.wait()
+                    defer { semaphore.signal() }
+
+                    let pid = target.pid
+                    let key = target.key
+                    let base = target.base
+                    let startTime = Date()
+
+                    let check = await ProviderValidator.validateModel(
+                        providerId: pid,
+                        model: target.model,
+                        apiKey: key,
+                        baseUrl: base
+                    )
+                    let elapsed = Date().timeIntervalSince(startTime) * 1000
+
+                    await MainActor.run {
+                        healthCheckProgress = "Testing \(target.model)…"
+                    }
+
+                    return ModelHealthResult(
+                        providerId: pid,
+                        providerName: target.name,
+                        model: target.model,
+                        status: check.ok ? .healthy : (check.message.contains("429") ? .rateLimited : .unhealthy(check.message)),
+                        latencyMs: check.ok ? elapsed : nil,
+                        errorMessage: check.ok ? nil : check.message
+                    )
+                }
+            }
+            for await result in group {
+                if let result {
+                    // Scoped locking — raw lock()/unlock() is unavailable from
+                    // async contexts in the Swift 6 language mode.
+                    resultsLock.withLock {
+                        results.append(result)
+                    }
+                }
+            }
+        }
+
+        // Sort: healthy first (by latency), then rate-limited, then unhealthy.
+        modelHealthResults = results.sorted { a, b in
+            switch (a.status, b.status) {
+            case (.healthy, .healthy):
+                return (a.latencyMs ?? 99999) < (b.latencyMs ?? 99999)
+            case (.healthy, _):
+                return true
+            case (_, .healthy):
+                return false
+            case (.rateLimited, .unhealthy):
+                return true
+            case (.unhealthy, .rateLimited):
+                return false
+            default:
+                return a.model < b.model
+            }
+        }
+        isRunningHealthCheck = false
+        healthCheckProgress = ""
+    }
+
+    @ViewBuilder
+    private func modelHealthRow(_ result: ModelHealthResult) -> some View {
+        HStack(spacing: 8) {
+            // Status icon
+            switch result.status {
+            case .checking:
+                ProgressView().controlSize(.mini)
+            case .healthy:
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dsGreen)
+            case .unhealthy:
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dsRed)
+            case .rateLimited:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dsOrange)
+            }
+
+            // Provider name
+            Text(result.providerName)
+                .font(.system(size: DesignToken.caption2Size, weight: .medium))
+                .foregroundStyle(Color.dsTextSecondary)
+                .frame(width: 100, alignment: .leading)
+
+            // Model name
+            Text(result.model)
+                .font(.system(size: DesignToken.caption2Size, design: .monospaced))
+                .foregroundStyle(Color.dsTextPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer()
+
+            // Latency or error
+            switch result.status {
+            case .healthy:
+                if let ms = result.latencyMs {
+                    Text(String(format: "%.0fms", ms))
+                        .font(.system(size: DesignToken.caption2Size, design: .monospaced))
+                        .foregroundStyle(ms < 500 ? Color.dsGreen : (ms < 2000 ? Color.dsOrange : Color.dsRed))
+                }
+            case .rateLimited:
+                Text("Rate limited")
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsOrange)
+            case .unhealthy(let msg):
+                Text(msg)
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsRed)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(msg)
+            case .checking:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, DesignToken.spacing12)
+        .padding(.vertical, DesignToken.spacing6)
+    }
 
     private var routingTab: some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing20) {
             sectionGroup("App Routing Rules") {
-                Text("Choose which apps route through JXProxy. Drag .app files from Finder to add rules.")
+                Text("Choose which apps route through JXProxy. Drag .app files from Finder to add rules. \"Pass Through OpenAI\" lets an app (e.g. Codex) use the real OpenAI API even when Route OpenAI is on — other AI traffic from that app still routes.")
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextTertiary)
 
@@ -918,10 +1538,28 @@ struct SettingsView: View {
                     .padding(.vertical, DesignToken.spacing16)
                 } else {
                     VStack(spacing: 0) {
-                        ForEach($appRoutes) { $rule in
-                            AppRuleRow(rule: $rule, onDelete: {
-                                appRoutes.removeAll { $0.id == rule.id }
-                            })
+                        // Value-based rows (no ForEach($appRoutes) bindings):
+                        // mutations go through id lookups, so a delete can
+                        // never leave a dangling binding behind — that dangling
+                        // copy crashed the app (SIGSEGV in AppRuleRow during
+                        // view-graph updates).
+                        ForEach(appRoutes) { rule in
+                            AppRuleRow(
+                                rule: rule,
+                                onEnabledChange: { newValue in
+                                    if let idx = appRoutes.firstIndex(where: { $0.id == rule.id }) {
+                                        appRoutes[idx].enabled = newValue
+                                    }
+                                },
+                                onActionChange: { newValue in
+                                    if let idx = appRoutes.firstIndex(where: { $0.id == rule.id }) {
+                                        appRoutes[idx].action = newValue
+                                    }
+                                },
+                                onDelete: {
+                                    appRoutes.removeAll { $0.id == rule.id }
+                                }
+                            )
                             if rule.id != appRoutes.last?.id {
                                 Divider().overlay(Color.dsSeparator.opacity(0.5))
                             }
@@ -967,8 +1605,92 @@ struct SettingsView: View {
 
     // MARK: - System Tab
 
+    /// One selectable theme card: swatch strip + name, check-marked when
+    /// active. Tapping applies the theme app-wide immediately.
+    private func themeCard(_ theme: Theme) -> some View {
+        let isActive = ThemeController.shared.currentThemeId == theme.id
+        return Button {
+            ThemeController.shared.setTheme(theme)
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                // Swatch strip: background, surface, raised, accent, sky.
+                HStack(spacing: 3) {
+                    ForEach([theme.background, theme.surface, theme.surfaceRaised,
+                             theme.accent, theme.sky], id: \.light) { role in
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color(nsColor: role.dark))
+                            .frame(width: 16, height: 22)
+                    }
+                }
+                HStack(spacing: 4) {
+                    Text(theme.name)
+                        .font(.system(size: DesignToken.caption2Size, weight: .medium))
+                        .foregroundStyle(Color.dsTextPrimary)
+                    if isActive {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.dsAccent)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(width: 118, alignment: .leading)
+            .background(isActive ? Color.dsAccentDim : Color.dsSurface)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isActive ? Color.dsAccent : Color.dsBorder, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Apply the \(theme.name) theme")
+    }
+
     private var systemTab: some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing20) {
+            // Theme & Appearance controls
+            sectionGroup("Theme & Appearance") {
+                VStack(alignment: .leading, spacing: DesignToken.spacing12) {
+                    // Appearance Mode (Light / Dark / System)
+                    HStack(spacing: DesignToken.spacing12) {
+                        Text("Appearance")
+                            .font(.system(size: DesignToken.subheadSize, weight: .medium))
+                            .foregroundStyle(Color.dsTextPrimary)
+
+                        Picker("", selection: Binding(
+                            get: { AppearanceController.shared.mode },
+                            set: { AppearanceController.shared.mode = $0 }
+                        )) {
+                            Text("System").tag(AppearanceMode.system)
+                            Text("Light").tag(AppearanceMode.light)
+                            Text("Dark").tag(AppearanceMode.dark)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 220)
+
+                        Spacer()
+                    }
+
+                    // Theme palette cards
+                    VStack(alignment: .leading, spacing: DesignToken.spacing6) {
+                        Text("Color Palette")
+                            .font(.system(size: DesignToken.captionSize, weight: .medium))
+                            .foregroundStyle(Color.dsTextSecondary)
+
+                        HStack(spacing: DesignToken.spacing8) {
+                            ForEach(Theme.all) { theme in
+                                themeCard(theme)
+                            }
+                            Spacer()
+                        }
+                    }
+
+                    Text("Themes customize the semantic palette (JX Default or Opcode Dark/Light). Appearance toggles Light/Dark mode. Changes apply immediately across all windows.")
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+            }
+
             sectionGroup("System Proxy") {
                 HStack(spacing: 8) {
                     Toggle(isOn: $enableSystemProxy) {
@@ -1005,6 +1727,21 @@ struct SettingsView: View {
                         }
                     }
                 }
+
+                HStack(spacing: 8) {
+                    Toggle(isOn: $routeOpenAI) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Route OpenAI connections")
+                                .font(.system(size: DesignToken.bodySize))
+                            Text("Intercept api.openai.com (Codex, OpenAI SDK clients) and route it through your configured providers. Turn off to let OpenAI traffic pass through unmodified — Claude (Anthropic) routing is unaffected.")
+                                .font(.system(size: DesignToken.caption2Size))
+                                .foregroundStyle(Color.dsTextTertiary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    savedFieldCheckmark("routeOpenAI")
+                }
+                .onChange(of: routeOpenAI) { _, _ in scheduleAutoSave() }
 
                 Text("Routes every app's HTTP/HTTPS traffic through JXProxy. Anthropic (api.anthropic.com) and OpenAI (api.openai.com) connections are routed through your configured providers — every other request passes through unmodified. Claude Code is routed automatically via its settings and doesn't need this. HTTPS interception requires trusting the JXProxy CA (menu-bar icon → Security → Install CA Certificate).")
                     .font(.system(size: DesignToken.captionSize))
@@ -1212,29 +1949,61 @@ struct SettingsView: View {
 
     // MARK: - Helpers
 
-    /// Composite hash of all editable settings – observed to detect unsaved changes.
-    private var settingsHash: String {
-        let urlOverridesStr = providerUrlOverrides.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: ",")
-        let tierProvidersStr = tierProviders.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: ",")
-        let appRoutesStr = appRoutes.map { "\($0.bundleIdentifier ?? "")|\($0.appName)" }.joined(separator: ",")
-        let customProvidersStr = customProviders
+    /// Composite hash of all editable settings – observed to detect unsaved
+    /// changes. Implemented with `Hasher` (not string concatenation) so the
+    /// per-keystroke recompute during body evaluation stays cheap — the old
+    /// string-building version ran on every render and contributed to the
+    /// interaction lag.
+    private var settingsHash: Int {
+        var hasher = Hasher()
+        hasher.combine(port)
+        hasher.combine(authToken)
+        hasher.combine(model)
+        hasher.combine(enableThinking)
+        hasher.combine(reasoningPolicies.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value.rawValue)" })
+        hasher.combine(provider)
+        hasher.combine(fallbackProviders)
+        hasher.combine(tierProviders.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" })
+        hasher.combine(modelOpus)
+        hasher.combine(modelSonnet)
+        hasher.combine(modelHaiku)
+        hasher.combine(openaiBaseUrl)
+        hasher.combine(localBaseUrl)
+        hasher.combine(localModel)
+        hasher.combine(ggufModelPath)
+        hasher.combine(ggufModelAlias)
+        hasher.combine(ggufGpuLayers)
+        hasher.combine(ggufContextSize)
+        hasher.combine(ggufPort)
+        hasher.combine(providerUrlOverrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" })
+        hasher.combine(enableSystemProxy)
+        hasher.combine(appRoutes.map { "\($0.bundleIdentifier ?? "")|\($0.appName)|\($0.enabled)" })
+        hasher.combine(anthropicKey)
+        hasher.combine(openaiKey)
+        hasher.combine(openrouterKey)
+        hasher.combine(opencodeKey)
+        hasher.combine(nvidiaKey)
+        hasher.combine(deepseekKey)
+        hasher.combine(geminiKey)
+        hasher.combine(mistralKey)
+        hasher.combine(codestralKey)
+        hasher.combine(cohereKey)
+        hasher.combine(groqKey)
+        hasher.combine(fireworksKey)
+        hasher.combine(sambanovaKey)
+        hasher.combine(cerebrasKey)
+        hasher.combine(huggingfaceKey)
+        hasher.combine(xaiKey)
+        hasher.combine(antigravityKey)
+        hasher.combine(customUrl)
+        hasher.combine(customKey)
+        hasher.combine(customProviders
             .sorted(by: { $0.id < $1.id })
-            .map { "\($0.id)|\($0.name)|\($0.baseUrl)|\(customProviderKeys[$0.id] ?? "")" }
-            .joined(separator: ",")
-        return [
-            port, authToken, model, String(enableThinking), reasoningPolicies.map { "\($0.key)=\($0.value.rawValue)" }.sorted().joined(separator: ","),
-            provider, fallbackProviders, tierProvidersStr,
-            modelOpus, modelSonnet, modelHaiku,
-            openaiBaseUrl, localBaseUrl, localModel,
-            urlOverridesStr,
-            String(enableSystemProxy), appRoutesStr,
-            anthropicKey, openaiKey, openrouterKey, opencodeKey, nvidiaKey,
-            deepseekKey, geminiKey, mistralKey, codestralKey, cohereKey,
-            groqKey, fireworksKey, sambanovaKey, cerebrasKey, huggingfaceKey, xaiKey,
-            customUrl, customKey,
-            customProvidersStr,
-            String(botIntegrationEnabled), telegramBotToken
-        ].joined(separator: "\u{1F}")
+            .map { "\($0.id)|\($0.name)|\($0.baseUrl)|\(customProviderKeys[$0.id] ?? "")" })
+        hasher.combine(botIntegrationEnabled)
+        hasher.combine(telegramBotToken)
+        hasher.combine(routeOpenAI)
+        return hasher.finalize()
     }
 
     private func loadFromConfig() {
@@ -1261,6 +2030,11 @@ struct SettingsView: View {
         openaiBaseUrl = config.openaiBaseUrl
         localBaseUrl = config.localLlmBaseUrl
         localModel = config.localLlmModel
+        ggufModelPath = config.ggufModelPath
+        ggufModelAlias = config.ggufModelAlias
+        ggufGpuLayers = config.ggufGpuLayers
+        ggufContextSize = config.ggufContextSize
+        ggufPort = String(config.ggufPort)
         customUrl = config.baseUrl(for: "custom")
         customKey = config.apiKey(for: "custom")
         customProviders = config.customProviders
@@ -1278,6 +2052,22 @@ struct SettingsView: View {
             customProviderKeys["custom"] = customKey
         }
         providerUrlOverrides = config.providerBackendUrls
+        reloadApiKeysFromConfig()
+        enableSystemProxy = manager.systemProxyEnabled
+        routeOpenAI = config.routeOpenAI
+        webControlEnabled = config.webControlEnabled
+        webControlPort = String(config.webControlPort)
+        botIntegrationEnabled = config.botIntegrationEnabled
+        telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
+        geminiOAuthClientId = UserDefaults.standard.string(forKey: GeminiOAuthManager.clientIdDefaultsKey) ?? ""
+        loadAppRoutesFromConfig()
+    }
+
+    /// Reload only the API-key fields from the Keychain (shell-config imports
+    /// land there). Shared by `loadFromConfig()`, the live ~/.zshrc watcher,
+    /// and the "Detect keys from ~/.zshrc" button — so a key detected while
+    /// the panel is open appears in its field immediately.
+    private func reloadApiKeysFromConfig() {
         anthropicKey = config.apiKey(for: "direct")
         openaiKey = config.apiKey(for: "openai")
         openrouterKey = config.apiKey(for: "openrouter")
@@ -1294,12 +2084,38 @@ struct SettingsView: View {
         cerebrasKey = config.apiKey(for: "cerebras")
         huggingfaceKey = config.apiKey(for: "huggingface")
         xaiKey = config.apiKey(for: "xai")
-        enableSystemProxy = manager.systemProxyEnabled
-        webControlEnabled = config.webControlEnabled
-        webControlPort = String(config.webControlPort)
-        botIntegrationEnabled = config.botIntegrationEnabled
-        telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
-        loadAppRoutesFromConfig()
+        antigravityKey = config.apiKey(for: "antigravity")
+        customKey = config.apiKey(for: "custom")
+        customProviderKeys = [:]
+        for def in customProviders {
+            customProviderKeys[def.id] = config.apiKey(for: def.id)
+        }
+        // The reloaded fields now match the persisted state — don't flash a
+        // spurious checkmark (or trigger a redundant auto-save) for them.
+        lastSavedValues = currentFieldValues()
+    }
+
+    /// "Detect keys from ~/.zshrc" — re-scan the shell configs and show what
+    /// was imported (or that everything was already saved).
+    private func detectKeysFromShellConfigs() {
+        let imported = config.importKeysFromShellConfigs()
+        reloadApiKeysFromConfig()
+        if imported.isEmpty {
+            flashShellImport("No new keys found in ~/.zshrc — everything you have is already saved.")
+        } else {
+            flashShellImport("Imported from ~/.zshrc: \(imported.joined(separator: ", "))")
+        }
+    }
+
+    /// Show a transient detection-feedback message under the provider buttons.
+    private func flashShellImport(_ message: String) {
+        shellImportFlashTask?.cancel()
+        shellImportFlash = message
+        shellImportFlashTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            shellImportFlash = nil
+        }
     }
 
     private func loadAppRoutesFromConfig() {
@@ -1337,6 +2153,11 @@ struct SettingsView: View {
         config.openaiBaseUrl = openaiBaseUrl
         config.localLlmBaseUrl = localBaseUrl
         config.localLlmModel = localModel
+        config.ggufModelPath = ggufModelPath
+        config.ggufModelAlias = ggufModelAlias
+        config.ggufGpuLayers = ggufGpuLayers
+        config.ggufContextSize = ggufContextSize
+        if let ggufPortVal = Int(ggufPort) { config.ggufPort = ggufPortVal }
         // Custom provider: endpoint + key (persisted, auto-fetchable).
         var overrides = providerUrlOverrides.filter { !$0.value.isEmpty }
         if !customUrl.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -1353,29 +2174,64 @@ struct SettingsView: View {
             config.removeCustomProvider(id: def.id)
         }
 
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.anthropic, value: anthropicKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.openai, value: openaiKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.openrouter, value: openrouterKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.opencode, value: opencodeKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.nvidia, value: nvidiaKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.deepseek, value: deepseekKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.gemini, value: geminiKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.mistral, value: mistralKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.codestral, value: codestralKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.cohere, value: cohereKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.groq, value: groqKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.fireworks, value: fireworksKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.sambanova, value: sambanovaKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.cerebras, value: cerebrasKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.huggingface, value: huggingfaceKey)
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.xai, value: xaiKey)
+        // API keys are written ONLY when their value actually changed since the
+        // last save. Every `setApiKey` is a blocking Keychain round-trip (up to
+        // 3s each when the Keychain daemon stalls), so writing all ~40 keys on
+        // every debounced save — i.e. every keystroke — was the interaction
+        // lag: each edit triggered a full Keychain write storm on the main
+        // actor. The diff keeps the autosave fast while staying exact.
+        let current = currentFieldValues()
+        let keyWrites: [(field: String, chainKey: String)] = [
+            ("key:direct", ConfigManager.KeychainKey.anthropic),
+            ("key:openai", ConfigManager.KeychainKey.openai),
+            ("key:openrouter", ConfigManager.KeychainKey.openrouter),
+            ("key:opencode-zen", ConfigManager.KeychainKey.opencode),
+            ("key:nvidia-nim", ConfigManager.KeychainKey.nvidia),
+            ("key:deepseek", ConfigManager.KeychainKey.deepseek),
+            ("key:gemini", ConfigManager.KeychainKey.gemini),
+            ("key:mistral", ConfigManager.KeychainKey.mistral),
+            ("key:codestral", ConfigManager.KeychainKey.codestral),
+            ("key:cohere", ConfigManager.KeychainKey.cohere),
+            ("key:groq", ConfigManager.KeychainKey.groq),
+            ("key:fireworks", ConfigManager.KeychainKey.fireworks),
+            ("key:sambanova", ConfigManager.KeychainKey.sambanova),
+            ("key:cerebras", ConfigManager.KeychainKey.cerebras),
+            ("key:huggingface", ConfigManager.KeychainKey.huggingface),
+            ("key:xai", ConfigManager.KeychainKey.xai),
+            ("key:antigravity", ConfigManager.KeychainKey.antigravity),
+        ]
+        for write in keyWrites {
+            let value = current[write.field] ?? ""
+            if lastSavedValues[write.field] != value {
+                config.setApiKey(chainKey: write.chainKey, value: value)
+            }
+        }
+        if lastSavedValues["customKey"] != customKey {
+            config.setApiKey(chainKey: ConfigManager.KeychainKey.custom, value: customKey)
+        }
+        for def in customProviders {
+            let value = customProviderKeys[def.id] ?? ""
+            let field = "customProvider:\(def.id)"
+            if lastSavedValues[field] != "\(def.name)|\(def.baseUrl)|\(value)" {
+                config.setApiKey(chainKey: ConfigManager.customProviderKey(def.id), value: value)
+            }
+        }
         config.botIntegrationEnabled = botIntegrationEnabled
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken, value: telegramBotToken)
+        if botIntegrationEnabled {
+            config.setApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken, value: telegramBotToken)
+        }
+        config.routeOpenAI = routeOpenAI
         config.webControlEnabled = webControlEnabled
         if let webPort = Int(webControlPort) { config.webControlPort = webPort }
 
         saveAppRoutesToConfig()
-        manager.loadAllFromConfig()
+        // Lightweight sync only: `manager.loadAllFromConfig()` re-reads EVERY
+        // provider key from the Keychain and rebuilds the providers array,
+        // whose didSet triggers another debounced flushSave (another ~40
+        // Keychain writes) — the full chain ran on every auto-save. The
+        // settings just written are already in ConfigManager, so syncing the
+        // proxy's port/auth/config caches is sufficient and fast.
+        manager.syncFromConfig()
         manager.applyWebControl()
     }
 
@@ -1385,9 +2241,12 @@ struct SettingsView: View {
     /// replacing the old Save button's post-save verification.
     private func scheduleAutoSave() {
         autoSaveTask?.cancel()
+        let snapshotGeneration = saveGeneration
         autoSaveTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard !Task.isCancelled else { return }
+            // Skip this save if a newer edit arrived while the debounce was sleeping.
+            guard saveGeneration == snapshotGeneration else { return }
             saveConfig()
             // Per-field checkmarks: diff current values against the last saved
             // snapshot, so only the fields that actually changed get a ✓.
@@ -1420,9 +2279,6 @@ struct SettingsView: View {
                 if !apiKeyForProvider(provider).isEmpty {
                     await verifyProviderKey(provider)
                 }
-                if !model.isEmpty {
-                    await verifyDefaultModel()
-                }
             }
         }
     }
@@ -1441,21 +2297,25 @@ struct SettingsView: View {
         values["openaiBaseUrl"] = openaiBaseUrl
         values["localBaseUrl"] = localBaseUrl
         values["localModel"] = localModel
+        values["ggufModelPath"] = ggufModelPath
+        values["ggufModelAlias"] = ggufModelAlias
+        values["ggufGpuLayers"] = String(ggufGpuLayers)
+        values["ggufContextSize"] = String(ggufContextSize)
+        values["ggufPort"] = ggufPort
         values["customUrl"] = customUrl
         values["customKey"] = customKey
         values["enableSystemProxy"] = String(enableSystemProxy)
+        values["routeOpenAI"] = String(routeOpenAI)
         values["webControlEnabled"] = String(webControlEnabled)
         values["webControlPort"] = webControlPort
         values["botIntegration"] = String(botIntegrationEnabled)
         values["appRoutes"] = appRoutes.map { "\($0.bundleIdentifier ?? "")\($0.appName)\($0.enabled)" }.joined(separator: ",")
         // API keys — one id per provider.
-        for (pid, key) in [
-            ("direct", anthropicKey), ("openai", openaiKey), ("openrouter", openrouterKey),
+        for (pid, key) in [            ("direct", anthropicKey), ("openai", openaiKey), ("openrouter", openrouterKey),
             ("opencode-zen", opencodeKey), ("nvidia-nim", nvidiaKey), ("deepseek", deepseekKey),
             ("gemini", geminiKey), ("mistral", mistralKey), ("codestral", codestralKey),
             ("cohere", cohereKey), ("groq", groqKey), ("fireworks", fireworksKey),
-            ("sambanova", sambanovaKey), ("cerebras", cerebrasKey), ("huggingface", huggingfaceKey),
-            ("xai", xaiKey), ("custom", customKey),
+            ("sambanova", sambanovaKey), ("cerebras", cerebrasKey), ("huggingface", huggingfaceKey), ("xai", xaiKey), ("antigravity", antigravityKey), ("custom", customKey),
         ] {
             values["key:\(pid)"] = key
         }
@@ -1489,9 +2349,10 @@ struct SettingsView: View {
         enableThinking = true
         reasoningPolicies = [:]
         provider = "opencode-zen"
-        fallbackProviders = "nvidia,local"
+        fallbackProviders = ""
         tierProviders = [:]
         tierLiveModels = [:]
+        tierFetchStates = [:]
         // Model defaults are populated from the provider preset when one is selected
         model = providerPreset(provider)?.models.first ?? ""
         modelOpus = ""
@@ -1500,6 +2361,11 @@ struct SettingsView: View {
         openaiBaseUrl = "https://api.openai.com/v1"
         localBaseUrl = "http://127.0.0.1:11434/v1"
         localModel = "ollama/qwen3:latest"
+        ggufModelPath = ""
+        ggufModelAlias = "local-model"
+        ggufGpuLayers = 0
+        ggufContextSize = 0
+        ggufPort = "8081"
         customUrl = ""
         customKey = ""
         customProviders = []
@@ -1524,7 +2390,9 @@ struct SettingsView: View {
         cerebrasKey = ""
         huggingfaceKey = ""
         xaiKey = ""
+        antigravityKey = ""
         enableSystemProxy = false
+        routeOpenAI = true
         appRoutes = []
         webControlEnabled = false
         webControlPort = "5355"
@@ -1631,7 +2499,7 @@ struct SettingsView: View {
         case .ready:
             Task {
                 await mgr.start()
-                await fetchLiveModels()
+                await fetchTierModels(for: .defaultModel)
             }
         }
     }
@@ -1720,7 +2588,7 @@ struct SettingsView: View {
     /// Providers whose local server JXProxy can launch in the background.
     /// (LM Studio runs itself, so it is excluded.)
     private var isLocalAutoProvider: Bool {
-        provider == "ollama" || provider == "llamaapp"
+        provider == "ollama" || provider == "llamaapp" || provider == "gguf"
     }
 
     private var localModelQuickControl: some View {
@@ -1851,6 +2719,11 @@ struct SettingsView: View {
                 .frame(height: 22)
                 savedFieldCheckmark("model:\(tier.rawValue)")
             }
+            // Live feedback for the auto-fetch: spinner while in flight, a
+            // failure reason + Retry when the provider can't be reached, and a
+            // short confirmation once models land — the dropdown never looks
+            // silently broken.
+            modelFetchStatus(for: tier, providerId: pid)
         }
         .padding(10)
         .background(Color.dsSurface)
@@ -1859,6 +2732,50 @@ struct SettingsView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.dsBorder, lineWidth: 1)
         )
+    }
+
+    /// Live feedback for a tier's model-list auto-fetch: a spinner while the
+    /// request is in flight, a failure reason + Retry when the provider can't
+    /// be reached, and a short confirmation caption once models have landed.
+    @ViewBuilder
+    private func modelFetchStatus(for tier: TierKey, providerId: String) -> some View {
+        switch tierFetchStates[tier.rawValue] ?? .idle {
+        case .idle:
+            EmptyView()
+        case .fetching:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("Fetching models…")
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextTertiary)
+            }
+        case .failed(let reason):
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dsOrange)
+                Text(reason)
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(reason)
+                Button("Retry") {
+                    Task { await fetchTierModels(for: tier) }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: DesignToken.caption2Size))
+                .foregroundStyle(Color.dsAccent)
+                .accessibilityLabel("Retry fetching models for \(tier.displayName)")
+            }
+        case .loaded:
+            if let models = tierLiveModels[tier.rawValue], !models.isEmpty {
+                Text("\(models.count) model\(models.count == 1 ? "" : "s") auto-fetched from \(providerPreset(providerId)?.name ?? providerId)")
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextTertiary)
+            }
+        }
     }
 
     // MARK: - Custom Providers (named OpenAI-compatible endpoints)
@@ -1883,9 +2800,9 @@ struct SettingsView: View {
         newCustomName = ""
         newCustomUrl = ""
         newCustomKey = ""
-        // Immediately select it as the Default provider and fetch its models.
+        // Immediately select it as the Default provider — onChange(of: provider)
+        // syncs the Default tier's model and auto-fetches its model list.
         provider = id
-        Task { await fetchLiveModels(for: id) }
     }
 
     /// A saved custom provider row: name, endpoint, key field, verify + delete.
@@ -1928,12 +2845,27 @@ struct SettingsView: View {
                 .foregroundStyle(Color.dsTextSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if (customProviderKeys[def.id] ?? "").isEmpty,
+               let source = config.inheritedKeySource(for: def.baseUrl) {
+                HStack(spacing: 4) {
+                    Image(systemName: "link.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.dsAccent)
+                    Text("Using \(providerPreset(source)?.name ?? source)'s API key — same endpoint")
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextSecondary)
+                }
+                .help("This custom provider points at the same endpoint as \(providerPreset(source)?.name ?? source); its verified API key is used automatically.")
+            }
             HStack(spacing: DesignToken.spacing6) {
                 SecureField("••••••••", text: Binding(
                     get: { customProviderKeys[def.id] ?? "" },
                     set: { customProviderKeys[def.id] = $0 }
                 ))
                 .textFieldStyle(.roundedBorder)
+                .onChange(of: customProviderKeys[def.id] ?? "") {
+                    providerChecks[def.id] = .unknown
+                }
                 Button("Verify") {
                     Task { await verifyProviderKey(def.id) }
                 }
@@ -1994,26 +2926,67 @@ struct SettingsView: View {
         }
     }
 
-    /// Set a tier's provider, auto-populate its model, and autofetch its
-    /// model list immediately. Each pair is independent.
+    /// Set a tier's provider, keep its model in sync, and autofetch its model
+    /// list immediately. Each pair is independent.
     ///
-    /// A user-chosen model is NEVER overwritten: only when the tier has no
-    /// model yet is the provider's first preset auto-populated. Previously a
-    /// non-empty model that wasn't in the new provider's preset list was
-    /// clobbered with the first preset ("big-pickle" for OpenCode Zen), which
-    /// looked like the model "reverting" after saving.
+    /// The Default tier follows the primary provider: changing it goes through
+    /// `provider`, whose onChange handler runs the same sync+fetch for the
+    /// Default pair — so the model dropdown always reflects the provider the
+    /// user just picked.
     private func setTierProvider(_ tier: TierKey, _ pid: String) {
         if tier == .defaultModel {
             provider = pid
         } else {
             tierProviders[tier.rawValue] = pid
+            syncTierToProvider(tier, pid)
         }
+    }
+
+    /// Re-sync a tier after its provider changes: drop the previous provider's
+    /// cached models, reselect the model when it no longer belongs to the new
+    /// provider, and auto-fetch the new provider's list.
+    private func syncTierToProvider(_ tier: TierKey, _ pid: String) {
         tierLiveModels[tier.rawValue] = []
-        if tierModelValue(tier).isEmpty,
-           let preset = providerPreset(pid) {
-            setTierModel(tier, ProviderPreset.bareModel(preset.models.first ?? "", for: pid))
-        }
+        tierFetchStates[tier.rawValue] = .idle
+        // A different provider means the previous test result is meaningless —
+        // clear it so the row shows "Not tested" instead of the old provider's
+        // stale error until the user re-runs Test All Models.
+        tierModelChecks[tier.rawValue] = .unknown
+        sanitizeTierModel(for: tier)
         Task { await fetchTierModels(for: tier) }
+    }
+
+    /// Keep the tier's model aligned with its provider. The model is only
+    /// replaced when it is clearly stale: an empty selection picks the
+    /// provider's first preset, and a model that belongs to a *different*
+    /// provider's preset list is swapped for the new provider's first preset.
+    /// Anything else (e.g. a custom model id the user typed) is preserved.
+    private func sanitizeTierModel(for tier: TierKey) {
+        let pid = tierProviderId(for: tier)
+        let current = tierModelValue(tier)
+        guard !current.isEmpty else {
+            if let preset = providerPreset(pid), let first = preset.models.first {
+                setTierModel(tier, ProviderPreset.bareModel(first, for: pid))
+            }
+            return
+        }
+        let options = tierModelOptions(for: tier)
+        if !options.contains(ProviderPreset.bareModel(current, for: pid)),
+           modelBelongsToAnotherProvider(current, excluding: pid),
+           let preset = providerPreset(pid),
+           let first = preset.models.first {
+            setTierModel(tier, ProviderPreset.bareModel(first, for: pid))
+        }
+    }
+
+    /// True when the model id (stripped of its own routing prefix) matches a
+    /// preset of any provider other than `pid` — i.e. a leftover from a
+    /// previous provider selection, not a custom id the user typed.
+    private func modelBelongsToAnotherProvider(_ model: String, excluding pid: String) -> Bool {
+        let bare = ProviderPreset.bareModel(model, for: pid)
+        return ProviderPreset.all.contains { other in
+            other.id != pid && other.models.contains { ProviderPreset.bareModel($0, for: other.id) == bare }
+        }
     }
 
     private func tierModelBinding(_ tier: TierKey) -> Binding<String> {
@@ -2048,47 +3021,369 @@ struct SettingsView: View {
         for m in tierLiveModels[tier.rawValue] ?? [] {
             models.insert(ProviderPreset.bareModel(m, for: pid))
         }
+        // The app-wide auto-fetch results — the provider's full live list
+        // (free tier included) — merge in here too.
+        for m in providerLiveModels[pid] ?? [] {
+            models.insert(ProviderPreset.bareModel(m, for: pid))
+        }
         return Array(models).sorted()
     }
 
     /// Fetch available models from a tier's provider and cache them locally.
+    /// Drives the per-tier fetch state so the dropdown shows a spinner, a
+    /// failure reason + Retry, or a model count instead of failing silently.
     private func fetchTierModels(for tier: TierKey) async {
         let pid = tierProviderId(for: tier)
-        var baseUrl = config.baseUrl(for: pid).replacingOccurrences(of: "/v1", with: "")
+        var baseUrl = config.baseUrl(for: pid)
         if pid == "llamaapp" {
-            let mgr = LocalModelManager.shared
-            if mgr.port != 8080 { baseUrl = "http://\(mgr.host):\(mgr.port)" }
+            // llama.app's server port is NOT stable — it rebinds to a free
+            // port after relaunches (observed moving 8080 → 9931). Always use
+            // the LIVE port discovered from the running `llama serve` process;
+            // the hardcoded 8080 fallback silently broke model detection
+            // whenever llama.app picked a different port.
+            let livePort = LocalServerDiscovery.liveLlamaPort()
+            baseUrl = "http://127.0.0.1:\(livePort)"
         }
-        guard let url = URL(string: "\(baseUrl)/v1/models") else { return }
+        // Only a TRAILING "/v1" marks the API root. A contains-replace would
+        // mangle endpoints whose path merely contains "/v1" (Gemini's
+        // "/v1beta" → "/beta"), producing a dead URL. Strip exactly one
+        // trailing "/v1"; the root is re-appended below.
+        if baseUrl.hasSuffix("/v1") { baseUrl = String(baseUrl.dropLast(3)) }
+        guard let url = URL(string: baseUrl + "/v1/models") else {
+            tierFetchStates[tier.rawValue] = .failed("Invalid endpoint \(baseUrl)")
+            return
+        }
+        tierFetchStates[tier.rawValue] = .fetching
         do {
             var req = URLRequest(url: url)
-            req.timeoutInterval = 5
-            // Reactive @State key (same reasoning as fetchLiveModels) so a
+            req.timeoutInterval = 12
+            // Reactive @State key (same reasoning as the provider verify) so a
             // freshly typed key authenticates the models request immediately.
             let key = apiKeyForProvider(pid)
             if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-            let (data, _) = try await URLSession.shared.data(for: req)
+            // Use a URLSession that ignores cache so fresh fetches always land.
+            let (data, _) = try await URLSession(configuration: .ephemeral).data(for: req)
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let modelList = json["data"] as? [[String: Any]] else { return }
-            let names = modelList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
-            if !names.isEmpty {
+                  let modelList = json["data"] as? [[String: Any]] else {
                 await MainActor.run {
-                    tierLiveModels[tier.rawValue] = names
-                    if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
-                        manager.providers[idx].visibleModelIds.formUnion(names)
-                    }
-                    // Auto-populate an empty tier model from the first live
-                    // model — custom/local providers (e.g. llama.app) expose
-                    // their models only via this fetch, so a freshly selected
-                    // provider would otherwise sit at "No model selected".
-                    if tierModelValue(tier).isEmpty {
-                        setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
-                    }
+                    // The endpoint answered but with an unreadable body (e.g. a
+                    // plain-text 401 from a gateway) — surface it, don't stall.
+                    guard tierProviderId(for: tier) == pid else { return }
+                    tierFetchStates[tier.rawValue] = .failed("Provider returned no model list")
+                }
+                return
+            }
+            let names = modelList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
+            await MainActor.run {
+                // Only apply when the tier is still on this provider — a quick
+                // provider switch must never be clobbered by a slow response
+                // from the previous one.
+                guard tierProviderId(for: tier) == pid else { return }
+                guard !names.isEmpty else {
+                    tierFetchStates[tier.rawValue] = .failed("No models returned")
+                    return
+                }
+                tierLiveModels[tier.rawValue] = names
+                tierFetchStates[tier.rawValue] = .loaded
+                if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
+                    manager.providers[idx].visibleModelIds.formUnion(names)
+                }
+                // Auto-populate an empty tier model from the first live model —
+                // custom/local providers (e.g. llama.app) expose their models
+                // only via this fetch, so a freshly selected provider would
+                // otherwise sit at "No model selected".
+                let current = tierModelValue(tier)
+                if current.isEmpty {
+                    setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
+                } else if !tierModelOptions(for: tier).contains(ProviderPreset.bareModel(current, for: pid)),
+                          modelBelongsToAnotherProvider(current, excluding: pid) {
+                    // Stale model from a different provider — adopt the first
+                    // fetched model so the pair stays consistent.
+                    setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
                 }
             }
         } catch {
+            await MainActor.run {
+                guard tierProviderId(for: tier) == pid else { return }
+                tierLiveModels[tier.rawValue] = []
+                tierFetchStates[tier.rawValue] = .failed(fetchFailureText(error, baseUrl: baseUrl))
+            }
             print("[SettingsView] Failed to fetch tier models from \(url): \(error)")
         }
+    }
+
+    /// Human-readable reason for a failed model fetch — local endpoints get a
+    /// "is the server running?" hint, everything else shows the error.
+    private func fetchFailureText(_ error: Error, baseUrl: String) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost,
+                 .timedOut, .notConnectedToInternet:
+                let host = URL(string: baseUrl)?.host ?? baseUrl
+                return "Couldn't reach \(host) — is the server running?"
+            default:
+                return urlError.localizedDescription
+            }
+        }
+        return error.localizedDescription
+    }
+
+    // MARK: - App-Wide Provider Model Auto-Fetch (free tier included)
+
+    /// Fetch EVERY remote provider's live model list once and union the FREE
+    /// models into that provider's visible set. This auto-selects "all the
+    /// free tier models" per provider:
+    /// - OpenRouter / OpenCode Zen serve their catalogs PUBLICLY (no key) —
+    ///   fetched even before the user pastes a key.
+    /// - Providers with per-model pricing (OpenRouter: `pricing == 0`;
+    ///   OpenCode: `-free` suffix) get ONLY their free models.
+    /// - Providers whose whole catalog is free (Groq, Cerebras, SambaNova —
+    ///   rate-limited free usage) get the full live list.
+    private func fetchAllProviderModels() async {
+        guard !isFetchingAllProviderModels else { return }
+        isFetchingAllProviderModels = true
+        defer { isFetchingAllProviderModels = false }
+
+        // Every remote provider that can serve a free tier — iterated over ALL
+        // presets (not just availableProviders, which drops keyed presets when
+        // no key is set): a provider is a target when it has a key, OR its
+        // /models endpoint is public (OpenRouter/OpenCode free catalogs are
+        // fetchable keylessly).
+        let targets = ProviderPreset.all.filter { preset in
+            guard ProviderFreeTier.hasFreeTier(providerId: preset.id) else { return false }
+            if ProviderFreeTier.publicModelsEndpoints.contains(preset.id) { return true }
+            return !apiKeyForProvider(preset.id).isEmpty
+        }
+
+        await withTaskGroup(of: (String, [String]).self) { group in
+            for preset in targets {
+                group.addTask {
+                    (preset.id, await self.fetchProviderModelList(preset))
+                }
+            }
+            var results: [String: [String]] = [:]
+            for await (pid, models) in group where !models.isEmpty {
+                results[pid] = models
+            }
+            guard !results.isEmpty else { return }
+            await MainActor.run {
+                for (pid, models) in results {
+                    providerLiveModels[pid] = models
+                    // Union into the per-tier cache so dropdowns show them even
+                    // before that tier's own fetch runs.
+                    for tier in TierKey.allCases where tierProviderId(for: tier) == pid {
+                        tierLiveModels[tier.rawValue] = Array(
+                            Set((tierLiveModels[tier.rawValue] ?? []) + models)
+                        ).sorted()
+                    }
+                    if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
+                        manager.providers[idx].visibleModelIds.formUnion(models)
+                    }
+                }
+            }
+        }
+    }
+
+    /// One provider's live model list via its OpenAI-compatible /models
+    /// endpoint. Returns [] on any failure (the tier fetch surfaces errors;
+    /// this background pass is best-effort).
+    private func fetchProviderModelList(_ preset: ProviderPreset) async -> [String] {
+        var baseUrl = config.baseUrl(for: preset.id)
+        if baseUrl.hasSuffix("/v1") { baseUrl = String(baseUrl.dropLast(3)) }
+        guard baseUrl.hasPrefix("https://") || baseUrl.hasPrefix("http://"),
+              let url = URL(string: baseUrl + "/v1/models") else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 15
+        let key = apiKeyForProvider(preset.id)
+        if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        // Some gateways (Anthropic-style) key on x-api-key instead.
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "x-api-key") }
+        do {
+            let (data, response) = try await URLSession(configuration: .ephemeral).data(for: req)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let modelList = json["data"] as? [[String: Any]] else { return [] }
+            // Filter to the provider's free tier (no-op for whole-catalog-free
+            // providers — see ProviderFreeTier.freeModels).
+            return ProviderFreeTier.freeModels(providerId: preset.id, rawModels: modelList)
+        } catch {
+            return []
+        }
+    }
+
+    // MARK: - API Key Removal (with model cascade)
+
+    /// Providers that share a single API key field. The OpenCode key is shared
+    /// between OpenCode Zen and OpenCode Go; every other key is one-to-one.
+    private func providerIdsSharingKey(with providerId: String) -> [String] {
+        switch providerId {
+        case "opencode-zen", "opencode-go": return ["opencode-zen", "opencode-go"]
+        default: return [providerId]
+        }
+    }
+
+    /// Keychain account key for a built-in provider key field.
+    private func chainKeyForProviderField(_ providerId: String) -> String? {
+        switch providerId {
+        case "direct": return ConfigManager.KeychainKey.anthropic
+        case "openai": return ConfigManager.KeychainKey.openai
+        case "openrouter": return ConfigManager.KeychainKey.openrouter
+        case "opencode-zen", "opencode-go": return ConfigManager.KeychainKey.opencode
+        case "nvidia-nim": return ConfigManager.KeychainKey.nvidia
+        case "deepseek": return ConfigManager.KeychainKey.deepseek
+        case "gemini": return ConfigManager.KeychainKey.gemini
+        case "mistral": return ConfigManager.KeychainKey.mistral
+        case "codestral": return ConfigManager.KeychainKey.codestral
+        case "cohere": return ConfigManager.KeychainKey.cohere
+        case "groq": return ConfigManager.KeychainKey.groq
+        case "fireworks": return ConfigManager.KeychainKey.fireworks
+        case "sambanova": return ConfigManager.KeychainKey.sambanova
+        case "cerebras": return ConfigManager.KeychainKey.cerebras
+        case "huggingface": return ConfigManager.KeychainKey.huggingface
+        case "xai": return ConfigManager.KeychainKey.xai
+        case "antigravity": return ConfigManager.KeychainKey.antigravity
+        default: return nil
+        }
+    }
+
+    /// Clear the matching @State key field for a provider.
+    private func clearApiKeyField(_ providerId: String) {
+        switch providerId {
+        case "direct": anthropicKey = ""
+        case "openai": openaiKey = ""
+        case "openrouter": openrouterKey = ""
+        case "opencode-zen", "opencode-go": opencodeKey = ""
+        case "nvidia-nim": nvidiaKey = ""
+        case "deepseek": deepseekKey = ""
+        case "gemini": geminiKey = ""
+        case "mistral": mistralKey = ""
+        case "codestral": codestralKey = ""
+        case "cohere": cohereKey = ""
+        case "groq": groqKey = ""
+        case "fireworks": fireworksKey = ""
+        case "sambanova": sambanovaKey = ""
+        case "cerebras": cerebrasKey = ""
+        case "huggingface": huggingfaceKey = ""
+        case "xai": xaiKey = ""
+        case "antigravity": antigravityKey = ""
+        default: break
+        }
+    }
+
+    /// Show a confirmation sheet before removing a key. Deletion is
+    /// destructive but the key can be re-entered; the model cascade is the
+    /// irreversible part.
+    private func confirmRemoveApiKey(providerId: String, label: String) {
+        let affected = providerIdsSharingKey(with: providerId)
+        let modelNote = affected.count > 1
+            ? "\n\nAll models installed with this key (\(affected.map { providerPreset($0)?.name ?? $0 }.joined(separator: ", "))) will be uninstalled from the model selection lists."
+            : ""
+        let alert = NSAlert()
+        alert.messageText = "Remove \(label)?"
+        alert.informativeText = "The API key will be deleted from the Keychain.\(modelNote)"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        removeApiKey(providerId: providerId)
+    }
+
+    /// Remove an API key and cascade: uninstall every model that was installed
+    /// via this key, clear tier/provider selections that referenced affected
+    /// providers, and repair any orphaned tier model selections.
+    private func removeApiKey(providerId: String) {
+        let affectedProviders = providerIdsSharingKey(with: providerId)
+
+        // 1. Clear the key field + the Keychain entry.
+        clearApiKeyField(providerId)
+        if let chainKey = chainKeyForProviderField(providerId) {
+            config.setApiKey(chainKey: chainKey, value: "")
+        }
+
+        // 2. Determine which tier models were installed via this key (capture
+        //    membership BEFORE clearing the live lists below).
+        let orphanedTiers = TierKey.allCases.filter { tier in
+            let model = tierModelValue(tier)
+            return !model.isEmpty && affectedProviders.contains(where: { modelBelongsToProvider(model, $0) })
+        }
+
+        // 3. Uninstall every live-fetched model for affected providers.
+        for pid in affectedProviders {
+            uninstallModels(for: pid)
+        }
+
+        // 4. Drop tier/provider selections referencing an affected provider.
+        for tier in TierKey.allCases where tier != .defaultModel {
+            if let pid = tierProviders[tier.rawValue], affectedProviders.contains(pid) {
+                tierProviders.removeValue(forKey: tier.rawValue)
+            }
+        }
+        if affectedProviders.contains(provider) {
+            if let first = availableProviders.first {
+                provider = first.id
+            }
+        }
+
+        // 5. Clear orphaned tier models and re-sanitize.
+        for tier in orphanedTiers {
+            setTierModel(tier, "")
+        }
+        for tier in TierKey.allCases {
+            sanitizeTierModel(for: tier)
+        }
+
+        providerChecks[providerId] = .unknown
+        // Also invalidate checks for sibling providers that share this key.
+        for pid in affectedProviders where pid != providerId {
+            providerChecks[pid] = .unknown
+        }
+        scheduleAutoSave()
+    }
+
+    /// Uninstall the live-fetched ("installed via key") models for a provider:
+    /// clear the tier fetch caches and the persisted visible-model list, so
+    /// model dropdowns no longer offer models that can't be served.
+    private func uninstallModels(for pid: String) {
+        for tier in TierKey.allCases {
+            if tierProviderId(for: tier) == pid {
+                tierLiveModels[tier.rawValue] = []
+                tierFetchStates[tier.rawValue] = .idle
+                tierModelChecks[tier.rawValue] = .unknown
+            }
+        }
+        // Clear the provider's persisted live models.
+        manager.visibleModels[pid] = []
+        if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
+            manager.providers[idx].visibleModelIds = []
+        }
+        // Persist the cleared visible-model list immediately without the full
+        // flushSave chain (which re-writes every API key to the Keychain).
+        let visibleStr = manager.providers.map { p in
+            "\(p.id)=\(p.visibleModelIds.joined(separator: ","))"
+        }.joined(separator: ";")
+        config.visibleModelsRaw = visibleStr
+    }
+
+    /// True when a model id belongs to a provider's preset or its live-fetched
+    /// list. Used to detect orphaned tier selections after key removal.
+    private func modelBelongsToProvider(_ model: String, _ pid: String) -> Bool {
+        guard !model.isEmpty else { return false }
+        let bare = ProviderPreset.bareModel(model, for: pid)
+        if let preset = providerPreset(pid),
+           preset.models.contains(where: { ProviderPreset.bareModel($0, for: pid) == bare }) {
+            return true
+        }
+        if let p = manager.providers.first(where: { $0.id == pid }),
+           p.visibleModelIds.contains(bare) {
+            return true
+        }
+        for models in tierLiveModels.values {
+            if models.contains(where: { ProviderPreset.bareModel($0, for: pid) == bare }) {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -2173,7 +3468,7 @@ private struct LogEntryRow: View {
     private func actionColor(_ action: RouteAction) -> Color {
         switch action {
         case .routeAI: return .dsGreen
-        case .passthrough: return .dsTextSecondary
+        case .passthrough, .passThroughOpenAI: return .dsTextSecondary
         case .block: return .dsRed
         }
     }
@@ -2181,7 +3476,7 @@ private struct LogEntryRow: View {
     private func actionString(_ action: RouteAction) -> String {
         switch action {
         case .routeAI: return "ROUTED"
-        case .passthrough: return "PASSTHROUGH"
+        case .passthrough, .passThroughOpenAI: return "PASSTHROUGH"
         case .block: return "BLOCKED"
         }
     }

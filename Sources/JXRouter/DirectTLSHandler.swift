@@ -20,6 +20,38 @@ final class DirectTLSHandler: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.jxproxy.directtls", qos: .userInitiated)
     private weak var providerRouter: ProviderRouter?
 
+    /// F3: per-connection idle timers (dispatch sources) keyed by connection.
+    /// All access is on `queue` — the same queue the receive callbacks and
+    /// timer handlers run on, so no extra lock is needed.
+    private var idleTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
+
+    /// Arm an idle timer that closes the connection when `deadline` passes.
+    private func storeTimer(connection: NWConnection, deadline: DispatchTime) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: deadline)
+        timer.setEventHandler { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            idleTimers.removeValue(forKey: ObjectIdentifier(connection))
+            guard connection.state != .cancelled else { return }
+            print("[DirectTLS] Idle timeout — closing idle connection")
+            sendError(connection, statusCode: 408, message: "Request timeout")
+            connection.cancel()
+        }
+        timer.resume()
+        idleTimers[ObjectIdentifier(connection)] = timer
+    }
+
+    /// Push a live connection's idle deadline forward (data arrived).
+    private func rearmTimer(connection: NWConnection, deadline: DispatchTime) {
+        idleTimers[ObjectIdentifier(connection)]?.schedule(deadline: deadline)
+    }
+
+    /// Drop the connection's idle timer once a full request has arrived and
+    /// routing has begun (the timer exists only to bound the idle wait).
+    private func cancelTimer(connection: NWConnection) {
+        if let t = idleTimers.removeValue(forKey: ObjectIdentifier(connection)) { t.cancel() }
+    }
+
     /// Whether the TLS listener is active.
     private(set) var isRunning = false
 
@@ -27,13 +59,16 @@ final class DirectTLSHandler: @unchecked Sendable {
     private var multiDomainIdentity: sec_identity_t?
 
     /// Paths the provider router understands. Anything else on an intercepted
-    /// AI host (OpenAI's /v1/responses, /v1/embeddings, /v1/models/{id}, …) is
-    /// passed through as a fresh TLS connection to the real host so the proxy
-    /// never interferes with endpoints it doesn't route.
+    /// AI host (OpenAI's /v1/embeddings, /v1/models/{id}, …) is passed through
+    /// as a fresh TLS connection to the real host so the proxy never
+    /// interferes with endpoints it doesn't route. /v1/responses (the OpenAI
+    /// Responses API, used by Codex and recent SDKs) IS routed — it is
+    /// translated to chat completions and back by the router.
     private static let routedPaths: Set<String> = [
         "/v1/messages", "/v1/v1/messages", "/messages",
         "/v1/messages/count_tokens",
         "/v1/chat/completions", "/v1/v1/chat/completions", "/chat/completions",
+        "/v1/responses", "/v1/v1/responses", "/responses",
         "/v1/models",
         "/health", "/", "/api/hello", "/v1/api/hello",
         "/stop",
@@ -77,7 +112,11 @@ final class DirectTLSHandler: @unchecked Sendable {
         // loopback-only; a specific port here throws EINVAL at listener creation.
         params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: 0)
 
-        guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            print("[DirectTLS] Invalid port \(port)")
+            return false
+        }
+        guard let listener = try? NWListener(using: params, on: nwPort) else {
             print("[DirectTLS] Failed to create TLS listener on port \(port)")
             return false
         }
@@ -116,11 +155,29 @@ final class DirectTLSHandler: @unchecked Sendable {
         tlsListener?.cancel()
         tlsListener = nil
         isRunning = false
+        queue.async { [weak self] in
+            guard let self else { return }
+            for (_, t) in self.idleTimers { t.cancel() }
+            self.idleTimers.removeAll()
+        }
     }
 
     // MARK: - Connection Handling
 
     private func receiveRequest(connection: NWConnection, accumulatedData: Data, deadline: DispatchTime) {
+        // F3 fix: real idle timeout. The old code only compared the deadline
+        // inside the receive callback — which never fires on an idle
+        // connection — so "idle" connections were held forever. A queue timer
+        // closes the connection when its deadline passes and is re-armed on
+        // every data arrival.
+        if accumulatedData.isEmpty {
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: deadline)
+            storeTimer(connection: connection, deadline: deadline)
+        } else {
+            rearmTimer(connection: connection, deadline: deadline)
+        }
+
         connection.receive(minimumIncompleteLength: 1, maximumLength: 131_072) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             
@@ -194,6 +251,7 @@ final class DirectTLSHandler: @unchecked Sendable {
     }
 
     private func routeHTTP(connection: NWConnection, requestData: Data) async {
+        cancelTimer(connection: connection)
         guard let requestStr = String(data: requestData, encoding: .utf8) else {
             sendError(connection, statusCode: 400, message: "Invalid HTTP request")
             return
@@ -230,11 +288,11 @@ final class DirectTLSHandler: @unchecked Sendable {
         let trimmedBody = bodyData.prefix(contentLength)
 
         // Pass through AI-host paths the router doesn't handle (OpenAI's
-        // /v1/responses, /v1/embeddings, /v1/models/{id}, …) as a fresh TLS
-        // connection to the real host. The client's own request and auth reach
-        // the real API untouched — no interference with endpoints we don't
-        // route. (Non-AI hosts never reach this handler; they get a raw TCP
-        // relay in MITMHandler.)
+        // /v1/embeddings, /v1/models/{id}, …) as a fresh TLS connection to the
+        // real host. The client's own request and auth reach the real API
+        // untouched — no interference with endpoints we don't route. (Non-AI
+        // hosts never reach this handler; they get a raw TCP relay in
+        // MITMHandler.)
         if !Self.routedPaths.contains(path) {
             let targetHost = headers["host"]?.split(separator: ":").first.map(String.init) ?? ""
             guard !targetHost.isEmpty, targetHost != "127.0.0.1", targetHost != "localhost" else {
@@ -248,14 +306,14 @@ final class DirectTLSHandler: @unchecked Sendable {
         }
 
         guard let router = providerRouter else {
-            print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Provider Router unavailable")
+            print("[DirectTLSHandler] Error: providerRouter is nil"); sendError(connection, statusCode: 502, message: "Provider Router unavailable")
             return
         }
 
         do {
             print("[DirectTLSHandler] Calling route"); let response = try await router.route(method: method, path: path, headers: headers, body: trimmedBody)
 
-            print("[DirectTLSHandler] Got response (response.statusCode)"); var respStr = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"
+            print("[DirectTLSHandler] Got response \(response.statusCode)"); var respStr = "HTTP/1.1 \(response.statusCode) \(statusText(response.statusCode))\r\n"
             for (key, value) in response.headers {
                 respStr += "\(key): \(value)\r\n"
             }
@@ -266,7 +324,7 @@ final class DirectTLSHandler: @unchecked Sendable {
                 connection.send(content: Data(respStr.utf8), completion: .contentProcessed({ _ in }))
                 
                 for await chunk in stream {
-                    var chunkStr = String(format: "%X\r\n", chunk.count)
+                    let chunkStr = String(format: "%X\r\n", chunk.count)
                     var chunkData = Data(chunkStr.utf8)
                     chunkData.append(chunk)
                     chunkData.append(Data("\r\n".utf8))
@@ -287,7 +345,7 @@ final class DirectTLSHandler: @unchecked Sendable {
                 }))
             }
         } catch {
-            print("[DirectTLSHandler] Error: (error)"); sendError(connection, statusCode: 502, message: "Upstream error: \(error.localizedDescription)")
+            print("[DirectTLSHandler] Error: \(error)"); sendError(connection, statusCode: 502, message: "Upstream error: \(error.localizedDescription)")
         }
     }
 
@@ -297,7 +355,12 @@ final class DirectTLSHandler: @unchecked Sendable {
     /// proxy weren't there.
     private func passthroughTLS(connection: NWConnection, requestData: Data, host: String, port: UInt16) {
         let params = NWParameters(tls: NWProtocolTLS.Options())
-        let target = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: params)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            print("[DirectTLS] Invalid passthrough port \(port)")
+            connection.cancel()
+            return
+        }
+        let target = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
         target.start(queue: queue)
 
         target.stateUpdateHandler = { [weak self] state in

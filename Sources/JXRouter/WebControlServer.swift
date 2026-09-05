@@ -25,7 +25,11 @@ final class WebControlServer {
     func start(port: UInt16) {
         guard listener == nil else { return }
         do {
-            let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
+            guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+                print("[WebControl] Invalid port \(port)")
+                return
+            }
+            let listener = try NWListener(using: .tcp, on: nwPort)
             listener.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -387,6 +391,16 @@ var pollTimer=null;
 
 function $(id){return document.getElementById(id)}
 
+// Escape a string for safe interpolation into innerHTML. Log hosts/URLs are
+// attacker-controlled (any site can put markup in its own URL), so they must
+// never reach innerHTML raw — that is stored XSS with the auth token in reach.
+function esc(s){
+  s=(s===undefined||s===null)?'':String(s);
+  return s.replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
 function showGate(msg){
   $('app').style.display='none';
   $('gate').style.display='flex';
@@ -464,7 +478,7 @@ async function loadProviders(active){
       var d=document.createElement('div');
       d.className='provider'+(pr.active?' active':'');
       var keyTxt=pr.requiresKey?(pr.hasKey?'key set':'no key'):'keyless';
-      d.innerHTML='<div style="flex:1"><div class="name">'+pr.name+'</div><div class="sub">'+pr.id+' · '+keyTxt+(pr.active?' · active':'')+'</div></div>'+(pr.active?'<span class="check">✓</span>':'');
+      d.innerHTML='<div style="flex:1"><div class="name">'+esc(pr.name)+'</div><div class="sub">'+esc(pr.id)+' · '+keyTxt+(pr.active?' · active':'')+'</div></div>'+(pr.active?'<span class="check">✓</span>':'');
       d.onclick=function(){if(!pr.active)act('setProvider',pr.id)};
       el.appendChild(d);
     });
@@ -480,8 +494,8 @@ function renderLogs(l){
     d.className='log';
     var when=e.time?new Date(e.time).toLocaleTimeString():'';
     var actionBadge=e.action==='routeAI'?'<span class="badge route">ROUTE</span>':(e.action==='passthrough'?'<span class="badge pass">PASS</span>':'<span class="badge block">BLOCK</span>');
-    var served=e.servedBy?(e.usedFallback?'<span class="badge fb">↪ '+e.servedBy+'</span>':'<span class="badge on">'+e.servedBy+'</span>'):'';
-    d.innerHTML='<div class="t">'+when+' · '+e.method+' '+e.host+'</div><div class="line">'+actionBadge+'<span class="host">'+e.url+'</span>'+served+'</div>';
+    var served=e.servedBy?(e.usedFallback?'<span class="badge fb">↪ '+esc(e.servedBy)+'</span>':'<span class="badge on">'+esc(e.servedBy)+'</span>'):'';
+    d.innerHTML='<div class="t">'+esc(when)+' · '+esc(e.method)+' '+esc(e.host)+'</div><div class="line">'+actionBadge+'<span class="host">'+esc(e.url)+'</span>'+served+'</div>';
     el.appendChild(d);
   });
 }

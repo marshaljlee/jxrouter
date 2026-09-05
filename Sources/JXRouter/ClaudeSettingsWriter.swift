@@ -23,7 +23,7 @@ final class ClaudeSettingsWriter {
     /// Keys JXProxy manages inside the settings.json `env` block.
     static let managedEnvKeys: [String] = [
         "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -61,7 +61,7 @@ final class ClaudeSettingsWriter {
 
         var env = json["env"] as? [String: String] ?? [:]
         env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:\(proxyPort)"
-        env["ANTHROPIC_AUTH_TOKEN"] = authToken
+        env["ANTHROPIC_API_KEY"] = authToken
         env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
         // Neutralise hardcoded shell overrides — empty string is falsy, so
         // Claude Code falls back to native tier names which JXProxy routes.

@@ -1,25 +1,62 @@
 import Foundation
 
-/// Response from a provider route — either a buffered body or an async SSE stream.
-struct ProviderResponse: Sendable {
-    let statusCode: Int
-    let headers: [String: String]
-    let body: Data
+struct ProviderResponse {
+    var id: String = ""
+    var object: String = ""
+    var model: String = ""
+    var choices: [Choice] = []
+    var usage: Usage?
+    var statusCode: Int = 200
+    var headers: [String: String] = [:]
     var stream: AsyncStream<Data>?
-    /// The upstream provider id that served this response (nil when the request
-    /// was not routed to a provider). Set by the router on the success path.
+    var body: Data = Data()
+    /// Which provider served this request (set by the chain logic for logging).
     var servingProvider: String?
-    /// True when a fallback provider served the request because the primary failed.
+    /// True when the request was served by a fallback (index > 0 in the chain).
     var usedFallback: Bool = false
-}
 
-enum ProviderError: Error, LocalizedError {
-    case providerUnavailable(providerId: String, statusCode: Int)
+    // Custom memberwise initializer matching the call sites in ProviderRouter:
+    // ProviderResponse(statusCode:headers:body:stream:) — stream must precede body.
+    init(statusCode: Int, headers: [String: String], body: Data = Data()) {
+        self.statusCode = statusCode
+        self.headers = headers
+        self.body = body
+    }
 
-    var errorDescription: String? {
-        switch self {
-        case .providerUnavailable(let id, let code):
-            return "Provider \(id) unavailable (HTTP \(code))"
-        }
+    init(statusCode: Int, headers: [String: String], body: Data = Data(), stream: AsyncStream<Data>?) {
+        self.statusCode = statusCode
+        self.headers = headers
+        self.body = body
+        self.stream = stream
+    }
+
+    struct Choice: Codable {
+        var index: Int = 0
+        var message: Message?
+        var delta: Delta?
+        var finishReason: String?
+        enum CodingKeys: String, CodingKey { case index, message, delta, finishReason = "finish_reason" }
+    }
+
+    struct Message: Codable {
+        var role: String = ""
+        var content: String?
+        var reasoningContent: String?
+        enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content" }
+    }
+
+    struct Delta: Codable {
+        var role: String?
+        var content: String?
+        var reasoningContent: String?
+        var finishReason: String?
+        enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content", finishReason = "finish_reason" }
+    }
+
+    struct Usage: Codable {
+        var promptTokens: Int = 0
+        var completionTokens: Int = 0
+        var totalTokens: Int = 0
+        enum CodingKeys: String, CodingKey { case promptTokens = "prompt_tokens", completionTokens = "completion_tokens", totalTokens = "total_tokens" }
     }
 }

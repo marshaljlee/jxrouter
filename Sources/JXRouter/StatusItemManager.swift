@@ -2,6 +2,14 @@ import AppKit
 import SwiftUI
 import Observation
 
+extension Notification.Name {
+    /// Posted by the gear button in JXRouterView; observed by StatusItemManager
+    /// to open the Settings window with proper positioning and pairing.
+    static let jxproxyOpenSettings = Notification.Name("jxproxyOpenSettings")
+    /// Posted to open the Vault workspace window.
+    static let jxproxyOpenVault = Notification.Name("jxproxyOpenVault")
+}
+
 // MARK: - Status Item Manager
 //
 // Replaces the SwiftUI MenuBarExtra with an AppKit NSStatusItem.
@@ -12,7 +20,14 @@ import Observation
 final class StatusItemManager: NSObject {
     private var statusItem: NSStatusItem!
     private var window: NSWindow!
+    private var settingsWindow: NSWindow?
+    private var vaultWorkspaceWindow: NSWindow?
+    private var hostingController: NSHostingController<JXRouterView>!
     private var proxyManager: ProxyManager
+    /// Guard against re-entrant slide animations
+    private var isAnimatingSettings: Bool = false
+    /// Stored notification observer tokens — removed in deinit to prevent leaks.
+    private var observerTokens: [NSObjectProtocol] = []
 
     // MARK: - Init
 
@@ -22,6 +37,8 @@ final class StatusItemManager: NSObject {
         setupStatusItem()
         setupWindow()
         observeProxyState()
+        observeOpenSettingsNotification()
+        observeOpenVaultNotification()
     }
 
     // MARK: - Status Item
@@ -61,28 +78,44 @@ final class StatusItemManager: NSObject {
         let contentView = JXRouterView(manager: proxyManager)
         let hostingController = NSHostingController(rootView: contentView)
         
-        if #available(macOS 13.0, *) {
-            hostingController.sizingOptions = [.intrinsicContentSize]
-        }
+        // The window is a fixed size: it is sized ONCE at setup and never
+        // resized again. On macOS 26 any change to the hosting view's ideal
+        // size while the window is displayed re-enters the window's constraint
+        // pass (`_postWindowNeedsUpdateConstraints` overflow) and crashes the
+        // app — every build with a resized/auto-sized window hit it. All
+        // dashboard views use fixed frames, and Settings open in the separate
+        // fixed-size Settings window, so the content size is static.
 
-        // Initial height matches the dashboard's natural content height
-        // (~785pt with the Detected Apps card). If it doesn't, the
-        // intrinsicContentSize pass below animates a resize right after the
-        // window appears — the visible "window jiggle" at launch.
+        // Initial height matches the dashboard's natural content height;
+        // the one-time setContentSize below corrects it before the window is
+        // ever shown.
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 380, height: 785),
             styleMask: [
                 .titled,
                 .closable,
                 .miniaturizable,
-                .resizable,
                 .fullSizeContentView,
             ],
             backing: .buffered,
             defer: true
         )
 
+        self.hostingController = hostingController
         window.contentViewController = hostingController
+
+        // ONE-TIME window sizing: match the window to the dashboard's natural
+        // size at setup. The window is never resized again — on macOS 26 any
+        // change to the hosting view's ideal size while the window is
+        // displayed re-enters the window's constraint pass and crashes the app
+        // (`_postWindowNeedsUpdateConstraints` overflow). All dashboard views
+        // use fixed frames, and Settings open in the separate fixed-size
+        // Settings window, so the content size is static after launch.
+        let fitting = hostingController.view.fittingSize
+        if fitting.width > 0, fitting.height > 0 {
+            window.setContentSize(NSSize(width: ceil(fitting.width), height: ceil(fitting.height)))
+        }
+
         window.isReleasedWhenClosed = false
         window.delegate = self
 
@@ -111,6 +144,10 @@ final class StatusItemManager: NSObject {
         if window.isVisible {
             window.orderOut(nil)
         } else {
+            // The two windows are paired — opening the dashboard closes
+            // Settings so only one is visible at a time.
+            settingsWindow?.orderOut(nil)
+            settingsWindow = nil
             positionWindow()
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -119,10 +156,17 @@ final class StatusItemManager: NSObject {
 
     /// Position the window below the status item, centred horizontally.
     private func positionWindow() {
-        guard let screen = NSScreen.main,
-              let button = statusItem.button else { return }
+        guard let button = statusItem.button,
+              let buttonWindow = button.window else { return }
 
-        let buttonRectInScreen = button.window?.convertToScreen(button.frame)
+        // Anchor to the menu-bar button's own screen — NOT NSScreen.main,
+        // which is the screen with keyboard focus. Opening the dashboard from
+        // a multi-display setup while another display has focus would
+        // otherwise drop the panel on the WRONG screen (the same family of
+        // "appears at a random position" bugs as the Settings anchor).
+        guard let screen = buttonWindow.screen else { return }
+
+        let buttonRectInScreen = buttonWindow.convertToScreen(button.frame)
             ?? .zero
         let windowWidth = window.frame.width
         let x = buttonRectInScreen.midX - windowWidth / 2
@@ -167,6 +211,12 @@ final class StatusItemManager: NSObject {
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(
+            title: "Open Vault Workspace",
+            action: #selector(openVaultAction),
+            keyEquivalent: "v"
+        ))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(
             title: "Quit JXProxy",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
@@ -181,7 +231,8 @@ final class StatusItemManager: NSObject {
     private func toggleProxyAction() {
         Task { @MainActor in
             if proxyManager.isRunning {
-                await proxyManager.stopProxy()
+                // stopProxy() is synchronous — no await needed.
+                proxyManager.stopProxy()
             } else {
                 await proxyManager.startProxy()
             }
@@ -190,8 +241,167 @@ final class StatusItemManager: NSObject {
 
     @objc
     private func openSettingsAction() {
+        openSettingsWindow()
+    }
+
+    @objc
+    private func openVaultAction() {
+        openVaultWorkspaceWindow()
+    }
+
+    /// Open the Settings window with a true ROLL-OUT from the main interface:
+    /// the panel starts invisibly UNDERNEATH the dashboard (z-ordered below
+    /// it), then slides out to the right while fading in — the dashboard
+    /// occludes it at the start, so the panel visibly EMERGES from beneath
+    /// the interface. Only after the slide completes does the dashboard hide
+    /// and the panel come to front.
+    ///
+    /// Why the geometry: the panel (560pt) is WIDER than the dashboard
+    /// (380pt), so "tucking" it slightly behind the dashboard edge shows 95%
+    /// of it immediately — no occlusion, no roll-out feel (the previous
+    /// attempt's bug). The panel must START overlapping the dashboard's own
+    /// area and travel the dashboard's full width to read as sliding out of
+    /// it. The Settings window is a standalone NSWindow hosting SwiftUI's
+    /// SettingsView — NOT the SwiftUI Settings scene, which doesn't respond
+    /// to showSettingsWindow: in LSUIElement apps.
+    func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+
+        guard !isAnimatingSettings else { return }
+
+        // If already open, toggle it closed with a reverse slide
+        if let sw = settingsWindow, sw.isVisible {
+            closeSettingsWithSlide()
+            return
+        }
+
+        let sw = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 780),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        sw.title = "JXProxy Settings"
+        sw.contentViewController = NSHostingController(rootView: SettingsView(manager: proxyManager))
+        sw.isReleasedWhenClosed = false
+        sw.backgroundColor = NSColor.windowBackgroundColor
+
+        let dashboardVisible = window.isVisible
+        let anchorFrame: NSRect
+        if dashboardVisible {
+            anchorFrame = window.frame
+        } else if let button = statusItem.button, let buttonWindow = button.window {
+            let b = buttonWindow.convertToScreen(button.frame)
+            anchorFrame = NSRect(
+                x: b.midX - 190,
+                y: (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? b.minY,
+                width: 380, height: 780
+            ).intersection((buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? .zero)
+        } else {
+            anchorFrame = window.frame
+        }
+
+        // Determine available space on both sides of the anchor (main window)
+        let gap: CGFloat = 10
+        let targetScreen = window.screen ?? statusItem.button?.window?.screen ?? NSScreen.main
+        let screenFrame = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let swWidth = sw.frame.width   // 560
+        let swHeight = sw.frame.height // 780
+
+        let spaceOnRight = screenFrame.maxX - (anchorFrame.maxX + gap)
+        let spaceOnLeft = (anchorFrame.minX - gap) - screenFrame.minX
+
+        // Choose slide direction based on available space
+        let slideToRight = spaceOnRight >= swWidth || (spaceOnRight >= spaceOnLeft && spaceOnLeft < swWidth)
+
+        let finalX: CGFloat
+        let startX: CGFloat
+        if slideToRight {
+            finalX = min(anchorFrame.maxX + gap, screenFrame.maxX - swWidth)
+            // Start directly tucked behind the dashboard window
+            startX = anchorFrame.minX
+        } else {
+            finalX = max(anchorFrame.minX - gap - swWidth, screenFrame.minX)
+            // Start directly tucked behind the dashboard window
+            startX = anchorFrame.maxX - swWidth
+        }
+
+        // Align top of settings with top of anchor, clamped within screen bounds
+        let topAlignedY = anchorFrame.maxY - swHeight
+        let finalY = min(max(topAlignedY, screenFrame.minY + 20), screenFrame.maxY - swHeight)
+        let finalFrame = NSRect(x: finalX, y: finalY, width: swWidth, height: swHeight)
+        let startFrame = NSRect(x: startX, y: finalY, width: swWidth, height: swHeight)
+
+        // Close observer — closing Settings clears reference
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: sw,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.settingsWindow = nil
+            }
+        }
+
+        settingsWindow = sw
+
+        guard dashboardVisible else {
+            sw.setFrame(finalFrame, display: false)
+            sw.alphaValue = 1.0
+            sw.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        // Window starts tucked behind the dashboard with 0.05 alpha so the emerging slide is smooth
+        isAnimatingSettings = true
+        sw.setFrame(startFrame, display: true)
+        sw.alphaValue = 0.05
+
+        // Order Settings below the dashboard so it visually emerges from beneath it
+        sw.order(.below, relativeTo: window.windowNumber)
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.32
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            sw.animator().setFrame(finalFrame, display: true)
+            sw.animator().alphaValue = 1.0
+        }, completionHandler: { [weak self, weak sw] in
+            // Slide complete: raise Settings to key window while keeping the main dashboard visible
+            sw?.makeKeyAndOrderFront(nil)
+            self?.isAnimatingSettings = false
+        })
+    }
+
+    private func closeSettingsWithSlide() {
+        guard let sw = settingsWindow, sw.isVisible else {
+            settingsWindow?.close()
+            settingsWindow = nil
+            return
+        }
+
+        guard !isAnimatingSettings else { return }
+
+        let anchorFrame = window.frame
+        let currentFrame = sw.frame
+        let isRightOfAnchor = currentFrame.minX >= anchorFrame.minX
+
+        let targetX: CGFloat = isRightOfAnchor
+            ? anchorFrame.minX
+            : (anchorFrame.maxX - currentFrame.width)
+
+        let returnFrame = NSRect(x: targetX, y: currentFrame.origin.y, width: currentFrame.width, height: currentFrame.height)
+
+        isAnimatingSettings = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            sw.animator().setFrame(returnFrame, display: true)
+            sw.animator().alphaValue = 0.0
+        }, completionHandler: { [weak self, weak sw] in
+            sw?.orderOut(nil)
+            self?.settingsWindow = nil
+            self?.isAnimatingSettings = false
+        })
     }
 
     // MARK: - CA Trust Management
@@ -343,6 +553,75 @@ final class StatusItemManager: NSObject {
         }
     }
 
+    /// Listen for the gear button's notification so the coordinated
+    /// openSettingsWindow (position + pair + close dashboard) runs.
+    private func observeOpenSettingsNotification() {
+        let token = NotificationCenter.default.addObserver(
+            forName: .jxproxyOpenSettings,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.openSettingsWindow()
+            }
+        }
+        observerTokens.append(token)
+    }
+
+    /// Listen for the vault workspace notification.
+    private func observeOpenVaultNotification() {
+        let token = NotificationCenter.default.addObserver(
+            forName: .jxproxyOpenVault,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.openVaultWorkspaceWindow()
+            }
+        }
+        observerTokens.append(token)
+    }
+
+    /// Open the Vault workspace — a full-featured Claude Code GUI with
+    /// vault isolation, routing, agents, analytics, and file explorer.
+    func openVaultWorkspaceWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        // If already open, just bring it to front
+        if let vw = vaultWorkspaceWindow, vw.isVisible {
+            vw.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let vw = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        vw.title = "Vault — AI Development Workspace"
+        vw.contentViewController = NSHostingController(
+            rootView: VaultWorkspaceView(manager: proxyManager)
+        )
+        vw.isReleasedWhenClosed = false
+        vw.minSize = NSSize(width: 900, height: 600)
+        vw.center()
+
+        vaultWorkspaceWindow = vw
+        vw.makeKeyAndOrderFront(nil)
+
+        // Close observer
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: vw,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.vaultWorkspaceWindow = nil
+            }
+        }
+    }
+
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         let iconName = proxyManager.isRunning ? "bolt.fill" : "bolt.slash"
@@ -354,8 +633,11 @@ final class StatusItemManager: NSObject {
     }
 
     deinit {
-        // withObservationTracking does not hold a strong reference to the
-        // onChange closure once it fires, but we are safe regardless.
+        // Remove all stored notification observers to prevent leaks.
+        for token in observerTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        observerTokens.removeAll()
     }
 }
 
@@ -363,18 +645,16 @@ final class StatusItemManager: NSObject {
 
 extension StatusItemManager: NSWindowDelegate {
 
-    /// The close button (red dot) just hides the window instead of quitting.
+    /// Allow the close button to actually close the window. The app itself is
+    /// a background-only agent (LSUIElement) and keeps running — clicking the
+    /// menu-bar icon re-opens the dashboard window at any time.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
-    }
-
-    /// The minimise button (yellow dot) hides the window instead, since the
-    /// app has no dock icon (LSUIElement = true) and a minimised window
-    /// would be unreachable.
-    func windowWillMiniaturize(_ notification: Notification) {
-        guard let win = notification.object as? NSWindow else { return }
-        win.orderOut(nil)
+        // Closing the dashboard also closes the Settings window — the two
+        // windows are a paired UI; leaving Settings orphaned would confuse.
+        if sender === window, let sw = settingsWindow {
+            sw.orderOut(nil)
+        }
+        return true
     }
 }
 

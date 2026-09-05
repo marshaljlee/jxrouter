@@ -181,9 +181,16 @@ final class ProxyManager {
         loadAppRoutesFromConfig()
     }
 
-    private func syncFromConfig() {
+    /// Lightweight live-sync from ConfigManager: refresh the proxy server's
+    /// port/auth/config caches. Deliberately does NOT rebuild the `providers`
+    /// array (which re-reads every API key from the Keychain) — that path is
+    /// reserved for explicit loads, not every auto-save.
+    func syncFromConfig() {
         proxyServer.port = resolvedPort(config.port)
         proxyServer.authToken = config.authToken
+        // Live-update routing caches (e.g. the "Route OpenAI connections"
+        // switch) so toggles take effect without restarting the proxy.
+        proxyServer.syncConfigCache()
     }
 
     private func loadProvidersFromConfig() {
@@ -255,6 +262,14 @@ final class ProxyManager {
         config.visibleModelsRaw = visibleStr
 
         for p in providers {
+            // NEVER write empty values here. `flushSave` only syncs values the
+            // app already read from the Keychain — and with prompt-free reads,
+            // a temporarily unreadable item (locked keychain at login) comes
+            // back empty. Writing that empty value back would silently wipe
+            // the real stored key. Explicit deletions always go through
+            // ConfigManager.setApiKey("") from the UI (Remove button / field
+            // edit), never through this path.
+            guard !p.apiKey.isEmpty else { continue }
             config.setApiKey(chainKey: apiChainKey(for: p.id), value: p.apiKey)
         }
         saveAppRoutesToConfig()
@@ -301,11 +316,23 @@ final class ProxyManager {
 
     // MARK: - System Proxy
 
+    /// Enable the System-Wide Proxy toggle.
+    ///
+    /// Permanent guard: the macOS proxy is ONLY pointed at the local server
+    /// while that server is actually listening. Enabling it when the server is
+    /// down routes every app on the machine to a dead port and kills all
+    /// internet (the "system proxy enabled but proxy not running" error fired
+    /// 9 times in the error log before this guard). The intent is recorded so
+    /// `startProxy()` applies the proxy the moment the listener is live; the
+    /// system setting itself is never enabled early.
     func enableSystemProxy(port: Int) {
         setBuiltInProxyPort(resolvedPort(port))
-        if !builtInProxyRunning {
-            setError("System-Wide Proxy is enabled but the proxy is not running — apps will lose internet access until the proxy is started.")
+        systemProxyEnabled = true
+        guard builtInProxyRunning else {
+            print("[ProxyManager] System-Wide Proxy requested but server not running — will apply when proxy starts")
+            return
         }
+        systemProxyManager.discoverInterfaces()
         systemProxyManager.enable()
         systemProxyEnabled = true
     }
@@ -320,6 +347,8 @@ final class ProxyManager {
     /// Start/restart the remote web-control server after the Settings toggle
     /// or port changes (only effective while the proxy is running).
     func applyWebControl() {
+        // Stop-then-restart so a port/toggle change rebinds the listener.
+        // (The panel itself survives proxy stops — see stopProxy.)
         webControlServer.stop()
         guard config.webControlEnabled, builtInProxyRunning else { return }
         webControlServer.start(port: UInt16(config.webControlPort))
@@ -328,6 +357,7 @@ final class ProxyManager {
     // MARK: - Controls
 
     func startProxy() async {
+                isRunning = builtInProxyRunning  // reconcile stale UI flag
         guard !builtInProxyRunning else { return }  // Already running
 
         lockUI = true
@@ -339,6 +369,10 @@ final class ProxyManager {
         do {
             // Sync system proxy port with the configured port before starting
             setBuiltInProxyPort(proxyServer.port)
+
+            // User-initiated start: reset the unexpected-death auto-restart cap
+            // so a fresh failure after this action still gets bounded retries.
+            proxyServer.resetUnexpectedRestartCount()
 
             try proxyServer.start(port: proxyServer.port)
             builtInProxyRunning = true
@@ -393,8 +427,14 @@ final class ProxyManager {
         lockUI = true
         defer { lockUI = false }
 
+        // The remote web-control panel must SURVIVE a proxy stop — it is the
+        // only way to restart the proxy from the phone/tablet wrappers (the
+        // panel's Start Proxy button). Stopping it here made the panel's
+        // Start button permanently unreachable: stop killed the panel, so the
+        // panel was never up while the proxy was down. The panel is gated by
+        // its own opt-in setting (Settings → Remote Web Control), not by the
+        // proxy's run state.
         proxyServer.stop()
-        webControlServer.stop()
         builtInProxyRunning = false
         isRunning = false
         startTime = nil
@@ -512,9 +552,13 @@ final class ProxyManager {
                     let killTask = Process()
                     killTask.executableURL = URL(fileURLWithPath: "/bin/kill")
                     killTask.arguments = ["-9", pid]
-                    try? killTask.run()
-                    killTask.waitUntilExit()
-                    print("[Recovery] Killed PID \(pid) (\(owningPaths[0])) holding port \(port) — owned by this app")
+                    do {
+                        try killTask.run()
+                        killTask.waitUntilExit()
+                        print("[Recovery] Killed PID \(pid) (\(owningPaths[0])) holding port \(port) — owned by this app")
+                    } catch {
+                        print("[Recovery] Failed to launch kill for PID \(pid): \(error)")
+                    }
                 } else {
                     print("[Recovery] PID \(pid) on port \(port) does not belong to this app (\(owningPaths[0])) — leaving alive")
                 }
@@ -599,15 +643,23 @@ final class ProxyManager {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/dscacheutil")
         task.arguments = ["-flushcache"]
-        try? task.run()
-        task.waitUntilExit()
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            print("[Recovery] DNS cache flush failed: \(error)")
+        }
 
         // Also signal mDNSResponder to flush
         let mTask = Process()
         mTask.executableURL = URL(fileURLWithPath: "/bin/kill")
         mTask.arguments = ["-HUP", "mDNSResponderHelper"]
-        try? mTask.run()
-        mTask.waitUntilExit()
+        do {
+            try mTask.run()
+            mTask.waitUntilExit()
+        } catch {
+            print("[Recovery] mDNSResponder HUP failed: \(error)")
+        }
     }
 
     private func checkAndLaunchClaude() {
@@ -632,7 +684,7 @@ final class ProxyManager {
                 }
             }
         } catch {
-            print("Error checking for claude: \\(error)")
+            print("Error checking for claude: \(error)")
         }
     }
 
@@ -806,10 +858,12 @@ final class ProxyManager {
     func toggleSystemProxy() {
         if systemProxyManager.isEnabled {
             systemProxyManager.disable()
+            systemProxyEnabled = false
         } else {
-            systemProxyManager.enable()
+            enableSystemProxy(port: Int(proxyServer.port))
+            // Intent flag set by enableSystemProxy stays true even when the
+            // server isn't running yet — startProxy() applies it later.
         }
-        systemProxyEnabled = systemProxyManager.isEnabled
     }
 
     func discoverNetworkInterfaces() {

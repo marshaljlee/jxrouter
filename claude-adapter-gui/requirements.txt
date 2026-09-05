@@ -1,0 +1,6 @@
+# Runtime dependencies for the claude-adapter Control Center GUI.
+# The `claude-adapter` binary itself is installed separately:
+#   npm install -g claude-adapter   (requires Node.js >= 20)
+click>=8.1,<9
+trogon>=0.6,<1
+textual>=1.0

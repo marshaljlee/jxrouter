@@ -21,7 +21,7 @@ struct CustomLauncherService {
                 args: "\(modelFlag)--disable-slash-commands \"$@\"",
                 env: [
                     "ANTHROPIC_BASE_URL": "http://127.0.0.1:\(proxyPort)",
-                    "ANTHROPIC_AUTH_TOKEN": authToken,
+                    "ANTHROPIC_API_KEY": authToken,
                     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
                     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "190000",
                     "DISABLE_AUTOUPDATER": "1",

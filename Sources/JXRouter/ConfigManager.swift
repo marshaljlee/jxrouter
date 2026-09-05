@@ -1,5 +1,13 @@
 import Foundation
 import Observation
+import Dispatch
+
+/// Posted when the app re-imports API keys from the user's shell config files
+/// (e.g. ~/.zshrc) while it is already running. `userInfo["imported"]` carries
+/// the Keychain keys that were newly imported (e.g. "NVIDIA_NIM_API_KEY").
+extension Notification.Name {
+    static let jxproxyShellKeysImported = Notification.Name("JXProxyShellKeysImported")
+}
 
 /// Per-provider reasoning pass-through policy.
 ///
@@ -47,6 +55,8 @@ struct CustomProviderDef: Identifiable, Codable, Equatable, Hashable {
 @Observable
 final class ConfigManager: @unchecked Sendable {
     static let shared = ConfigManager()
+    /// If true, shell config imports are skipped (used to keep unit tests hermetic).
+    static var skipShellImport = false
 
     // MARK: - UserDefaults Keys
     private enum UDKey {
@@ -63,6 +73,11 @@ final class ConfigManager: @unchecked Sendable {
         static let openaiBaseUrl = "openaiBaseUrl"
         static let localLlmBaseUrl = "localLlmBaseUrl"
         static let localLlmModel = "localLlmModel"
+        static let ggufModelPath = "ggufModelPath"
+        static let ggufModelAlias = "ggufModelAlias"
+        static let ggufGpuLayers = "ggufGpuLayers"
+        static let ggufContextSize = "ggufContextSize"
+        static let ggufPort = "ggufPort"
         static let authToken = "authToken"
         static let authTokenResetDone = "authTokenResetDone"
         static let appRoutesJSON = "appRoutesJSON"
@@ -73,6 +88,9 @@ final class ConfigManager: @unchecked Sendable {
         static let customProviders = "customProvidersJSON"
         static let mitmHosts = "mitmHosts"
         static let botIntegrationEnabled = "botIntegrationEnabled"
+        /// Whether intercepted OpenAI traffic (api.openai.com) is routed through
+        /// the configured providers or passed through unmodified.
+        static let routeOpenAI = "routeOpenAI"
     }
 
     // MARK: - Keychain Keys
@@ -102,6 +120,7 @@ final class ConfigManager: @unchecked Sendable {
         static let zai = "ZAI_API_KEY"
         static let ollamaCloud = "OLLAMA_API_KEY"
         static let aiGateway = "AI_GATEWAY_API_KEY"
+        static let antigravity = "ANTIGRAVITY_API_KEY"
         static let custom = "CUSTOM_API_KEY"
         static let telegramBotToken = "TELEGRAM_BOT_TOKEN"
         static let authToken = "JXPROXY_AUTH_TOKEN"
@@ -110,7 +129,7 @@ final class ConfigManager: @unchecked Sendable {
     /// UserDefaults key for storing API keys JSON dictionary.
     private static let udApiKeysKey = "apiKeysDict"
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     // MARK: - Published Config
 
@@ -209,7 +228,16 @@ final class ConfigManager: @unchecked Sendable {
 
     /// Comma-separated fallback provider names.
     var fallbackProviders: String {
-        get { defaults.string(forKey: UDKey.fallbackProviders) ?? "nvidia,local" }
+        get {
+            let raw = defaults.string(forKey: UDKey.fallbackProviders) ?? ""
+            // Validate: strip any ids that don't match a real provider, so
+            // stale entries like "nvidia" (should be "nvidia-nim") or "local"
+            // (never a real id) are silently cleaned up.
+            let valid = raw.components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && ProviderPreset.preset(for: $0) != nil }
+            return valid.joined(separator: ",")
+        }
         set { defaults.set(newValue, forKey: UDKey.fallbackProviders); publish() }
     }
 
@@ -225,7 +253,13 @@ final class ConfigManager: @unchecked Sendable {
     func tierProvider(for tier: String) -> String? {
         guard let data = tierProvidersJSON.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return nil }
-        return dict[tier]
+        let pid = dict[tier]
+        // Legacy alias — llama.cpp was replaced by the Llama desktop app. The
+        // primary provider is migrated on init; remap here too so per-tier
+        // overrides saved before the rename (e.g. "llamacpp" pinned to Haiku)
+        // resolve to the live provider instead of an unknown id.
+        if pid == "llamacpp" { return "llamaapp" }
+        return pid
     }
 
     /// Store a per-tier provider id (or remove it when empty).
@@ -260,6 +294,38 @@ final class ConfigManager: @unchecked Sendable {
     var localLlmModel: String {
         get { defaults.string(forKey: UDKey.localLlmModel) ?? "ollama/qwen3:latest" }
         set { defaults.set(newValue, forKey: UDKey.localLlmModel); publish() }
+    }
+
+    // MARK: - GGUF (Direct llama-server hosting)
+
+    /// Path to the selected GGUF model file.
+    var ggufModelPath: String {
+        get { defaults.string(forKey: UDKey.ggufModelPath) ?? "" }
+        set { defaults.set(newValue, forKey: UDKey.ggufModelPath); publish() }
+    }
+
+    /// Model alias served by llama-server (what the OpenAI /v1/models reports).
+    var ggufModelAlias: String {
+        get { defaults.string(forKey: UDKey.ggufModelAlias) ?? "local-model" }
+        set { defaults.set(newValue, forKey: UDKey.ggufModelAlias); publish() }
+    }
+
+    /// GPU layers to offload (-1 = all, 0 = CPU only, N = N layers).
+    var ggufGpuLayers: Int {
+        get { defaults.object(forKey: UDKey.ggufGpuLayers) as? Int ?? 0 }
+        set { defaults.set(newValue, forKey: UDKey.ggufGpuLayers); publish() }
+    }
+
+    /// Context size override (0 = use the model's native context).
+    var ggufContextSize: Int {
+        get { defaults.object(forKey: UDKey.ggufContextSize) as? Int ?? 0 }
+        set { defaults.set(newValue, forKey: UDKey.ggufContextSize); publish() }
+    }
+
+    /// Port the GGUF llama-server listens on.
+    var ggufPort: Int {
+        get { defaults.object(forKey: UDKey.ggufPort) as? Int ?? 8081 }
+        set { defaults.set(newValue, forKey: UDKey.ggufPort); publish() }
     }
 
     /// Auth token for proxy authentication. Defaults to the documented token
@@ -329,6 +395,16 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.botIntegrationEnabled); publish() }
     }
 
+    /// Whether OpenAI connections (api.openai.com) are routed through the
+    /// configured providers. Independent of Anthropic routing: when off, OpenAI
+    /// traffic passes through unmodified (raw passthrough), so Codex/OpenAI
+    /// SDK clients keep talking to the real OpenAI API while Claude still
+    /// routes through the proxy. On by default to preserve existing behavior.
+    var routeOpenAI: Bool {
+        get { defaults.object(forKey: UDKey.routeOpenAI) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: UDKey.routeOpenAI); publish() }
+    }
+
     // MARK: - API Key Import from Shell Configs
 
     /// Known shell-variable names mapped to their Keychain keys. GUI apps
@@ -341,6 +417,8 @@ final class ConfigManager: @unchecked Sendable {
         "OPENROUTER_API_KEY": KeychainKey.openrouter,
         "OPENCODE_API_KEY": KeychainKey.opencode,
         "NVIDIA_NIM_API_KEY": KeychainKey.nvidia,
+        // NVIDIA's other canonical variable name — many users export this one.
+        "NVIDIA_API_KEY": KeychainKey.nvidia,
         "DEEPSEEK_API_KEY": KeychainKey.deepseek,
         "GEMINI_API_KEY": KeychainKey.gemini,
         "MISTRAL_API_KEY": KeychainKey.mistral,
@@ -363,6 +441,22 @@ final class ConfigManager: @unchecked Sendable {
         "ZAI_API_KEY": KeychainKey.zai,
         "OLLAMA_API_KEY": KeychainKey.ollamaCloud,
         "AI_GATEWAY_API_KEY": KeychainKey.aiGateway,
+        "ANTIGRAVITY_API_KEY": KeychainKey.antigravity,
+    ]
+
+    /// Shell config files scanned for `export KEY=…` lines, in order. Internal
+    /// (not private) so tests can point the importer at temp files instead of
+    /// the developer's real configs.
+    private(set) var shellConfigPaths: [String] = [
+        "~/.zshrc",
+        "~/.zshenv",
+        "~/.zprofile",
+        "~/.bash_profile",
+        "~/.bashrc",
+        "~/.profile",
+        // Legacy config file from the old app version (usually already
+        // consumed by migrateFromConfigEnv — belt and suspenders).
+        "~/.jxproxy/config.env",
     ]
 
     /// Import API keys from the user's shell configs into the Keychain.
@@ -370,7 +464,8 @@ final class ConfigManager: @unchecked Sendable {
     /// Why this exists: a menu-bar app like JXProxy is never launched from a
     /// shell, so `export ANTHROPIC_API_KEY=…` in ~/.zshrc never reaches the
     /// process environment — the keys were simply invisible to the app.
-    /// This parses the config files directly.
+    /// This parses the config files directly (and merges the process
+    /// environment for the case where the app WAS launched from a terminal).
     ///
     /// Rules (kept deliberately conservative):
     ///   • Only EMPTY Keychain slots are filled — existing keys are never
@@ -378,41 +473,76 @@ final class ConfigManager: @unchecked Sendable {
     ///   • Values containing unexpanded shell substitutions (`$…`, `` `… ``)
     ///     are skipped — importing a literal `$JXPROXY_AUTH_TOKEN` would store
     ///     garbage.
-    ///   • Idempotent and cheap — safe to run on every launch.
-    func importKeysFromShellConfigs() {
-        let files = [
-            "~/.zshrc",
-            "~/.zshenv",
-            "~/.bash_profile",
-            "~/.bashrc",
-            // Legacy config file from the old app version (usually already
-            // consumed by migrateFromConfigEnv — belt and suspenders).
-            "~/.jxproxy/config.env",
-        ]
+    ///   • Idempotent and cheap — safe to run on every launch, on Settings
+    ///     open, on a ~/.zshrc file change, and on demand from a button.
+    ///
+    /// - Returns: the Keychain keys (e.g. "NVIDIA_NIM_API_KEY") that were
+    ///   newly imported this call, so callers can surface "Imported …"
+    ///   feedback. Empty when everything was already saved.
+    @discardableResult
+    func importKeysFromShellConfigs(paths: [String]? = nil) -> [String] {
+        // If the Keychain is in its retry cooldown (a recent read timed out —
+        // keychain locked at login, securityd stalled), probing every known
+        // account would block up to 3 seconds each for nothing, and writes
+        // would pile up prompts. Skip the pass; the recovery loop re-runs it
+        // once the Keychain responds again.
+        guard !KeychainManager.isUnavailable else { return [] }
+
+        let files = paths ?? shellConfigPaths
+
+        // If we are in hermetic test mode, filter out any default system files
+        // and do NOT read from the host process environment.
+        let filesToProcess: [String]
+        if Self.skipShellImport {
+            filesToProcess = files.filter { file in
+                !file.hasPrefix("~/") && !file.contains("/Users/")
+            }
+            if filesToProcess.isEmpty {
+                return []
+            }
+        } else {
+            filesToProcess = files
+        }
+
         var env: [String: String] = [:]
-        for file in files {
+        // GUI apps launched from Finder never inherit the shell environment,
+        // but when the app IS launched from a terminal the exported vars are
+        // already there — merge them first so explicit shell-file exports
+        // still win (last occurrence wins below).
+        // Skip reading from the host process environment during hermetic tests.
+        if !Self.skipShellImport {
+            for (varName, _) in Self.shellEnvKeyMap {
+                if let value = ProcessInfo.processInfo.environment[varName], !value.isEmpty {
+                    env[varName] = value
+                }
+            }
+        }
+        for file in filesToProcess {
             let expanded = NSString(string: file).expandingTildeInPath
             guard let content = try? String(contentsOfFile: expanded, encoding: .utf8) else { continue }
             mergeShellEnv(&env, content)
         }
 
-        var imported = 0
+        var imported: [String] = []
         for (varName, chainKey) in Self.shellEnvKeyMap {
             guard let value = env[varName], !value.isEmpty,
                   getApiKey(chainKey: chainKey).isEmpty else { continue }
             setApiKey(chainKey: chainKey, value: value)
-            imported += 1
+            imported.append(chainKey)
             print("[ConfigManager] Imported \(varName) from shell configs into the Keychain")
         }
-        if imported > 0 {
-            print("[ConfigManager] Imported \(imported) API key(s) from shell configs")
+        if !imported.isEmpty {
+            print("[ConfigManager] Imported \(imported.count) API key(s) from shell configs")
         }
+        return imported
     }
 
     /// Parse `KEY=value` and `export KEY="value"` lines into a dict (last
-    /// occurrence wins). Skips comments and values containing unexpanded shell
-    /// substitution (`$` or backticks).
-    private func mergeShellEnv(_ env: inout [String: String], _ content: String) {
+    /// occurrence wins). Handles single/double quotes and inline `#` comments
+    /// (`export NVIDIA_NIM_API_KEY="nvapi-…" # my key`), and skips comments
+    /// plus values containing unexpanded shell substitution (`$` or backticks).
+    /// Internal (not private) so unit tests can exercise the parser directly.
+    func mergeShellEnv(_ env: inout [String: String], _ content: String) {
         for line in content.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
@@ -421,26 +551,56 @@ final class ConfigManager: @unchecked Sendable {
             let parts = body.split(separator: "=", maxSplits: 1)
             guard parts.count == 2 else { continue }
             let name = String(parts[0]).trimmingCharacters(in: .whitespaces)
-            var value = String(parts[1]).trimmingCharacters(in: .whitespaces)
-            // Strip a single pair of surrounding quotes ('…' or "…").
-            if value.count >= 2, value.first == value.last,
-               value.first == "\"" || value.first == "'" {
-                value = String(value.dropFirst().dropLast())
-            }
-            // Never import unexpanded shell substitutions as a key.
-            if value.contains("$") || value.contains("`") { continue }
+            guard let value = Self.parseShellValue(String(parts[1])) else { continue }
             env[name] = value
         }
     }
 
+    /// Extract the literal value from a `KEY=…` right-hand side. Strips a
+    /// single pair of surrounding quotes and anything after the closing quote
+    /// (a trailing `# comment` is common), or cuts an unquoted comment that
+    /// starts after whitespace. Returns nil for unterminated quotes and for
+    /// values containing unexpanded shell substitution (`$` or backticks).
+    private static func parseShellValue(_ raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespaces)
+        if let first = value.first, first == "\"" || first == "'" {
+            let rest = value.dropFirst()
+            guard let close = rest.firstIndex(of: first) else { return nil }
+            value = String(rest[..<close])
+        } else if let hash = value.range(of: " #")?.lowerBound {
+            // Unquoted values: a `#` after whitespace starts a comment.
+            value = String(value[..<hash]).trimmingCharacters(in: .whitespaces)
+        }
+        // Never import unexpanded shell substitutions as a key.
+        if value.contains("$") || value.contains("`") { return nil }
+        guard !value.isEmpty else { return nil }
+        return value
+    }
+
     // MARK: - API Key Storage (UserDefaults)
+
+    /// True when the Keychain answered the reads performed during this
+    /// process's startup. When false, every key field loaded into the UI is an
+    /// empty placeholder (reads timed out, e.g. a Keychain permission prompt
+    /// pending), so an empty-value save is NOT evidence the user cleared the
+    /// key — deleting would wipe the real stored secret.
+    private var keychainReadHealthyAtStartup = false
 
     /// Store an API key securely in the Keychain.
     ///
     /// On Keychain failure the error is surfaced and the prior value is kept —
     /// secrets are never written to UserDefaults (ticket 0001).
+    ///
+    /// An empty value clears the stored key — but only when the Keychain was
+    /// readable at startup. Otherwise the empty value is untrustworthy (the
+    /// UI never saw the real key) and the existing secret is kept, so a
+    /// transient startup read failure can never auto-wipe provider keys.
     func setApiKey(chainKey: String, value: String) {
         guard !value.isEmpty else {
+            guard keychainReadHealthyAtStartup else {
+                print("[ConfigManager] Refusing to clear \(chainKey) — Keychain was unreadable at startup; keeping the stored key to avoid data loss.")
+                return
+            }
             try? KeychainManager.delete(key: chainKey)
             return
         }
@@ -464,8 +624,77 @@ final class ConfigManager: @unchecked Sendable {
         "CUSTOM_PROVIDER_KEY_\(id)"
     }
 
+    /// The id of the key-requiring built-in provider that a custom provider at
+    /// `baseUrl` inherits its key from — the first endpoint match whose key is
+    /// actually available — or nil. Surfaced in Settings so the user can see
+    /// which verified key their custom provider is using.
+    func inheritedKeySource(for customUrl: String) -> String? {
+        let normalized = normalizedEndpoint(customUrl)
+        guard !normalized.isEmpty else { return nil }
+        // Only real built-ins inherit — the legacy "custom" preset is skipped
+        // so a custom provider can never match against itself (no recursion).
+        for preset in ProviderPreset.all where preset.requiresKey && preset.id != "custom" {
+            if normalizedEndpoint(baseUrl(for: preset.id)) == normalized,
+               !apiKey(for: preset.id).isEmpty {
+                return preset.id
+            }
+        }
+        return nil
+    }
+
+    /// API key of the key-requiring built-in provider whose endpoint exactly
+    /// matches the given base URL, or "" when there is no match. Normalization
+    /// compares host + path with the scheme and a trailing "/v1" stripped, so
+    /// a custom provider at the built-in's URL inherits its verified key.
+    private func keyForMatchingBuiltIn(_ customBaseUrl: String) -> String {
+        guard let source = inheritedKeySource(for: customBaseUrl) else { return "" }
+        return apiKey(for: source)
+    }
+
+    /// Lowercased host + path with scheme and trailing "/v1" (and slashes)
+    /// removed, so "https://integrate.api.nvidia.com/v1" and
+    /// "https://integrate.api.nvidia.com" compare equal.
+    private func normalizedEndpoint(_ url: String) -> String {
+        var s = url.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if s.hasPrefix("https://") { s.removeFirst("https://".count) }
+        else if s.hasPrefix("http://") { s.removeFirst("http://".count) }
+        while s.hasSuffix("/") { s.removeLast() }
+        if s.hasSuffix("/v1") { s = String(s.dropLast(3)) }
+        while s.hasSuffix("/") { s.removeLast() }
+        return s
+    }
+
     /// Get the resolved API key for a given provider identifier.
+    ///
+    /// When the Keychain has no key for the provider, lazily re-scans the
+    /// user's shell configs (debounced) before giving up — a menu-bar app can
+    /// run for days, so a key the user just added to ~/.zshrc is picked up on
+    /// the very next request without a relaunch. Import only fills empty
+    /// Keychain slots, so this never overrides a key saved in Settings.
     func apiKey(for providerId: String) -> String {
+        let key = resolvedApiKey(for: providerId)
+        if key.isEmpty {
+            shellFallbackImportIfNeeded()
+            return resolvedApiKey(for: providerId)
+        }
+        return key
+    }
+
+    /// Last time the lazy shell fallback re-scanned the configs (debounce so
+    /// a persistently-missing key doesn't re-parse the files on every request).
+    private var lastShellFallbackImport = Date.distantPast
+
+    /// Debounced re-scan of the shell configs, triggered only when a provider
+    /// key resolves empty. Benign under races (worst case: one extra import).
+    private func shellFallbackImportIfNeeded() {
+        guard Date().timeIntervalSince(lastShellFallbackImport) > 3 else { return }
+        lastShellFallbackImport = Date()
+        importKeysFromShellConfigs()
+    }
+
+    /// The pure Keychain resolution for a provider (no shell fallback), kept
+    /// separate so `apiKey(for:)` can lazily retry the shell import once.
+    private func resolvedApiKey(for providerId: String) -> String {
         // Named custom providers first — each has its own Keychain account.
         // Fall through to the legacy "custom" account if the per-provider
         // account is empty (pre-migration setups stored the key there).
@@ -476,7 +705,14 @@ final class ConfigManager: @unchecked Sendable {
                 let legacy = getApiKey(chainKey: KeychainKey.custom)
                 if !legacy.isEmpty { return legacy }
             }
-            return key
+            // A custom provider pointing at the SAME endpoint as a built-in
+            // provider (e.g. a duplicate "Nvidia" entry at the NVIDIA NIM URL)
+            // reuses that provider's key. Without this, a user who verified a
+            // key on the built-in provider still gets "No API key entered" in
+            // Test All Models — and 401s at runtime — for their custom twin.
+            // Only an exact endpoint match inherits, so unrelated custom
+            // gateways never pick up another provider's key.
+            return keyForMatchingBuiltIn(def.baseUrl)
         }
         switch providerId {
         case "direct": return getApiKey(chainKey: KeychainKey.anthropic)
@@ -505,7 +741,9 @@ final class ConfigManager: @unchecked Sendable {
         case "ollama-cloud": return getApiKey(chainKey: KeychainKey.ollamaCloud)
         case "ai-gateway": return getApiKey(chainKey: KeychainKey.aiGateway)
         case "custom": return getApiKey(chainKey: KeychainKey.custom)
-        case "local", "ollama", "lmstudio", "llamaapp", "jan": return ""
+        case "antigravity": return getApiKey(chainKey: KeychainKey.antigravity)
+        case "local", "ollama", "lmstudio", "llamaapp", "jan", "unsloth", "gguf": return ""
+        case "gemini-oauth": return getApiKey(chainKey: "GEMINI_OAUTH_ACCESS_TOKEN")
         default: return ""
         }
     }
@@ -553,7 +791,12 @@ final class ConfigManager: @unchecked Sendable {
 
     // MARK: - Initialization & Migration
 
-    private init() {
+    /// Internal so the unit-test target can construct isolated instances
+    /// against a scratch UserDefaults suite (never the real preferences). The
+    /// app always uses `shared`, which keeps `.standard`.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+
         // Hygiene sweep: migrate any legacy plaintext apiKeysDict into Keychain (ticket 0001).
         migrateLegacyApiKeysDict()
 
@@ -562,9 +805,30 @@ final class ConfigManager: @unchecked Sendable {
             hasMigrated = true
         }
 
-        // Pick up keys the user exported in shell configs (~/.zshrc etc.) —
-        // see importKeysFromShellConfigs(). Fills only empty Keychain slots.
-        importKeysFromShellConfigs()
+        // Live detection: menu-bar apps stay running for days, so a key the
+        // user just added to ~/.zshrc must be picked up without a relaunch.
+        // Only the app singleton (real .standard defaults) watches the files;
+        // unit-test instances use scratch suites and stay hermetic.
+        if defaults === UserDefaults.standard {
+            startShellConfigWatcher()
+            // The shell-config import is NOT run synchronously here. At app
+            // launch (login item, keychain still settling / permission prompt
+            // pending) a synchronous import would hit the Keychain dozens of
+            // times — reads that time out and latch, writes that block — which
+            // is exactly the "keeps asking for keychain password / no API key
+            // installed" regression. It now runs on a background queue with
+            // cooldown-based retries and self-heals item ACLs first.
+            scheduleStartupKeychainRecovery()
+        }
+
+        // Snapshot Keychain health from the startup reads above: if they timed
+        // out (permission prompt pending, securityd stalled), every key field
+        // loaded into the UI is an empty placeholder and empty-value saves
+        // must not delete the real stored secrets.
+        keychainReadHealthyAtStartup = !KeychainManager.isUnavailable
+        if !keychainReadHealthyAtStartup {
+            print("[ConfigManager] Keychain was unreadable at startup — empty key fields are placeholders; refusing to clear stored keys this session.")
+        }
 
         // Auth policy is the documented "jxproxy" default. One-time sweep:
         // clear any token minted by the earlier random-token protocol (32 hex
@@ -586,6 +850,104 @@ final class ConfigManager: @unchecked Sendable {
         // provider id so old installs keep routing to the same local server.
         if provider == "llamacpp" {
             provider = "llamaapp"
+        }
+    }
+
+    /// Keeps the app's shell-config import fresh while it runs.
+    private var shellConfigWatcher: ShellConfigWatcher?
+
+    /// Start watching the shell config files for edits. When one changes, the
+    /// import re-runs (fills only empty Keychain slots) and a notification is
+    /// posted so the Settings UI can surface newly detected keys live.
+    private func startShellConfigWatcher() {
+        let paths = shellConfigPaths.map { NSString(string: $0).expandingTildeInPath }
+        let watcher = ShellConfigWatcher(paths: paths) { [weak self] in
+            guard let self else { return }
+            let imported = self.importKeysFromShellConfigs()
+            guard !imported.isEmpty else { return }
+            print("[ConfigManager] Re-imported shell-config keys while running: \(imported.joined(separator: ", "))")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .jxproxyShellKeysImported,
+                    object: self,
+                    userInfo: ["imported": imported]
+                )
+            }
+        }
+        watcher.start()
+        shellConfigWatcher = watcher
+    }
+
+    // MARK: - Startup Keychain Recovery
+
+    /// Number of recovery passes performed this session (bounded so a repair
+    /// that can't complete never turns into a background prompt loop).
+    private var keychainRecoveryPasses = 0
+
+    /// Schedule the first startup recovery pass shortly after launch. Runs off
+    /// the main thread so startup never blocks on (or prompts from) the
+    /// Keychain.
+    private func scheduleStartupKeychainRecovery() {
+        let queue = DispatchQueue(label: "com.jxproxy.keychain-recovery")
+        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.performKeychainRecoveryPass()
+        }
+    }
+
+    /// One recovery pass: self-heal the items' access control (so reads never
+    /// prompt), re-import keys from the shell configs into empty slots, and
+    /// refresh the startup-health snapshot.
+    ///
+    /// The ACL self-heal runs at most ONCE per launch. Retrying it on a timer
+    /// re-presented the "JXRouter wants to make changes to your keychain"
+    /// password dialog on every pass when the user declined — the recurring
+    /// macOS password prompt. One prompt-free attempt either repairs the
+    /// items (unlocked keychain + the app trusted) or silently defers to the
+    /// next launch.
+    ///
+    /// While the Keychain stays unavailable (locked at login, securityd
+    /// stalled) the pass re-schedules itself for the read side only, so the
+    /// app never stays key-less for the whole session — these re-runs are
+    /// prompt-free.
+    private func performKeychainRecoveryPass() {
+        keychainRecoveryPasses += 1
+
+        if keychainRecoveryPasses == 1 {
+            // First pass: one prompt-free ACL self-heal attempt. The Keychain
+            // reads below are also prompt-free (kSecUseAuthenticationUIFail),
+            // so this pass can never trigger a password dialog.
+            let repairsDone = KeychainManager.repairAccessControlForAllKeys()
+            if !repairsDone {
+                print("[ConfigManager] ACL repair incomplete (silent) — items not trusted by this build stay unreadable until re-entered; not retrying this session.")
+            }
+        }
+
+        let imported = importKeysFromShellConfigs()
+        if !imported.isEmpty {
+            print("[ConfigManager] Startup recovery imported \(imported.count) key(s) from shell configs")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .jxproxyShellKeysImported,
+                    object: self,
+                    userInfo: ["imported": imported]
+                )
+            }
+        }
+
+        // Refresh the health snapshot so the empty-save guard reflects the
+        // CURRENT state (a benign race on a Bool — worst case one extra
+        // refused delete, which is the safe direction).
+        keychainReadHealthyAtStartup = !KeychainManager.isUnavailable
+
+        // Reschedule ONLY for a genuinely unresponsive Keychain (reads still
+        // failing). Pending ACL repairs are NEVER retried in-session — a
+        // declined prompt must not become a prompt loop.
+        let keychainStillDown = KeychainManager.isUnavailable && keychainRecoveryPasses < 30
+        if keychainStillDown {
+            print("[ConfigManager] Keychain still unavailable after pass \(keychainRecoveryPasses) — rescheduling read retry in 60s")
+            DispatchQueue.global().asyncAfter(deadline: .now() + 60) { [weak self] in
+                self?.performKeychainRecoveryPass()
+            }
         }
     }
 
@@ -706,7 +1068,10 @@ final class ConfigManager: @unchecked Sendable {
         case "openai": return openaiBaseUrl
         case "nvidia-nim": return "https://integrate.api.nvidia.com/v1"
         case "deepseek": return "https://api.deepseek.com/v1"
-        case "gemini": return "https://generativelanguage.googleapis.com/v1beta"
+        // The API-key "gemini" preset goes through the OpenAI-compatible
+        // surface, which is where the router's chat/completions path points
+        // and which accepts bearer API keys.
+        case "gemini": return "https://generativelanguage.googleapis.com/v1beta/openai"
         case "mistral": return "https://api.mistral.ai/v1"
         case "codestral": return "https://codestral.mistral.ai/v1"
         case "cohere": return "https://api.cohere.ai/v1"
@@ -727,10 +1092,19 @@ final class ConfigManager: @unchecked Sendable {
         case "ai-gateway": return "https://gateway.ai.vercel.ai/v1"
         case "local", "ollama": return localLlmBaseUrl
         case "lmstudio": return "http://127.0.0.1:1234/v1"
-        case "llamaapp": return "http://127.0.0.1:8080/v1"
+        // llama.app's server port is NOT stable (it rebinds after relaunches,
+        // observed 8080 → 9931) — resolve the LIVE port from the running
+        // process so every caller (validation, health checks, model fetches)
+        // talks to the real endpoint instead of a stale 8080.
+        case "llamaapp": return "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
         // Legacy alias — old installs stored "llamacpp" as the provider id.
-        case "llamacpp": return "http://127.0.0.1:8080/v1"
+        case "llamacpp": return "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
         case "jan": return "http://127.0.0.1:1337/v1"
+        case "unsloth": return "http://127.0.0.1:8000/v1"
+        // Direct GGUF hosting via llama-server (Homebrew llama.cpp).
+        case "gguf": return "http://127.0.0.1:\(ggufPort)/v1"
+        case "gemini-oauth": return "https://generativelanguage.googleapis.com/v1beta/openai"
+        case "antigravity": return "https://api.antigravity.dev/v1"
         case "custom":
             // The custom provider's endpoint lives in providerBackendUrls;
             // fall back to a sensible OpenAI-compatible default.
@@ -904,3 +1278,58 @@ extension Int {
     /// Return self if non-zero, otherwise nil.
     fileprivate var nonzero: Int? { self == 0 ? nil : self }
 }
+
+/// Watches the shell config files for edits while the app runs, firing
+/// `onChange` when any of them is touched. Uses a lightweight mtime poll
+/// rather than a DispatchSource fd watch: editors commonly save via
+/// write-temp-then-rename (atomic saves), which a single fd watch can miss or
+/// lose after the inode is replaced — a stat every few seconds catches every
+/// real edit and costs almost nothing.
+final class ShellConfigWatcher {
+    private var timer: DispatchSourceTimer?
+    private let paths: [String]
+    private var lastModified: [String: Date?]
+    private let onChange: () -> Void
+
+    init(paths: [String], onChange: @escaping () -> Void) {
+        self.paths = paths
+        self.onChange = onChange
+        lastModified = Dictionary(uniqueKeysWithValues: paths.map { ($0, Self.modDate($0)) })
+    }
+
+    func start() {
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "com.jxproxy.shell-config-watch", qos: .utility)
+        )
+        timer.schedule(deadline: .now() + 3, repeating: 5, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.poll()
+        }
+        timer.resume()
+        self.timer = timer
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    private func poll() {
+        var changed = false
+        for path in paths {
+            let current = Self.modDate(path)
+            if current != lastModified[path] ?? nil {
+                lastModified[path] = current
+                changed = true
+            }
+        }
+        if changed {
+            onChange()
+        }
+    }
+
+    private static func modDate(_ path: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date
+    }
+}
+

@@ -1,111 +1,73 @@
 import Foundation
-import Darwin
+import Network
 
-/// Resolves hostnames to IP addresses using Cloudflare DNS-over-HTTPS,
-/// falling back to system resolver (getaddrinfo) if the external query fails.
-///
-/// The resolved IP is used by CurlClient with `--resolve` to bypass
-/// the system proxy settings and connect directly to the upstream provider.
-final class DirectDNSResolver {
+/// Lightweight DNS resolver that returns an IP address for a hostname.
+/// Used by CurlClient to connect directly to IPs, bypassing slow or
+/// poisoned system DNS resolvers.
+struct DirectDNSResolver {
     static let shared = DirectDNSResolver()
 
-    private var cache: [String: String] = [:]
-
-    func resolve(_ hostname: String) async -> String? {
-        if let cached = cache[hostname] { return cached }
-
-        // Local / loopback — skip DNS entirely
-        if hostname == "127.0.0.1" || hostname == "localhost" || hostname == "0.0.0.0" {
-            cache[hostname] = hostname
-            return hostname
+    /// Single-shot completion gate: the connection state handler and the
+    /// timeout both fire, but the continuation may be resumed only once (a
+    /// second resume is a runtime crash). Thread-safe and Sendable.
+    private final class ResolveGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        func markDone() -> Bool {
+            lock.withLock {
+                if done { return false }
+                done = true
+                return true
+            }
         }
-
-        // Already an IP address — no need to resolve
-        if hostname.allSatisfy({ $0.isASCII && ($0.isNumber || $0 == "." || $0 == ":") }),
-           hostname.split(separator: ".").count == 4 {
-            cache[hostname] = hostname
-            return hostname
-        }
-
-        // Try Cloudflare DoH first (fast, privacy-respecting)
-        if let ip = await resolveViaDoH(hostname) {
-            cache[hostname] = ip
-            return ip
-        }
-
-        // Fallback to system DNS (getaddrinfo) — works even when
-        // cloudflare-dns.com is unreachable.
-        if let ip = resolveViaSystem(hostname) {
-            cache[hostname] = ip
-            return ip
-        }
-
-        return nil
     }
 
-    private func resolveViaDoH(_ hostname: String) async -> String? {
-        guard let url = URL(string: "https://cloudflare-dns.com/dns-query?name=\(hostname)&type=A") else { return nil }
-        var request = URLRequest(url: url)
-        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = 5
+    /// Resolve a hostname to its first IPv4 address. Returns the original
+    /// hostname on failure so callers can still attempt a connection.
+    func resolve(_ host: String) async -> String? {
+        return await withCheckedContinuation { continuation in
+            let parameters = NWParameters()
+            let endpoint = NWEndpoint.Host(host)
+            let connection = NWConnection(host: endpoint, port: 80, using: parameters)
+            let gate = ResolveGate()
 
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let answer = json["Answer"] as? [[String: Any]] else {
-                return nil
-            }
-            for record in answer {
-                if let type = record["type"] as? Int, type == 1, let ip = record["data"] as? String {
-                    return ip
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    guard gate.markDone() else { return }
+                    connection.cancel()
+                    if case .hostPort(let h, _) = connection.currentPath?.remoteEndpoint {
+                        let resolved: String
+                        switch h {
+                        case .ipv4(let addr):
+                            var sa = addr
+                            resolved = withUnsafePointer(to: &sa) {
+                                $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { ptr in
+                                    String(cString: inet_ntoa(ptr.pointee.sin_addr))
+                                }
+                            }
+                        default:
+                            resolved = host
+                        }
+                        continuation.resume(returning: resolved)
+                    } else {
+                        continuation.resume(returning: host)
+                    }
+                case .failed:
+                    guard gate.markDone() else { return }
+                    connection.cancel()
+                    continuation.resume(returning: host)
+                default:
+                    break
                 }
             }
-        } catch {
-            print("[DirectDNSResolver] DoH failed for \(hostname): \(error)")
-        }
-        return nil
-    }
-
-    // FIX #8: Run getaddrinfo on a background thread with a 10-second timeout.
-    // Previously there was no timeout — getaddrinfo can block for 30+ seconds
-    // depending on system DNS configuration (multi-DNS, VPN, mDNSResponder issues).
-    private func resolveViaSystem(_ hostname: String) -> String? {
-        let semaphore = DispatchSemaphore(value: 0)
-        var resultIP: String?
-
-        DispatchQueue.global().async {
-            var hints = addrinfo(
-                ai_flags: 0,
-                ai_family: AF_INET,
-                ai_socktype: SOCK_STREAM,
-                ai_protocol: 0,
-                ai_addrlen: 0,
-                ai_canonname: nil,
-                ai_addr: nil,
-                ai_next: nil
-            )
-            var addrInfo: UnsafeMutablePointer<addrinfo>? = nil
-            let result = getaddrinfo(hostname, nil, &hints, &addrInfo)
-            guard result == 0, let info = addrInfo else {
-                print("[DirectDNSResolver] getaddrinfo failed for \(hostname): \(result)")
-                semaphore.signal()
-                return
+            connection.start(queue: .global(qos: .userInitiated))
+            // Timeout after 3 seconds
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                guard gate.markDone() else { return }
+                connection.cancel()
+                continuation.resume(returning: host)
             }
-            defer { freeaddrinfo(addrInfo) }
-
-            let addr = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-            let ipBytes = addr.sin_addr
-            let ipStr = String(cString: inet_ntoa(ipBytes))
-            resultIP = ipStr
-            semaphore.signal()
         }
-
-        // Wait up to 10 seconds for system DNS resolution
-        guard semaphore.wait(timeout: .now() + 10) == .success else {
-            print("[DirectDNSResolver] getaddrinfo timed out for \(hostname)")
-            return nil
-        }
-
-        return resultIP
     }
 }

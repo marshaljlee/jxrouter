@@ -2,9 +2,11 @@ import Foundation
 import Observation
 
 /// Manages the local model servers JXProxy can start on this Mac: the Llama
-/// desktop app (llama.app) and Ollama. Provides start/stop lifecycle and
+/// desktop app (llama.app), Ollama, and direct GGUF models via `llama-server`
+/// (the Homebrew llama.cpp server binary). Provides start/stop lifecycle and
 /// status tracking. llama.app is launched as a GUI app whose built-in server
-/// serves on port 8080; Ollama runs as a background server process.
+/// serves on port 8080; Ollama runs as a background server process; GGUF models
+/// are served directly by an in-process `llama-server` child process.
 @MainActor
 @Observable
 final class LocalModelManager {
@@ -22,18 +24,22 @@ final class LocalModelManager {
     enum LocalProvider: String, CaseIterable {
         case llamaapp = "llamaapp"
         case ollama = "ollama"
+        /// Direct GGUF hosting via llama-server (Homebrew llama.cpp)
+        case gguf = "gguf"
 
         var serverName: String {
             switch self {
             case .llamaapp: return "Llama"
             case .ollama: return "ollama"
+            case .gguf: return "llama-server"
             }
         }
 
         var defaultPort: Int {
             switch self {
-            case .llamaapp: return 8080
+            case .llamaapp: return 9931
             case .ollama: return 11434
+            case .gguf: return 8081
             }
         }
 
@@ -48,11 +54,26 @@ final class LocalModelManager {
         if case .running = status { return true }
         return false
     }
-    var port: Int = 8080
+    var port: Int = 9931
     var host: String = "127.0.0.1"
 
     /// Custom path to the Ollama binary. Empty = auto-search common locations.
     var customBinaryPath: String = ""
+
+    /// The selected GGUF model file path (set when the user picks a model).
+    var selectedGGUFPath: String = ""
+
+    /// The model name alias to register with llama-server (defaults to filename stem).
+    var ggufModelAlias: String = "local-model"
+
+    /// GPU layers to offload (default: 0 = CPU only, -1 = all layers).
+    var ggufGpuLayers: Int = 0
+
+    /// Context size override (0 = use model's default).
+    var ggufContextSize: Int = 0
+
+    /// Chat template override for llama-server (empty = auto-detect via LocalChatTemplateEngine).
+    var ggufChatTemplate: String = ""
 
     private var process: Process?
 
@@ -91,6 +112,8 @@ final class LocalModelManager {
             } else {
                 status = .failed(diagnoseLlamaServerFailure())
             }
+        case .gguf:
+            await startGGUF()
         case .ollama:
             guard let binPath = binaryPath() else {
                 status = .failed("ollama not found. Install via: brew install ollama.")
@@ -145,26 +168,47 @@ final class LocalModelManager {
         }
     }
 
-    /// Stop the local model server — quit the Llama app, or kill ollama.
+    /// Stop the local model server — quit the Llama app, kill ollama, or
+    /// terminate the llama-server child process (GGUF).
     func stop() {
         if case .running(let pid) = status, pid > 0 {
             kill(pid: pid)
             print("[LocalModel] Server stopped (was PID \(pid))")
         }
 
-        if provider == .llamaapp {
+        switch provider {
+        case .llamaapp:
             // Quit the Llama app gracefully; its local server goes down with it.
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             task.arguments = ["-e", "tell application \"Llama\" to quit"]
-            try? task.run()
-            task.waitUntilExit()
-        } else {
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                print("[LocalModel] Failed to quit Llama app: \(error)")
+            }
+        case .gguf:
+            // llama-server child process — terminate it directly if tracked.
+            if let proc = process, proc.isRunning {
+                proc.terminate()
+                // Give it a moment to clean up, then force-kill if needed.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak proc, weak self] in
+                    if let proc, proc.isRunning {
+                        self?.kill(pid: proc.processIdentifier)
+                    }
+                }
+            }
+        case .ollama:
             let pkill = Process()
             pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
             pkill.arguments = ["-f", provider.serverName]
-            try? pkill.run()
-            pkill.waitUntilExit()
+            do {
+                try pkill.run()
+                pkill.waitUntilExit()
+            } catch {
+                print("[LocalModel] Failed to pkill \(provider.serverName): \(error)")
+            }
         }
 
         process = nil
@@ -207,6 +251,176 @@ final class LocalModelManager {
         return "The Llama app is running but its local server isn't answering on port \(port). Open the app, load a model, and make sure the local server is enabled."
     }
 
+    /// Start the GGUF model server (llama-server) with the selected model.
+    /// Discovers the llama-server binary, launches it as a child process, and
+    /// waits for the OpenAI-compatible endpoint to answer.
+    private func startGGUF() async {
+        guard !selectedGGUFPath.isEmpty else {
+            status = .failed("No GGUF model file selected. Pick a model first.")
+            return
+        }
+
+        guard FileManager.default.isReadableFile(atPath: selectedGGUFPath) else {
+            status = .failed("Cannot read GGUF model file: \(selectedGGUFPath)")
+            return
+        }
+
+        guard let serverPath = findLlamaServer() else {
+            status = .failed("llama-server not found. Install via: brew install llama.cpp")
+            return
+        }
+
+        // If a server is already answering on our port, adopt it
+        if await healthCheck() {
+            status = .running(pid: 0)
+            print("[LocalModel] llama-server already running on port \(port)")
+            return
+        }
+
+        print("[LocalModel] Launching llama-server: \(serverPath)")
+        print("[LocalModel]   Model: \(selectedGGUFPath)")
+        print("[LocalModel]   Port: \(port)")
+        print("[LocalModel]   Alias: \(ggufModelAlias)")
+        print("[LocalModel]   GPU layers: \(ggufGpuLayers)")
+        print("[LocalModel]   Context size: \(ggufContextSize)")
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: serverPath)
+
+        var args: [String] = []
+        args.append(contentsOf: ["-m", selectedGGUFPath])
+        args.append(contentsOf: ["--host", "127.0.0.1"])
+        args.append(contentsOf: ["--port", "\(port)"])
+        args.append(contentsOf: ["-a", ggufModelAlias])
+
+        // GPU offloading
+        if ggufGpuLayers > 0 {
+            args.append(contentsOf: ["-ngl", "\(ggufGpuLayers)"])
+        } else if ggufGpuLayers == -1 {
+            args.append(contentsOf: ["-ngl", "999"])
+        }
+
+        // Context size override
+        if ggufContextSize > 0 {
+            args.append(contentsOf: ["-c", "\(ggufContextSize)"])
+        }
+
+        // Chat template resolution & Jinja activation
+        let effectiveTemplate = !ggufChatTemplate.isEmpty
+            ? ggufChatTemplate
+            : LocalChatTemplateEngine.detectLlamaServerTemplate(forPath: selectedGGUFPath, alias: ggufModelAlias)
+        args.append("--jinja")
+        args.append(contentsOf: ["--chat-template", effectiveTemplate])
+
+        print("[LocalModel]   Chat template: \(effectiveTemplate) (Jinja enabled)")
+
+        // Reasonable defaults for an API server
+        args.append(contentsOf: ["-to", "600"]) // 10min timeout for long context
+        // `--parallel` enables multiple concurrent requests (Claude Code often
+        // fires parallel tool calls) — the server's default of 1 would serialize
+        // them and stall tool-calling turns.
+        args.append(contentsOf: ["--parallel", "4"])
+
+        proc.arguments = args
+
+        // Redirect stdout/stderr to log files
+        let stdoutPath = "/tmp/llama-server-stdout.log"
+        let stderrPath = "/tmp/llama-server-stderr.log"
+        FileManager.default.createFile(atPath: stdoutPath, contents: nil)
+        FileManager.default.createFile(atPath: stderrPath, contents: nil)
+
+        let stdoutHandle = FileHandle(forWritingAtPath: stdoutPath) ?? FileHandle.standardOutput
+        let stderrHandle = FileHandle(forWritingAtPath: stderrPath) ?? FileHandle.standardError
+        proc.standardOutput = stdoutHandle
+        proc.standardError = stderrHandle
+
+        do {
+            try proc.run()
+            process = proc
+            print("[LocalModel] llama-server launched (PID \(proc.processIdentifier))")
+
+            if await waitForHealth(timeout: 60) {
+                status = .running(pid: proc.processIdentifier)
+                print("[LocalModel] llama-server is up (port \(port))")
+            } else {
+                // Read stderr for diagnostics
+                let diag = diagnoseGGUFFailure(stderrPath: stderrPath)
+                status = .failed(diag)
+                proc.terminate()
+                process = nil
+            }
+        } catch {
+            status = .failed("Failed to launch llama-server: \(error.localizedDescription)")
+            process = nil
+        }
+    }
+
+    /// Diagnose why llama-server failed to start by reading stderr.
+    private func diagnoseGGUFFailure(stderrPath: String) -> String {
+        guard let data = FileManager.default.contents(atPath: stderrPath),
+              let text = String(data: data, encoding: .utf8) else {
+            return "llama-server failed to start (no diagnostic output available)"
+        }
+        let lines = text.split(separator: "\n").map(String.init)
+        // Grab the last few error-looking lines
+        let relevant = lines.filter { line in
+            let l = line.lowercased()
+            return l.contains("error") || l.contains("failed") || l.contains("assert")
+                || l.contains("out of memory") || l.contains("cannot") || l.contains("unable")
+        }
+        if let last = relevant.last {
+            return "llama-server error: \(last.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+        if let last = lines.last {
+            return "llama-server: \(last.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+        return "llama-server failed to start (check /tmp/llama-server-stderr.log)"
+    }
+
+    /// Find the llama-server binary. Checks Homebrew and common locations.
+    private func findLlamaServer() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/llama-server",
+            "/usr/local/bin/llama-server",
+            "/opt/homebrew/bin/llama",
+            "/usr/local/bin/llama",
+        ]
+        for c in candidates {
+            if FileManager.default.isExecutableFile(atPath: c) {
+                // If the binary is `llama` (the multi-call binary), we need
+                // to invoke it as `llama-server` — symlink or rename.
+                if c.hasSuffix("llama-server") { return c }
+                // The `llama` multi-call binary accepts `server` as subcommand
+                if c.hasSuffix("llama") {
+                    // Check if there's a llama-server symlink
+                    let serverLink = c.replacingOccurrences(of: "/llama", with: "/llama-server")
+                    if FileManager.default.isExecutableFile(atPath: serverLink) {
+                        return serverLink
+                    }
+                    // Fall back to using `llama server` via shell
+                    return c
+                }
+            }
+        }
+        // Try `which` with a proper PATH
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        task.arguments = ["llama-server"]
+        task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let p = path, !p.isEmpty, FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return nil
+    }
+
     /// Last N non-empty lines of a log file (best-effort, read-only).
     private func tailLog(_ path: String, lines: Int) -> [String] {
         guard let data = FileManager.default.contents(atPath: path),
@@ -234,7 +448,10 @@ final class LocalModelManager {
 
     /// Health-check against the server's OpenAI-compatible endpoint.
     private func healthCheck() async -> Bool {
-        let baseURL = "http://\(host):\(port)"
+        // llama.app's server port is not stable (it can move after relaunches)
+        // — resolve the live port so the health check matches reality.
+        let effectivePort = provider == .llamaapp ? LocalServerDiscovery.liveLlamaPort() : port
+        let baseURL = "http://\(host):\(effectivePort)"
         guard let url = URL(string: "\(baseURL)/health") ?? URL(string: "\(baseURL)/v1/models") else { return false }
 
         for _ in 0..<10 {
@@ -263,6 +480,24 @@ final class LocalModelManager {
 
     // MARK: - Readiness & Auto-Detect
 
+    /// Re-check whether the local server is actually answering, so the UI
+    /// ("Llama not running" etc.) reflects reality. llama.app is frequently
+    /// started manually outside JXProxy — its live port is discovered from
+    /// the running process, so a manual start is adopted as "running" instead
+    /// of being reported as stopped. An in-flight start is never overridden.
+    func refreshStatus() async {
+        guard provider == .llamaapp || provider == .gguf else { return }
+        let effectivePort = provider == .llamaapp ? LocalServerDiscovery.liveLlamaPort() : port
+        if await healthCheck() {
+            if !isRunning {
+                status = .running(pid: 0)
+                print("[LocalModel] Adopted \(provider.serverName) server already running on port \(effectivePort)")
+            }
+        } else if case .running(0) = status {
+            status = .stopped
+        }
+    }
+
     enum LocalModelReadiness {
         /// The app/binary is available — can start now.
         case ready
@@ -282,6 +517,12 @@ final class LocalModelManager {
             return (appInstalled("Llama") || appInstalled("LlamaChat")) ? .ready : .needsInstall
         case .ollama:
             return binaryPath() != nil ? .ready : .needsInstall
+        case .gguf:
+            // GGUF needs a selected model file AND the llama-server binary.
+            guard !selectedGGUFPath.isEmpty, FileManager.default.isReadableFile(atPath: selectedGGUFPath) else {
+                return .needsInstall
+            }
+            return findLlamaServer() != nil ? .ready : .needsInstall
         }
     }
 
@@ -291,8 +532,12 @@ final class LocalModelManager {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         task.arguments = ["-a", name]
-        try? task.run()
-        task.waitUntilExit()
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            print("[LocalModel] Failed to open app \(name): \(error)")
+        }
     }
 
     private func appInstalled(_ name: String) -> Bool {
@@ -305,8 +550,12 @@ final class LocalModelManager {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/kill")
         task.arguments = ["-9", "\(pid)"]
-        try? task.run()
-        task.waitUntilExit()
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            print("[LocalModel] Failed to kill PID \(pid): \(error)")
+        }
     }
 
     /// Find the Ollama binary. Checks custom path first, then common Homebrew
@@ -342,8 +591,12 @@ final class LocalModelManager {
         task.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        try? task.run()
-        task.waitUntilExit()
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            print("[LocalModel] which lookup failed: \(error)")
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let p = path, !p.isEmpty, FileManager.default.isExecutableFile(atPath: p) {

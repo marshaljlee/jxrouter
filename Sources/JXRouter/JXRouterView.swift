@@ -3,15 +3,19 @@ import AppKit
 
 struct JXRouterView: View {
     @Bindable var manager: ProxyManager
-    @Environment(\.openSettings) private var showSettings
-    @State private var isSettingsPresented = false
+    /// Observed so the YOUR SETUP card reflects the Route OpenAI switch live.
+    @State private var config = ConfigManager.shared
     @State private var showOnboarding = false
-    /// Whether the Detected Apps panel is collapsed (window shrinks to match).
+    /// Whether the Detected Apps list is collapsed (the card keeps its fixed
+    /// height — the window's content size must never change, see below).
     @State private var isDetectedAppsCollapsed = false
     /// Free API key guide — auto-presented after first-launch onboarding when
     /// the user hasn't configured any provider key yet.
     @State private var showApiKeyGuide = false
-    
+    /// Current light/dark appearance — tracks AppearanceController.shared.mode
+    private var appearanceMode: AppearanceMode {
+        AppearanceController.shared.mode
+    }
     // Derived proxy stats for the dashboard
     private var requestsCount: Int {
         manager.proxyServer.stats.aiRouted + manager.proxyServer.stats.passthrough
@@ -108,6 +112,32 @@ struct JXRouterView: View {
                 .accessibilityLabel("Uninstall JXProxy")
             }
             .padding(.horizontal, 16)
+
+            if !manager.errorAcknowledged, let errorText = manager.errorMessage {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(errorText)
+                        .font(.system(size: 11))
+                        .lineLimit(3)
+                    Spacer()
+                    Button {
+                        manager.errorAcknowledged = true
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss error")
+                }
+                .padding(10)
+                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.horizontal, 16)
+            }
             
             Spacer().frame(height: 20)
             
@@ -128,6 +158,15 @@ struct JXRouterView: View {
                     StatusSummaryRow(icon: "arrow.triangle.branch", label: "Provider", value: manager.activeProviderName)
                     Divider().overlay(Color.dsBorder.opacity(0.5))
                     StatusSummaryRow(icon: "cpu", label: "Model", value: manager.currentModel.isEmpty ? "—" : manager.currentModel)
+                    Divider().overlay(Color.dsBorder.opacity(0.5))
+                    // Route OpenAI switch — visible at a glance, changes live with
+                    // the Settings toggle (ConfigManager is @Observable).
+                    StatusSummaryRow(
+                        icon: "globe",
+                        label: "OpenAI",
+                        value: config.routeOpenAI ? "Routed" : "Pass Through",
+                        valueColor: config.routeOpenAI ? .dsGreen : .dsTextSecondary
+                    )
                     Divider().overlay(Color.dsBorder.opacity(0.5))
                     StatusSummaryRow(icon: "network", label: "Traffic", value: "\(requestsCount) request\(requestsCount == 1 ? "" : "s") handled")
                 }
@@ -166,7 +205,7 @@ struct JXRouterView: View {
                     Divider().overlay(Color.dsBorder.opacity(0.5))
                     DetailRow(label: "Auth Token", value: manager.authToken, mono: true, copyable: true)
                     Divider().overlay(Color.dsBorder.opacity(0.5))
-                    DetailRow(label: "Version", value: "1.0.0")
+                    DetailRow(label: "Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
                 }
                 .background(Color.dsSurface)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -198,56 +237,70 @@ struct JXRouterView: View {
                 .padding(.horizontal, 20)
                 .accessibilityLabel(isDetectedAppsCollapsed ? "Expand detected apps" : "Collapse detected apps")
                 
-                // Detected app list
-                if isDetectedAppsCollapsed {
-                    EmptyView()
-                } else if manager.appDetector.detectedApps.isEmpty {
-                    // Empty state
-                    VStack(spacing: 8) {
-                        Image(systemName: "point.3.connected.trianglepath.dotted")
-                            .font(.system(size: 20))
-                            .foregroundStyle(Color.dsTextSecondary)
-                        Text("Listening on port \(manager.currentPort)...")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Color.dsTextSecondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
-                    .background(Color.dsSurface)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal, 16)
-                } else {
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            ForEach(manager.appDetector.detectedApps, id: \.self) { appName in
-                                HStack(spacing: 8) {
-                                    Image(systemName: "app.fill")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(Color.dsAccent)
-                                    Text(appName)
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(Color.dsTextPrimary)
-                                    Spacer()
-                                    Image(systemName: "circle.fill")
-                                        .font(.system(size: 6))
-                                        .foregroundStyle(Color.dsGreen)
+                // Detected app list — fixed 168pt card in every state. The
+                // window's content size must NEVER change: on macOS 26 any
+                // change to the hosting view's ideal size while the window is
+                // displayed re-enters the constraint pass and crashes the app
+                // (`_postWindowNeedsUpdateConstraints` overflow). Collapsing
+                // only blanks the card; the window stays the same size.
+                Group {
+                    if isDetectedAppsCollapsed {
+                        Color.dsSurface
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.dsBorder, lineWidth: 1)
+                            )
+                    } else if manager.appDetector.detectedApps.isEmpty {
+                        // Empty state
+                        VStack(spacing: 8) {
+                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                                .font(.system(size: 20))
+                                .foregroundStyle(Color.dsTextSecondary)
+                            Text("Listening on port \(manager.currentPort)...")
+                                .font(.system(size: 12))
+                                .foregroundStyle(Color.dsTextSecondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.dsSurface)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.dsBorder, lineWidth: 1)
+                        )
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 0) {
+                                ForEach(manager.appDetector.detectedApps, id: \.self) { appName in
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "app.fill")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(Color.dsAccent)
+                                        Text(appName)
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(Color.dsTextPrimary)
+                                        Spacer()
+                                        Image(systemName: "circle.fill")
+                                            .font(.system(size: 6))
+                                            .foregroundStyle(Color.dsGreen)
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(Color.dsSurface)
+                                    Divider().background(Color.dsBorder)
                                 }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(Color.dsSurface)
-                                Divider().background(Color.dsBorder)
                             }
                         }
+                        .background(Color.dsSurface)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.dsBorder, lineWidth: 1)
+                        )
                     }
-                    .frame(height: 168)
-                    .background(Color.dsSurface)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.dsBorder, lineWidth: 1)
-                    )
-                    .padding(.horizontal, 16)
                 }
+                .frame(height: 168)
+                .padding(.horizontal, 16)
             }
             }
             // Bottom margin matches the side margins (16pt) — the panel's last
@@ -271,7 +324,7 @@ struct JXRouterView: View {
                     .accessibilityLabel("Tutorial")
                     .help("Reopen the onboarding tutorial")
 
-                    Button(action: openSettings) {
+                    Button(action: { openSettings() }) {
                         Image(systemName: "gearshape.fill")
                             .font(.system(size: 13))
                     }
@@ -279,6 +332,17 @@ struct JXRouterView: View {
                     .foregroundStyle(Color.dsTextSecondary)
                     .accessibilityLabel("Open Settings")
                     .help("Open settings")
+
+                    // Dark / light toggle — sits right next to the settings
+                    // gear and follows the app's persisted appearance mode.
+                    Button(action: toggleAppearance) {
+                        Image(systemName: appearanceMode.symbolName)
+                            .font(.system(size: 13))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .accessibilityLabel("Toggle dark mode")
+                    .help(appearanceMode.isDark ? "Switch to light mode" : "Switch to dark mode")
                 }
                 // Negative top offset compensates the ~28pt title-bar inset of
                 // the content area, aligning the icons with the traffic lights.
@@ -286,16 +350,11 @@ struct JXRouterView: View {
                 .padding(.trailing, 14)
             }
         
-        // Slide-out Settings Panel
-        if isSettingsPresented {
-            Divider()
-                .ignoresSafeArea()
-            SettingsView(manager: manager)
-            .transition(.move(edge: .trailing))
-        }
         }
         .background(Color.dsBackground)
         .onAppear {
+            // Apply the persisted appearance (dark/light) to both windows.
+            AppearanceController.shared.apply()
             // First-launch onboarding splash
             if !UserDefaults.standard.bool(forKey: "hasSeenJXOnboarding") {
                 showOnboarding = true
@@ -328,19 +387,24 @@ struct JXRouterView: View {
         }
     }
     
-    private func openSettings() {
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            isSettingsPresented.toggle()
-        }
+    /// Collapse / expand the Detected Apps list. The card keeps its fixed
+    /// height in both states, so the window's content size never changes — the
+    /// macOS 26 constraint-pass crash (`_postWindowNeedsUpdateConstraints`
+    /// overflow) fires whenever the hosting view's ideal size changes while
+    /// the window is displayed, so NO runtime window resize is performed.
+    /// Settings open in the separate fixed-size Settings window instead.
+    private func toggleDetectedApps() {
+        isDetectedAppsCollapsed.toggle()
     }
 
-    /// Collapse / expand the Detected Apps panel. The window follows the
-    /// content's intrinsic height (sizingOptions = .intrinsicContentSize), so
-    /// collapsing also reclaims the vertical space.
-    private func toggleDetectedApps() {
-        withAnimation(.easeInOut(duration: 0.15)) {
-            isDetectedAppsCollapsed.toggle()
-        }
+    /// Open the native Settings window (separate from the dashboard).
+    private func openSettings() {
+        NotificationCenter.default.post(name: .jxproxyOpenSettings, object: nil)
+    }
+
+    /// Flip between dark and light appearance across the whole app.
+    private func toggleAppearance() {
+        AppearanceController.shared.toggle()
     }
 
     /// Present the free API key guide a beat after the onboarding sheet has
