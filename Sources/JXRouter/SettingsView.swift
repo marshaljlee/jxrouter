@@ -1260,7 +1260,7 @@ struct SettingsView: View {
         saveConfigImmediately()
 
         Task {
-            await mgr.start()
+            await mgr.start(forceRestart: true)
             // Detect from live server in case server confirmed alias
             let (_, liveAlias) = await mgr.detectRunningGGUF(customPort: Int(ggufPort))
             if let alias = liveAlias, !alias.isEmpty {
