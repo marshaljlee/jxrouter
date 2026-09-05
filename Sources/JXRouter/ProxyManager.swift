@@ -19,7 +19,16 @@ final class ProxyManager {
         config.port
     }
     var currentModel: String {
-        config.model
+        if config.provider == "gguf" {
+            let activeAlias = LocalModelManager.shared.ggufModelAlias
+            if !activeAlias.isEmpty && activeAlias != "local-model" {
+                return activeAlias
+            }
+            if !config.ggufModelAlias.isEmpty && config.ggufModelAlias != "local-model" {
+                return config.ggufModelAlias
+            }
+        }
+        return config.model
     }
 
     // MARK: - Dashboard Connection Details

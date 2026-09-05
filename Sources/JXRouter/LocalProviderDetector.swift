@@ -34,12 +34,35 @@ struct LocalProviderDetector {
 
     /// Probe every known local runtime concurrently.
     static func detect() async -> [LocalRuntime] {
-        async let ollama = probeOllama()
+        async let gguf = probeGGUF()
         async let llama = probeLlamaApp()
+        async let ollama = probeOllama()
         async let lmstudio = probeLMStudio()
         async let jan = probeJan()
         async let unsloth = probeUnsloth()
-        return await [ollama, llama, lmstudio, jan, unsloth]
+        return await [gguf, llama, ollama, lmstudio, jan, unsloth]
+    }
+
+    private static func probeGGUF() async -> LocalRuntime {
+        let port = ConfigManager.shared.ggufPort > 0 ? ConfigManager.shared.ggufPort : 8081
+        let healthOK = await httpOK("http://127.0.0.1:\(port)/health")
+        let modelsOK: Bool
+        if healthOK {
+            modelsOK = true
+        } else {
+            modelsOK = await httpOK("http://127.0.0.1:\(port)/v1/models")
+        }
+        let running = healthOK || modelsOK
+        let installed = running || (LocalModelManager.findLlamaServer() != nil)
+        return LocalRuntime(
+            id: "gguf", name: "GGUF (Direct)", port: port,
+            state: state(running: running, installed: installed),
+            hint: running
+                ? "Ready — model is active in the built-in GGUF loader on port \(port)."
+                : (installed
+                    ? "Installed (llama.cpp) — select a GGUF model in Settings to load it."
+                    : "Not detected. Install llama.cpp via `brew install llama.cpp`.")
+        )
     }
 
     // MARK: - Individual probes

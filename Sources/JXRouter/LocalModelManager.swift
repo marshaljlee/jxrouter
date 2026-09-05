@@ -276,7 +276,8 @@ final class LocalModelManager {
         // If a server is already answering on our port, adopt it
         if await healthCheck() {
             status = .running(pid: 0)
-            print("[LocalModel] llama-server already running on port \(port)")
+            let (_, liveAlias) = await detectRunningGGUF(customPort: port)
+            print("[LocalModel] llama-server already running on port \(port): \(liveAlias ?? ggufModelAlias)")
             return
         }
 
@@ -397,7 +398,7 @@ final class LocalModelManager {
     }
 
     /// Find the llama-server binary. Checks Homebrew and common locations.
-    private func findLlamaServer() -> String? {
+    nonisolated static func findLlamaServer() -> String? {
         let candidates = [
             "/opt/homebrew/bin/llama-server",
             "/usr/local/bin/llama-server",
@@ -438,6 +439,10 @@ final class LocalModelManager {
             return p
         }
         return nil
+    }
+
+    nonisolated func findLlamaServer() -> String? {
+        Self.findLlamaServer()
     }
 
     /// Last N non-empty lines of a log file (best-effort, read-only).
@@ -512,9 +517,84 @@ final class LocalModelManager {
                 status = .running(pid: 0)
                 print("[LocalModel] Adopted \(provider.serverName) server already running on port \(effectivePort)")
             }
+            if provider == .gguf {
+                await detectRunningGGUF(customPort: effectivePort)
+            }
         } else if case .running(0) = status {
             status = .stopped
         }
+    }
+
+    /// Check any running local model server regardless of current provider.
+    func detectAnyRunningServer() async {
+        let ggufCheckPort = port > 0 ? port : ConfigManager.shared.ggufPort
+        await detectRunningGGUF(customPort: ggufCheckPort)
+        await refreshStatus()
+    }
+
+    /// Discovers any running llama-server on the configured port (or port 8081)
+    /// and queries its live loaded model metadata (/props and /v1/models).
+    @discardableResult
+    func detectRunningGGUF(customPort: Int? = nil) async -> (modelPath: String?, modelAlias: String?) {
+        let checkPort = customPort ?? (port > 0 ? port : 8081)
+        let baseURL = "http://127.0.0.1:\(checkPort)"
+
+        guard let propsURL = URL(string: "\(baseURL)/props"),
+              let modelsURL = URL(string: "\(baseURL)/v1/models") else {
+            return (nil, nil)
+        }
+
+        var detectedPath: String?
+        var detectedAlias: String?
+
+        // 1. Try /props (llama-server specific endpoint giving model_path, model_alias, etc.)
+        do {
+            var req = URLRequest(url: propsURL)
+            req.timeoutInterval = 1.5
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let alias = json["model_alias"] as? String, !alias.isEmpty {
+                    detectedAlias = alias
+                }
+                if let path = json["model_path"] as? String, !path.isEmpty {
+                    detectedPath = path
+                }
+            }
+        } catch {}
+
+        // 2. Try /v1/models if alias or path not found
+        if detectedAlias == nil || detectedPath == nil {
+            do {
+                var req = URLRequest(url: modelsURL)
+                req.timeoutInterval = 1.5
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let list = (json["data"] as? [[String: Any]]) ?? (json["models"] as? [[String: Any]]) ?? []
+                    if let first = list.first {
+                        let id = (first["id"] as? String) ?? (first["name"] as? String) ?? (first["model"] as? String)
+                        if detectedAlias == nil { detectedAlias = id }
+                    }
+                }
+            } catch {}
+        }
+
+        if let alias = detectedAlias, !alias.isEmpty {
+            self.ggufModelAlias = alias
+            ConfigManager.shared.ggufModelAlias = alias
+            if let path = detectedPath, !path.isEmpty {
+                self.selectedGGUFPath = path
+                ConfigManager.shared.ggufModelPath = path
+            }
+            if !isRunning {
+                self.status = .running(pid: 0)
+            }
+            print("[LocalModel] Detected running GGUF server on port \(checkPort): alias='\(alias)', path='\(detectedPath ?? "unknown")'")
+            return (detectedPath, detectedAlias)
+        }
+
+        return (nil, nil)
     }
 
     enum LocalModelReadiness {

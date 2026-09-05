@@ -564,8 +564,8 @@ struct SettingsView: View {
                 // Detect local runtimes and show their status.
                 localRuntimes = await LocalProviderDetector.detect()
                 // Sync the General tab's local-model quick control with the
-                // live server (llama.app may be running on its own port).
-                await LocalModelManager.shared.refreshStatus()
+                // live server (llama.app or built-in GGUF running on port 8081).
+                await LocalModelManager.shared.detectAnyRunningServer()
                 // Auto-scan for GGUF models from the background.
                 await scanGGUFModels()
                 // Auto-fetch every configured provider's full live model list
@@ -794,7 +794,32 @@ struct SettingsView: View {
                 // Model selection
                 HStack(spacing: 8) {
                     Menu {
-                        if ggufModels.isEmpty {
+                        // If a live llama-server is currently active, show its loaded model at the top
+                        let activeAlias = LocalModelManager.shared.ggufModelAlias
+                        let activePath = LocalModelManager.shared.selectedGGUFPath
+                        if !activeAlias.isEmpty && activeAlias != "local-model" {
+                            Button {
+                                ggufModelAlias = activeAlias
+                                if !activePath.isEmpty { ggufModelPath = activePath }
+                                config.ggufModelAlias = activeAlias
+                                if !activePath.isEmpty { config.ggufModelPath = activePath }
+                                if provider == "gguf" {
+                                    model = activeAlias
+                                    config.model = activeAlias
+                                    setTierModel(.defaultModel, activeAlias)
+                                }
+                                saveConfigImmediately()
+                            } label: {
+                                HStack {
+                                    Text("\(activeAlias) (Active in llama-server)")
+                                    if ggufModelAlias == activeAlias || ggufModelPath == activePath {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                            Divider()
+                        }
+                        if ggufModels.isEmpty && activeAlias.isEmpty {
                             Button("No models found — scan first") {}.disabled(true)
                         }
                         ForEach(ggufModels) { model in
@@ -811,7 +836,7 @@ struct SettingsView: View {
                                             .foregroundStyle(Color.dsTextTertiary)
                                     }
                                     Spacer()
-                                    if ggufModelPath == model.path {
+                                    if ggufModelPath == model.path || ggufModelAlias == model.suggestedAlias {
                                         Image(systemName: "checkmark")
                                             .foregroundStyle(Color.dsAccent)
                                     }
@@ -1069,10 +1094,18 @@ struct SettingsView: View {
 
     /// The currently selected GGUF model's display name.
     private var selectedGGUFDisplayName: String {
-        guard let model = ggufModels.first(where: { $0.path == ggufModelPath }) else {
-            return ggufModelPath.isEmpty ? "Select a GGUF model…" : (ggufModelPath as NSString).lastPathComponent
+        let activePath = !ggufModelPath.isEmpty ? ggufModelPath : LocalModelManager.shared.selectedGGUFPath
+        if let model = ggufModels.first(where: { $0.path == activePath }) {
+            return model.name
         }
-        return model.name
+        if !activePath.isEmpty {
+            return (activePath as NSString).lastPathComponent
+        }
+        let activeAlias = !ggufModelAlias.isEmpty ? ggufModelAlias : LocalModelManager.shared.ggufModelAlias
+        if !activeAlias.isEmpty && activeAlias != "local-model" {
+            return activeAlias
+        }
+        return "Select a GGUF model…"
     }
 
     /// The currently selected mmproj projector display name.
@@ -1122,7 +1155,8 @@ struct SettingsView: View {
         case .starting: return "Loading model…"
         case .running(let pid):
             if mgr.provider == .gguf {
-                return "llama-server running\(pid > 0 ? " (PID \(pid))" : "")"
+                let alias = !mgr.ggufModelAlias.isEmpty ? " (\(mgr.ggufModelAlias))" : ""
+                return "llama-server running\(alias)\(pid > 0 ? " [PID \(pid)]" : "")"
             }
             return "llama-server not running"
         case .failed(let msg): return "Failed: \(msg)"
@@ -1151,6 +1185,12 @@ struct SettingsView: View {
         config.ggufModelPath = model.path
         config.ggufModelAlias = model.suggestedAlias
         config.ggufMmprojPath = matchedMmproj
+        if provider == "gguf" {
+            self.model = model.suggestedAlias
+            config.model = model.suggestedAlias
+            setTierModel(.defaultModel, model.suggestedAlias)
+        }
+        saveConfigImmediately()
         print("[Settings] Selected GGUF model: \(model.name) (\(model.path)), mmproj: \(matchedMmproj)")
     }
 
@@ -1165,6 +1205,27 @@ struct SettingsView: View {
         }.value
         ggufModels = models
         scannedMmprojFiles = mmprojs
+
+        // Query any live running GGUF server
+        let (livePath, liveAlias) = await LocalModelManager.shared.detectRunningGGUF(customPort: Int(ggufPort))
+        if let path = livePath, !path.isEmpty {
+            if ggufModelPath.isEmpty {
+                ggufModelPath = path
+                config.ggufModelPath = path
+            }
+        }
+        if let alias = liveAlias, !alias.isEmpty {
+            if ggufModelAlias.isEmpty || ggufModelAlias == "local-model" {
+                ggufModelAlias = alias
+                config.ggufModelAlias = alias
+            }
+            if provider == "gguf" && (model.isEmpty || model == "local-model") {
+                model = alias
+                config.model = alias
+                setTierModel(.defaultModel, alias)
+            }
+        }
+
         if ggufMmprojPath.isEmpty, !ggufModelPath.isEmpty {
             if let matched = GGUFModelScanner.findMatchingMmproj(forModelPath: ggufModelPath, knownMmproj: mmprojs) {
                 ggufMmprojPath = matched
@@ -1187,19 +1248,35 @@ struct SettingsView: View {
         mgr.ggufGpuLayers = ggufGpuLayers
         mgr.ggufContextSize = ggufContextSize
         if let p = Int(ggufPort) { mgr.port = p }
-        // Set the routed provider/model so this model becomes active.
-        if provider != "gguf" {
-            provider = "gguf"
-        }
-        // Set the default model to the alias the server will report.
+        // Set the routed provider/model so this model becomes active across the app.
+        provider = "gguf"
         model = mgr.ggufModelAlias
+        config.provider = "gguf"
+        config.model = mgr.ggufModelAlias
+        config.ggufModelPath = ggufModelPath
+        config.ggufModelAlias = mgr.ggufModelAlias
+        config.ggufMmprojPath = ggufMmprojPath
+        setTierModel(.defaultModel, mgr.ggufModelAlias)
+        saveConfigImmediately()
+
         Task {
             await mgr.start()
+            // Detect from live server in case server confirmed alias
+            let (_, liveAlias) = await mgr.detectRunningGGUF(customPort: Int(ggufPort))
+            if let alias = liveAlias, !alias.isEmpty {
+                await MainActor.run {
+                    self.model = alias
+                    self.config.model = alias
+                    setTierModel(.defaultModel, alias)
+                    saveConfigImmediately()
+                }
+            }
             await fetchTierModels(for: .defaultModel)
-            // After the server is up, make sure the model id matches what the
-            // server actually reports (the alias we registered).
+            await fetchLocalEndpointModels()
             if let first = tierLiveModels[TierKey.defaultModel.rawValue]?.first, !first.isEmpty {
                 setTierModel(.defaultModel, first)
+                config.model = first
+                saveConfigImmediately()
             }
         }
     }
@@ -1378,8 +1455,26 @@ struct SettingsView: View {
                 // Quick runtime selector chips
                 HStack(spacing: 8) {
                     let livePort = LocalServerDiscovery.liveLlamaPort()
+                    let ggufP = Int(ggufPort) ?? (config.ggufPort > 0 ? config.ggufPort : 8081)
+
+                    Button {
+                        localBaseUrl = "http://127.0.0.1:\(ggufP)/v1"
+                        config.localLlmBaseUrl = localBaseUrl
+                        saveConfigImmediately()
+                        Task { await fetchLocalEndpointModels() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "cpu.fill")
+                            Text("Built-in GGUF (:\(ggufP))")
+                        }
+                        .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":\(ggufP)") ? .bold : .regular))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(localBaseUrl.contains(":\(ggufP)") ? Color.dsAccent : Color.secondary)
+
                     Button {
                         localBaseUrl = "http://127.0.0.1:\(livePort)/v1"
+                        config.localLlmBaseUrl = localBaseUrl
                         saveConfigImmediately()
                         Task { await fetchLocalEndpointModels() }
                     } label: {
@@ -1394,6 +1489,7 @@ struct SettingsView: View {
 
                     Button {
                         localBaseUrl = "http://127.0.0.1:1234/v1"
+                        config.localLlmBaseUrl = localBaseUrl
                         saveConfigImmediately()
                         Task { await fetchLocalEndpointModels() }
                     } label: {
@@ -1408,6 +1504,7 @@ struct SettingsView: View {
 
                     Button {
                         localBaseUrl = "http://127.0.0.1:11434/v1"
+                        config.localLlmBaseUrl = localBaseUrl
                         saveConfigImmediately()
                         Task { await fetchLocalEndpointModels() }
                     } label: {
@@ -2624,17 +2721,29 @@ struct SettingsView: View {
                 localEndpointStatus = "Offline / Unreachable"
                 return
             }
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let list = json["data"] as? [[String: Any]] {
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let list = (json["data"] as? [[String: Any]]) ?? (json["models"] as? [[String: Any]]) ?? []
                 var modelIds: [String] = []
                 var loadedModel: String?
                 for item in list {
-                    if let id = item["id"] as? String {
+                    if let id = (item["id"] as? String) ?? (item["name"] as? String) ?? (item["model"] as? String) {
                         modelIds.append(id)
                         if let status = item["status"] as? [String: Any],
                            (status["value"] as? String) == "loaded" {
                             loadedModel = id
                         }
+                    }
+                }
+                if modelIds.isEmpty {
+                    if let alias = json["model_alias"] as? String, !alias.isEmpty {
+                        modelIds.append(alias)
+                    }
+                }
+                // If this is pointing to built-in GGUF and LocalModelManager has a model
+                if trimmedUrl.contains("8081") || trimmedUrl.contains(":\(config.ggufPort)") {
+                    let mgrAlias = LocalModelManager.shared.ggufModelAlias
+                    if !mgrAlias.isEmpty && mgrAlias != "local-model" && !modelIds.contains(mgrAlias) {
+                        modelIds.insert(mgrAlias, at: 0)
                     }
                 }
                 localEndpointModels = modelIds
@@ -3407,6 +3516,22 @@ struct SettingsView: View {
         for m in providerLiveModels[pid] ?? [] {
             models.insert(ProviderPreset.bareModel(m, for: pid))
         }
+        // For GGUF, ALWAYS include the currently loaded model alias and all scanned GGUF models!
+        if pid == "gguf" {
+            let mgr = LocalModelManager.shared
+            if !mgr.ggufModelAlias.isEmpty && mgr.ggufModelAlias != "local-model" {
+                models.insert(mgr.ggufModelAlias)
+            }
+            if !config.ggufModelAlias.isEmpty && config.ggufModelAlias != "local-model" {
+                models.insert(config.ggufModelAlias)
+            }
+            if !ggufModelAlias.isEmpty && ggufModelAlias != "local-model" {
+                models.insert(ggufModelAlias)
+            }
+            for g in ggufModels {
+                models.insert(g.suggestedAlias)
+            }
+        }
         return Array(models).sorted()
     }
 
@@ -3417,18 +3542,13 @@ struct SettingsView: View {
         let pid = tierProviderId(for: tier)
         var baseUrl = config.baseUrl(for: pid)
         if pid == "llamaapp" {
-            // llama.app's server port is NOT stable — it rebinds to a free
-            // port after relaunches (observed moving 8080 → 9931). Always use
-            // the LIVE port discovered from the running `llama serve` process;
-            // the hardcoded 8080 fallback silently broke model detection
-            // whenever llama.app picked a different port.
             let livePort = LocalServerDiscovery.liveLlamaPort()
             baseUrl = "http://127.0.0.1:\(livePort)"
+        } else if pid == "gguf" {
+            let p = Int(ggufPort) ?? (config.ggufPort > 0 ? config.ggufPort : 8081)
+            baseUrl = "http://127.0.0.1:\(p)"
         }
-        // Only a TRAILING "/v1" marks the API root. A contains-replace would
-        // mangle endpoints whose path merely contains "/v1" (Gemini's
-        // "/v1beta" → "/beta"), producing a dead URL. Strip exactly one
-        // trailing "/v1"; the root is re-appended below.
+        // Only a TRAILING "/v1" marks the API root.
         if baseUrl.hasSuffix("/v1") { baseUrl = String(baseUrl.dropLast(3)) }
         guard let url = URL(string: baseUrl + "/v1/models") else {
             tierFetchStates[tier.rawValue] = .failed("Invalid endpoint \(baseUrl)")
@@ -3437,28 +3557,31 @@ struct SettingsView: View {
         tierFetchStates[tier.rawValue] = .fetching
         do {
             var req = URLRequest(url: url)
-            req.timeoutInterval = 12
-            // Reactive @State key (same reasoning as the provider verify) so a
-            // freshly typed key authenticates the models request immediately.
+            req.timeoutInterval = 4
             let key = apiKeyForProvider(pid)
             if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-            // Use a URLSession that ignores cache so fresh fetches always land.
             let (data, _) = try await URLSession(configuration: .ephemeral).data(for: req)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let modelList = json["data"] as? [[String: Any]] else {
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 await MainActor.run {
-                    // The endpoint answered but with an unreadable body (e.g. a
-                    // plain-text 401 from a gateway) — surface it, don't stall.
                     guard tierProviderId(for: tier) == pid else { return }
-                    tierFetchStates[tier.rawValue] = .failed("Provider returned no model list")
+                    tierFetchStates[tier.rawValue] = .failed("Provider returned invalid JSON")
                 }
                 return
             }
-            let names = modelList.compactMap { $0["id"] as? String }.filter { !$0.isEmpty }
+            let modelList = (json["data"] as? [[String: Any]]) ?? (json["models"] as? [[String: Any]]) ?? []
+            var names = modelList.compactMap {
+                ($0["id"] as? String) ?? ($0["name"] as? String) ?? ($0["model"] as? String)
+            }.filter { !$0.isEmpty }
+
+            if names.isEmpty && pid == "gguf" {
+                if let alias = json["model_alias"] as? String, !alias.isEmpty {
+                    names = [alias]
+                } else if !LocalModelManager.shared.ggufModelAlias.isEmpty {
+                    names = [LocalModelManager.shared.ggufModelAlias]
+                }
+            }
+
             await MainActor.run {
-                // Only apply when the tier is still on this provider — a quick
-                // provider switch must never be clobbered by a slow response
-                // from the previous one.
                 guard tierProviderId(for: tier) == pid else { return }
                 guard !names.isEmpty else {
                     tierFetchStates[tier.rawValue] = .failed("No models returned")
@@ -3469,27 +3592,29 @@ struct SettingsView: View {
                 if let idx = manager.providers.firstIndex(where: { $0.id == pid }) {
                     manager.providers[idx].visibleModelIds.formUnion(names)
                 }
-                // Auto-populate an empty tier model from the first live model —
-                // custom/local providers (e.g. llama.app) expose their models
-                // only via this fetch, so a freshly selected provider would
-                // otherwise sit at "No model selected".
                 let current = tierModelValue(tier)
-                if current.isEmpty {
+                if current.isEmpty || current == "local-model" {
                     setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
                 } else if !tierModelOptions(for: tier).contains(ProviderPreset.bareModel(current, for: pid)),
                           modelBelongsToAnotherProvider(current, excluding: pid) {
-                    // Stale model from a different provider — adopt the first
-                    // fetched model so the pair stays consistent.
                     setTierModel(tier, ProviderPreset.bareModel(names[0], for: pid))
                 }
             }
         } catch {
             await MainActor.run {
                 guard tierProviderId(for: tier) == pid else { return }
-                tierLiveModels[tier.rawValue] = []
-                tierFetchStates[tier.rawValue] = .failed(fetchFailureText(error, baseUrl: baseUrl))
+                if pid == "gguf", !LocalModelManager.shared.ggufModelAlias.isEmpty {
+                    let fallbackName = LocalModelManager.shared.ggufModelAlias
+                    tierLiveModels[tier.rawValue] = [fallbackName]
+                    tierFetchStates[tier.rawValue] = .loaded
+                    if tierModelValue(tier).isEmpty || tierModelValue(tier) == "local-model" {
+                        setTierModel(tier, fallbackName)
+                    }
+                } else {
+                    tierLiveModels[tier.rawValue] = []
+                    tierFetchStates[tier.rawValue] = .failed(fetchFailureText(error, baseUrl: baseUrl))
+                }
             }
-            print("[SettingsView] Failed to fetch tier models from \(url): \(error)")
         }
     }
 
