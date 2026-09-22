@@ -347,6 +347,16 @@ final class InProcessLlamaEngine: @unchecked Sendable {
 
         let rc: Int32 = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, Error>) in
             queue.async {
+                // llama_decode appends at the memory's current cursor; it does
+                // not restart at 0 merely because this function's local n_past
+                // does. Every caller here rebuilds the entire message history
+                // into `prompt` (LocalInferenceServer.applyChatTemplate), so
+                // the request is self-contained and the KV cache must be
+                // dropped first. Without this, each request is evaluated after
+                // the previous one's tokens: the model answers in the context
+                // of stale conversations, and once the accumulated cache
+                // reaches n_ctx the decode fails outright.
+                self._clearKV?(model)
                 let code = prompt.withCString { cstr in
                     _generate(model, cstr,
                               s.temperature, s.topP, s.topK, s.repeatPenalty,
