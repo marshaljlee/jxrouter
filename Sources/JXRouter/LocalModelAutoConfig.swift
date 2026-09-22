@@ -372,7 +372,7 @@ enum LocalModelAutoConfig {
     /// Measured on a 32 GB M2 Max: a 262,144-token window cost ~8 GB of KV
     /// beside 10.5 GB of weights, which drove the machine into 17 GB of swap
     /// and made every request look like a hang. Raise it deliberately, per Mac.
-    private static let autoContextCeiling = 65_536
+    static let autoContextCeiling = 65_536
 
     /// Largest context this Mac can hold for a model, from its real dimensions.
     ///

@@ -563,6 +563,30 @@ final class LocalModelManager {
 
     // MARK: - In-Process GGUF Hosting
 
+    /// Context to hand the embedded engine, turning "Auto" into a real fit.
+    ///
+    /// Settings labels `ggufContextSize == 0` as "Auto (fit this Mac)", but
+    /// llama.cpp reads 0 as "use the model's full training context"
+    /// (`llama-context.cpp`: `cparams.n_ctx = params.n_ctx == 0 ?
+    /// hparams.n_ctx_train : params.n_ctx`). The llama-server path funnels
+    /// through `LocalModelAutoConfig.plan`, which fits the window to real
+    /// memory; this path passed the 0 straight through, so a model with a
+    /// 262,144-token training window asked for all of it and swapped. Resolve
+    /// it here the same way, so both engines honour the same ceiling.
+    private static func resolvedInProcessContext(path: String, requested: Int) -> Int {
+        let explicit = requested > 0 ? requested : ConfigManager.shared.ggufContextSize
+        if explicit > 0 { return explicit }
+        guard !path.isEmpty else { return 32_768 }
+
+        let meta = GGUFParser.metadata(from: URL(fileURLWithPath: path))
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? Int64) ?? 0
+        let native = meta.contextLength > 0 ? meta.contextLength : 32_768
+        let fitted = LocalModelAutoConfig.recommendedContext(
+            native: native, meta: meta, modelBytes: size)
+        return min(fitted, LocalModelAutoConfig.autoContextCeiling)
+    }
+
     /// Serve the GGUF from inside this process via the embedded llama.cpp.
     ///
     /// The server speaks the same HTTP surface as `llama-server`, so the health
@@ -581,7 +605,8 @@ final class LocalModelManager {
             port: UInt16(max(1, min(65535, port))),
             modelPath: selectedGGUFPath,
             modelAlias: ggufModelAlias,
-            nCtx: Int32(ggufContextSize),
+            nCtx: Int32(Self.resolvedInProcessContext(path: selectedGGUFPath,
+                                                      requested: ggufContextSize)),
             nBatch: 2048,
             nUBatch: 512,
             nGPULayers: Int32(ggufGpuLayers),
