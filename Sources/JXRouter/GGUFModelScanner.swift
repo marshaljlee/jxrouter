@@ -79,8 +79,16 @@ enum GGUFModelScanner {
         if let volumes = try? fm.contentsOfDirectory(atPath: "/Volumes") {
             for volume in volumes where !volume.hasPrefix(".") {
                 let volRoot = "/Volumes/\(volume)"
-                paths.append(volRoot)
+                // `/Volumes/macOS` is a symlink to `/`. Enumerating it walks the
+                // entire boot volume, which alone exhausts the scan budget and
+                // makes the model list depend on how fast the system disk
+                // answers. Only real mount points are expanded.
+                guard URL(fileURLWithPath: volRoot).resolvingSymlinksInPath().path == volRoot
+                else { continue }
+                // The Models subfolder first: it is where collections actually
+                // live, so it should never be starved by a volume-root walk.
                 paths.append("\(volRoot)/Models")
+                paths.append(volRoot)
             }
         }
 
@@ -110,6 +118,12 @@ enum GGUFModelScanner {
                 // own size (tens of bytes), so without resolving it every
                 // symlinked collection is silently dropped by the size filter.
                 let resolved = url.resolvingSymlinksInPath()
+                // A HuggingFace cache stores blobs under their SHA-256. The
+                // snapshot symlink that points at one resolves to a hash-named
+                // file, which surfaced in the picker as a nameless "Hf_Model"
+                // entry -- a 70 MB embedding model, not something llama-server
+                // can chat with.
+                if isHuggingFaceBlob(resolved) { continue }
                 guard let attrs = try? fm.attributesOfItem(atPath: resolved.path),
                       let fileSize = attrs[.size] as? Int64,
                       fileSize > 1_000_000 else { continue } // Skip < 1MB
@@ -298,7 +312,12 @@ enum GGUFModelScanner {
         var chatTemplate = ""
 
         let meta = GGUFParser.metadata(from: URL(fileURLWithPath: path))
-        if !meta.name.isEmpty { name = meta.name }
+        // Some conversions ship a placeholder in `general.name`. The Ternary
+        // Bonsai PQ2_0 file literally says "Hf", which made it unrecognisable
+        // in the picker -- the model was there, labelled with nothing. When the
+        // embedded name carries no information the filename is the only honest
+        // label, so fall back to it.
+        if !meta.name.isEmpty && !isPlaceholderName(meta.name) { name = meta.name }
         if !meta.architecture.isEmpty { architecture = meta.architecture }
         if meta.contextLength > 0 { contextLength = meta.contextLength }
         if !meta.chatTemplate.isEmpty { chatTemplate = meta.chatTemplate }
@@ -328,6 +347,26 @@ enum GGUFModelScanner {
 
     private static func architectureContainsQwen(_ arch: String) -> Bool {
         arch.lowercased().contains("qwen")
+    }
+
+    /// True for a file named as a HuggingFace content-addressed blob.
+    private static func isHuggingFaceBlob(_ url: URL) -> Bool {
+        let last = url.lastPathComponent
+        return last.count == 64 && last.allSatisfy { $0.isHexDigit }
+    }
+
+    /// Whether a GGUF's embedded `general.name` is a placeholder rather than a
+    /// real model name. Anything shorter than four characters, or one of the
+    /// generic tokens converters emit, tells the user nothing about which model
+    /// they are about to load.
+    private static func isPlaceholderName(_ raw: String) -> Bool {
+        let normalized = normalizedName(raw)
+        if normalized.count < 4 { return true }
+        let generic: Set<String> = [
+            "hf", "huggingface", "gguf", "model", "models", "untitled",
+            "unknown", "none", "null", "test", "converted", "output",
+        ]
+        return generic.contains(normalized)
     }
 
     /// Extract architecture from a known model filename pattern.
@@ -455,13 +494,54 @@ enum GGUFParser {
         }
     }
 
-    /// Read and parse a GGUF header.
+    /// Memoized header reads, keyed by path + size + mtime.
+    ///
+    /// Parsing a header means reading up to 32 MB, because the tokenizer
+    /// vocabulary lives in the GGUF KV section; on an external USB drive that
+    /// costs ~70 ms per call. The projector matcher asks for the *same* text
+    /// model's metadata once per candidate projector, so a folder holding 14
+    /// projectors cost ~1 s per model and the 5 s scan budget ran out after
+    /// five models. Caching collapses those repeats back to a single read.
+    private final class MetadataCache: @unchecked Sendable {
+        private var store: [String: (size: Int64, mtime: Date, meta: Metadata)] = [:]
+        private let lock = NSLock()
+
+        func value(for key: String) -> Metadata? {
+            lock.lock(); defer { lock.unlock() }
+            return store[key]?.meta
+        }
+
+        func insert(_ meta: Metadata, size: Int64, mtime: Date, key: String) {
+            lock.lock(); defer { lock.unlock() }
+            // Models are big and a scan touches few of them; a small ceiling is
+            // enough to make a scan cheap without holding stale headers forever.
+            if store.count >= 256 { store.removeAll(keepingCapacity: true) }
+            store[key] = (size, mtime, meta)
+        }
+    }
+
+    private static let cache = MetadataCache()
+
+    /// Read and parse a GGUF header, memoized per path + size + mtime.
     ///
     /// The header is parsed from one buffered read. The previous implementation
     /// issued a separate `read()` syscall for every scalar value, which cost
     /// ~1.5s per model — enough to blow the 5s scan budget on the very first
     /// file and truncate the model list to a single entry.
     static func metadata(from url: URL) -> Metadata {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? Int64) ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
+        let key = "\(url.path)|\(size)|\(mtime.timeIntervalSince1970)"
+
+        if let hit = cache.value(for: key) { return hit }
+        let meta = parseMetadata(from: url)
+        cache.insert(meta, size: size, mtime: mtime, key: key)
+        return meta
+    }
+
+    /// Unmemoized header parse. Call `metadata(from:)` instead.
+    private static func parseMetadata(from url: URL) -> Metadata {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return Metadata() }
         defer { try? handle.close() }
 
