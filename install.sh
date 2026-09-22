@@ -215,16 +215,38 @@ if [ ! -d "$APP_BUNDLE" ]; then
     exit 1
 fi
 
-# Remove existing app if present
+# Remove existing app if present.
+#
+# The removal is VERIFIED, because `cp -R` merges INTO an existing directory
+# rather than replacing it: if the rm fails, the copy lands inside the stale
+# bundle and anything already sitting in its root survives. That is how a
+# stray root symlink got sealed into a supposedly fresh install and failed
+# the codesign check below with "unsealed contents present in the bundle root".
 killall JXRouter 2>/dev/null || true
 rm -rf "/Applications/JXRouter.app" 2>/dev/null || true
 rm -rf "/Applications/JXProxy.app" 2>/dev/null || true
+if [ -e "/Applications/JXRouter.app" ]; then
+    echo "Error: could not remove the existing /Applications/JXRouter.app." >&2
+    echo "   Quit JXRouter, delete the bundle manually, then re-run this script." >&2
+    exit 1
+fi
 
 # Copy new build
 cp -R "$APP_BUNDLE" /Applications/
 
 # Strip stray extended attributes on the deployed bundle only (never the repo)
 xattr -cr "/Applications/JXRouter.app" 2>/dev/null || true
+
+# A bundle root contains Contents/ and nothing else. Anything else here is
+# "unsealed contents present in the bundle root" and invalidates the
+# signature, so catch it at the point it is created rather than at verify time.
+STRAY=$(find "/Applications/JXRouter.app" -maxdepth 1 -mindepth 1 ! -name Contents 2>/dev/null || true)
+if [ -n "$STRAY" ]; then
+    echo "Error: stray items in the bundle root:" >&2
+    echo "$STRAY" >&2
+    echo "   A bundle root must contain only Contents/. Remove the items above and re-run." >&2
+    exit 1
+fi
 
 # A Release build must not contain debug dylibs; fail loudly if it does
 if find "/Applications/JXRouter.app" \( -name '*.debug.dylib' -o -name '*__preview.dylib' \) -print -quit | grep -q .; then
@@ -410,7 +432,17 @@ export PATH="$LOCAL_BIN:$PATH"
 echo ""
 echo "7. Creating desktop shortcut..."
 
-ln -sf "/Applications/JXRouter.app" "$HOME/Desktop/JXProxy.app" 2>/dev/null || true
+# `ln -s TARGET DEST` creates the link INSIDE DEST when DEST already resolves
+# to a directory -- including a symlink that points at one, and even without
+# -f. Because an earlier install left
+#   ~/Desktop/JXProxy.app -> /Applications/JXRouter.app
+# every later run followed it and created
+#   /Applications/JXRouter.app/JXRouter.app -> /Applications/JXRouter.app
+# junk inside the app bundle, which codesign rejects with "unsealed contents
+# present in the bundle root". `-n` stops ln dereferencing DEST, so the link is
+# replaced instead of nested. Measured: `ln -sfn` leaves the target empty,
+# while plain `ln -s` creates target/target.
+ln -sfn "/Applications/JXRouter.app" "$HOME/Desktop/JXProxy.app" 2>/dev/null || true
 
 echo ""
 echo "8. Verifying installation..."
@@ -427,6 +459,18 @@ else
     echo "   bundle id: $(defaults read "$INSTALLED/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo '?')"
     echo "   archs:     $(lipo -archs "$INSTALLED/Contents/MacOS/JXRouter" 2>/dev/null || echo '?')"
 
+    # Name the cause before the opaque codesign complaint. A bundle root holds
+    # Contents/ and nothing else; a stray entry there is reported by codesign
+    # only as "unsealed contents present in the bundle root", which never says
+    # which item is at fault.
+    STRAY_ROOT=$(find "$INSTALLED" -maxdepth 1 -mindepth 1 ! -name Contents 2>/dev/null || true)
+    if [ -n "$STRAY_ROOT" ]; then
+        echo "   FAIL: stray items in the bundle root (unsealed contents):" >&2
+        echo "$STRAY_ROOT" >&2
+        echo "         A bundle root must contain only Contents/. Remove them and re-run." >&2
+        VERIFY_FAIL=1
+    fi
+
     if codesign --verify --deep --strict "$INSTALLED" 2>/dev/null; then
         echo "   signature: valid"
     else
@@ -436,12 +480,41 @@ else
 
     if [ -f "$INSTALLED/Contents/Frameworks/libjxllama.dylib" ]; then
         echo "   engine:    in-process libjxllama.dylib embedded"
+        # A stock-upstream engine cannot load the Prism ternary formats
+        # (GGML_TYPE_PQ2_0 142 / PTQ1_0 143). That is invisible at build time
+        # and shows up much later as "the app does not detect my model", so
+        # surface it here, where the engine actually ships.
+        TQ=$(grep -a -c PQ2_0 "$INSTALLED/Contents/Frameworks/libjxllama.dylib" 2>/dev/null || true)
+        case "$TQ" in ''|*[!0-9]*) TQ=0 ;; esac
+        if [ "$TQ" -gt 0 ]; then
+            echo "   ternary:   PQ2_0/PTQ1_0 supported"
+        else
+            echo "   WARN: engine has no PQ2_0/PTQ1_0 support - Ternary-Bonsai GGUFs will not load" >&2
+            echo "         rebuild with: LLAMA_SRC=\$HOME/.prism/llama.cpp LlamaEngine/build.sh" >&2
+        fi
     else
         echo "   WARN: in-process engine (Frameworks/libjxllama.dylib) is missing" >&2
     fi
 
     if [ -x "$INSTALLED/Contents/Resources/llama-cpp/llama-server" ]; then
         echo "   runtime:   llama.cpp bundled"
+        # llama-server is a SECOND, independent engine from libjxllama.dylib:
+        # it serves only when the in-process engine is disabled or unavailable.
+        # install.sh stages it from the runtime JXRouter downloaded, or from the
+        # official ggml-org release -- both stock upstream, so neither carries
+        # the Prism ternary formats. Say so rather than let it fail silently.
+        SRV=0
+        if [ -d "$INSTALLED/Contents/Resources/llama-cpp" ]; then
+            if grep -a -r -l -q PQ2_0 "$INSTALLED/Contents/Resources/llama-cpp" 2>/dev/null; then
+                SRV=1
+            fi
+        fi
+        if [ "$SRV" -gt 0 ]; then
+            echo "   ternary:   llama-server supports PQ2_0/PTQ1_0"
+        else
+            echo "   note:      bundled llama-server is stock upstream (no PQ2_0/PTQ1_0)"
+            echo "              harmless while the in-process engine is enabled (default on)"
+        fi
     else
         echo "   runtime:   not bundled (the app downloads it on first use)"
     fi
