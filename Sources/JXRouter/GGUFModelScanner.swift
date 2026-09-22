@@ -347,6 +347,14 @@ enum GGUFModelScanner {
     /// Extract quantization from a GGUF filename (e.g. Q8_0, Q4_K_M, BF16).
     private static func extractQuantization(from filename: String) -> String {
         let patterns = [
+            // Prism-fork and upstream ternary formats come FIRST, because their
+            // names contain the upstream substrings they would otherwise be
+            // misread as: "PQ2_0" contains "Q2_0", "PTQ1_0" contains "Q1_0",
+            // "TQ2_0" contains "Q2_0". Those are different formats (group 128
+            // vs 64), and the label is not cosmetic -- it feeds
+            // LocalModelManager's preset matching, so a ternary file would be
+            // matched against a plain Q2_0 preset.
+            "PQ2_0", "PTQ1_0", "TQ1_0", "TQ2_0",
             "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q5_1",
             "Q4_K_M", "Q4_K_S", "Q4_0", "Q4_1",
             "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q3_0",
