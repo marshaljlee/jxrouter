@@ -1,6 +1,14 @@
 #!/bin/zsh
 set -eu
 
+# Resolve the repo root from this script's own location. Without this, the
+# relative paths below (JXRouter.xcodeproj, and the pbxproj grep in step 3b)
+# only resolve when the cwd happens to BE the repo root -- invoking the
+# installer by absolute path from anywhere else died with:
+#   xcodebuild: error: 'JXRouter.xcodeproj' does not exist.
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
 echo "==========================================="
 echo " Installing JXProxy"
 echo "==========================================="
@@ -16,6 +24,14 @@ APP_NAME="JXRouter"
 # Check for Xcode CLI tools
 if ! command -v xcodebuild >/dev/null 2>&1; then
     echo "Error: xcodebuild not found. Please run 'xcode-select --install'"
+    exit 1
+fi
+
+# Preflight: the Xcode project must sit next to this script. ROOT is resolved
+# from $0 above, so this holds no matter which directory invoked us.
+if [ ! -d "$ROOT/JXRouter.xcodeproj" ]; then
+    echo "Error: $ROOT/JXRouter.xcodeproj not found." >&2
+    echo "   install.sh must live next to JXRouter.xcodeproj in the repo." >&2
     exit 1
 fi
 
@@ -38,28 +54,63 @@ if [ -n "$CONFLICT_FILES" ]; then
     echo ""
 fi
 
+# Where the Release build lands. Override with JX_BUILD_ROOT=/somewhere.
+BUILD_ROOT="${JX_BUILD_ROOT:-/tmp/JXRouterBuild}"
+
+# Optional: install a bundle you built yourself instead of building here.
+#   JX_APP_BUNDLE=/path/to/JXRouter.app ./install.sh
+# It must be a RELEASE build: a Debug build carries JXRouter.debug.dylib and
+# __preview.dylib and is rejected in step 4. In the Xcode IDE the Run action
+# defaults to Debug, so use Product > Build For > Running, or set the scheme's
+# Run > Build Configuration to Release.
+APP_BUNDLE="${JX_APP_BUNDLE:-$BUILD_ROOT/Release/JXRouter.app}"
+
 echo ""
 echo "1. Cleaning previous builds..."
-rm -rf /tmp/JXRouterBuild 2>/dev/null
+rm -rf "$BUILD_ROOT" 2>/dev/null
 
 echo ""
-echo "3. Building JXProxy (universal: Apple Silicon + Intel)..."
-# ARCHS="arm64 x86_64" + ONLY_ACTIVE_ARCH=NO produces a universal binary so
-# the same build runs on Apple Silicon AND Intel Macs. A pure Swift/AppKit
-# app, so the two slices are byte-for-byte the same code.
-xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release \
-    ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
-    SYMROOT="/tmp/JXRouterBuild" > /dev/null
+if [ -n "${JX_APP_BUNDLE:-}" ]; then
+    echo "3. Using prebuilt bundle: $APP_BUNDLE"
+    if [ ! -d "$APP_BUNDLE" ]; then
+        echo "Error: JX_APP_BUNDLE does not exist: $APP_BUNDLE" >&2
+        exit 1
+    fi
+else
+    echo "3. Building JXProxy (universal: Apple Silicon + Intel)..."
+    # ARCHS="arm64 x86_64" + ONLY_ACTIVE_ARCH=NO produces a universal binary so
+    # the same build runs on Apple Silicon AND Intel Macs. A pure Swift/AppKit
+    # app, so the two slices are byte-for-byte the same code.
+    # `if ! cmd` rather than `cmd; if [ $? -ne 0 ]`: under `set -e` a bare
+    # failing command aborts the script before the check, so the "Build failed"
+    # message never printed and the real error was all you saw.
+    mkdir -p "$BUILD_ROOT"
+    BUILD_LOG="$BUILD_ROOT/xcodebuild.log"
+    # JX_SWIFT_FLAGS is an opt-in escape hatch for sandboxed or CI builds that
+    # cannot spawn Xcode's Swift macro plugin server. Symptoms without it:
+    #   external macro implementation type 'ObservationMacros.ObservableMacro'
+    #   could not be found for macro 'Observable()'
+    #   sandbox-exec: sandbox_apply: Operation not permitted
+    # Use it as:  JX_SWIFT_FLAGS="-disable-sandbox" ./install.sh
+    # Leave unset for a normal local build -- it is NOT needed on a desktop.
+    EXTRA_FLAGS=()
+    if [ -n "${JX_SWIFT_FLAGS:-}" ]; then
+        EXTRA_FLAGS=("OTHER_SWIFT_FLAGS=${JX_SWIFT_FLAGS}")
+    fi
 
-if [ $? -ne 0 ]; then
-    echo "Build failed! Check xcodebuild output."
-    exit 1
+    if ! xcodebuild -project "$ROOT/JXRouter.xcodeproj" -scheme JXRouter \
+        -configuration Release \
+        ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+        SYMROOT="$BUILD_ROOT" "${EXTRA_FLAGS[@]}" > "$BUILD_LOG" 2>&1; then
+        echo "Build failed! Last 40 lines of $BUILD_LOG:" >&2
+        tail -40 "$BUILD_LOG" >&2
+        exit 1
+    fi
 fi
 
 echo ""
 echo "3b. Bundling agent resources..."
-APP_BUNDLE="/tmp/JXRouterBuild/Release/JXRouter.app"
-RESOURCES_SRC="$(dirname "$0")/JXRouter/Resources"
+RESOURCES_SRC="$ROOT/JXRouter/Resources"
 RESOURCES_DST="$APP_BUNDLE/Contents/Resources"
 
 if [ -d "$RESOURCES_SRC" ]; then
@@ -142,7 +193,7 @@ stage_llama_cpp "$APP_BUNDLE"
 # signature: the one-time Keychain "Always Allow" grant (bound to the
 # code-signature identity) stays valid across reinstalls instead of forcing a
 # new permission prompt every time.
-SIGN_IDENTITY=$(grep -m1 'CODE_SIGN_IDENTITY =' JXRouter.xcodeproj/project.pbxproj | sed -E 's/.*= "?([^";]+)"?;.*/\1/')
+SIGN_IDENTITY=$(grep -m1 'CODE_SIGN_IDENTITY =' "$ROOT/JXRouter.xcodeproj/project.pbxproj" | sed -E 's/.*= "?([^";]+)"?;.*/\1/')
 if [ -z "$SIGN_IDENTITY" ]; then
     SIGN_IDENTITY="-"
 fi
@@ -158,7 +209,6 @@ fi
 
 echo ""
 echo "4. Deploying to /Applications..."
-APP_BUNDLE="/tmp/JXRouterBuild/Release/JXRouter.app"
 
 if [ ! -d "$APP_BUNDLE" ]; then
     echo "Error: App bundle not found at $APP_BUNDLE"
@@ -361,6 +411,47 @@ echo ""
 echo "7. Creating desktop shortcut..."
 
 ln -sf "/Applications/JXRouter.app" "$HOME/Desktop/JXProxy.app" 2>/dev/null || true
+
+echo ""
+echo "8. Verifying installation..."
+
+INSTALLED="/Applications/JXRouter.app"
+VERIFY_FAIL=0
+
+if [ ! -d "$INSTALLED" ]; then
+    echo "   FAIL: $INSTALLED is missing" >&2
+    VERIFY_FAIL=1
+else
+    echo "   app:       $INSTALLED"
+    echo "   version:   $(defaults read "$INSTALLED/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo '?')"
+    echo "   bundle id: $(defaults read "$INSTALLED/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo '?')"
+    echo "   archs:     $(lipo -archs "$INSTALLED/Contents/MacOS/JXRouter" 2>/dev/null || echo '?')"
+
+    if codesign --verify --deep --strict "$INSTALLED" 2>/dev/null; then
+        echo "   signature: valid"
+    else
+        echo "   FAIL: code signature does not verify" >&2
+        VERIFY_FAIL=1
+    fi
+
+    if [ -f "$INSTALLED/Contents/Frameworks/libjxllama.dylib" ]; then
+        echo "   engine:    in-process libjxllama.dylib embedded"
+    else
+        echo "   WARN: in-process engine (Frameworks/libjxllama.dylib) is missing" >&2
+    fi
+
+    if [ -x "$INSTALLED/Contents/Resources/llama-cpp/llama-server" ]; then
+        echo "   runtime:   llama.cpp bundled"
+    else
+        echo "   runtime:   not bundled (the app downloads it on first use)"
+    fi
+fi
+
+if [ "$VERIFY_FAIL" -ne 0 ]; then
+    echo "" >&2
+    echo "Installation did NOT complete cleanly -- see FAIL lines above." >&2
+    exit 1
+fi
 
 echo ""
 echo "==========================================="
