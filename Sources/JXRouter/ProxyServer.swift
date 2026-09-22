@@ -2,13 +2,15 @@ import Foundation
 @preconcurrency import Network
 
 enum ProxyError: Error, LocalizedError {
-    case portInUse(port: Int, pids: String)
+    case portInUse(port: Int, pids: String, owners: [String])
     case listenerFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .portInUse(let port, let pids):
-            return "Port \(port) is in use by PID(s): \(pids). Click Restart to free it."
+        case .portInUse(let port, let pids, _):
+            // Names the program rather than just its PID — "port in use by PID
+            // 4821" doesn't tell anyone what to quit.
+            return PortOwner.conflictMessage(port: port, pids: pids)
         case .listenerFailed(let detail):
             return "Listener failed: \(detail). Click Restart to try again."
         }
@@ -33,7 +35,7 @@ struct ProxyStats: Sendable {
 @Observable
 final class ProxyServer: @unchecked Sendable {
     private var httpListener: NWListener?
-    private let queue = DispatchQueue(label: "com.jxproxy.proxy", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.proxy", qos: .userInitiated)
     /// Classifier instance kept in sync with the "Route OpenAI connections"
     /// switch (see syncConfigCache) so gating is consistent on every code path.
     /// Lock protecting mutable state accessed from multiple queues (proxy
@@ -211,7 +213,7 @@ final class ProxyServer: @unchecked Sendable {
         let checkData = checkPipe.fileHandleForReading.readDataToEndOfFile()
         let pids = String(data: checkData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !pids.isEmpty {
-            throw ProxyError.portInUse(port: Int(port), pids: pids)
+            throw ProxyError.portInUse(port: Int(port), pids: pids, owners: PortOwner.names(for: pids))
         }
 
         // Start HTTP proxy listener — throws synchronously if params are invalid,
@@ -468,7 +470,12 @@ final class ProxyServer: @unchecked Sendable {
         if let portStr = endpointString.components(separatedBy: ":").last, let sourcePort = UInt16(portStr) {
             if let appInfo = AppIdentifier.identifyApp(sourcePort: sourcePort) {
                 connectedApp = appInfo.name
-                
+
+                // Richer per-app telemetry: bundle id, PIDs, last-seen.
+                RoutingTelemetry.shared.record(name: appInfo.name,
+                                               bundleIdentifier: appInfo.bundleIdentifier,
+                                               pid: appInfo.pid)
+
                 // Track connected apps
                 Task { @MainActor in
                     if !self.connectedApps.contains(appInfo.name) {
@@ -704,13 +711,16 @@ final class ProxyServer: @unchecked Sendable {
             }
             if basePath == "/v1/messages" || basePath == "/v1/v1/messages" || basePath == "/messages"
                 || basePath == "/v1/chat/completions" || basePath == "/v1/v1/chat/completions" || basePath == "/chat/completions"
-                || basePath == "/v1/responses" || basePath == "/v1/v1/responses" || basePath == "/responses" {
+                || basePath == "/v1/responses" || basePath == "/v1/v1/responses" || basePath == "/responses"
+                || basePath == "/v1/messages/count_tokens" || basePath == "/v1/v1/messages/count_tokens" || basePath == "/count_tokens" {
                 // Loopback AI requests (Claude Code's /v1/messages, OpenAI
                 // clients pointed at OPENAI_BASE_URL=http://127.0.0.1:<port>/v1
-                // → /v1/chat/completions or /v1/responses) all route through
-                // the provider chain. Previously only /v1/messages was
-                // special-cased, so OpenAI loopback requests fell through to a
-                // dead passthrough (127.0.0.1:80) and failed.
+                // → /v1/chat/completions or /v1/responses, and Claude Code's
+                // /v1/messages/count_tokens) all route through the provider
+                // chain. count_tokens was previously missing from this list, so
+                // it fell through to forwardDirectly(127.0.0.1:5255) and was
+                // killed by the self-loop guard ("Request loop detected") —
+                // every Claude Code context estimate silently failed.
                 handleAIRouted(connection, method: method, initialData: initialData, connectedApp: connectedApp, path: basePath)
                 return
             }
@@ -1028,11 +1038,14 @@ final class ProxyServer: @unchecked Sendable {
             }
         }
 
-        // FIX #2: total-request timeout. Sized so a large local prefill (60k+
-        // tokens can take 30s–4min on a local model) completes instead of being
-        // cancelled mid-generation; the router's own chain caps are tighter.
+        // FIX #2: total-request timeout. A real Claude Code system prompt is
+        // 80-100k tokens; local prefill runs ~400-500 tok/s (3-4+ minutes)
+        // before the first byte streams back. The old 300s cap killed every
+        // healthy large local generation mid-prefill and surfaced as a 503
+        // after the chain burned. 900s covers the full local budget with
+        // headroom; the router's own chain caps remain tighter.
         Task {
-            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            try? await Task.sleep(nanoseconds: 900_000_000_000)
             requestTask.cancel()
         }
     }
@@ -1362,7 +1375,7 @@ final class ProxyServer: @unchecked Sendable {
         }
 
         Task {
-            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            try? await Task.sleep(nanoseconds: 900_000_000_000)
             requestTask.cancel()
         }
     }

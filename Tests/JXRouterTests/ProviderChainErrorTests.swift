@@ -1,5 +1,4 @@
 import XCTest
-@testable import JXRouter
 
 final class ProviderChainErrorTests: XCTestCase {
 

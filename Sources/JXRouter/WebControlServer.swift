@@ -17,7 +17,7 @@ import Network
 @MainActor
 final class WebControlServer {
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "com.jxproxy.webcontrol", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.webcontrol", qos: .userInitiated)
     private(set) var isRunning = false
 
     // MARK: - Lifecycle
@@ -52,7 +52,7 @@ final class WebControlServer {
                 guard let self else { return }
                 // Dedicated queue per connection so one slow/hung client can
                 // never wedge the listener's accept loop or another connection.
-                let connQueue = DispatchQueue(label: "com.jxproxy.webcontrol.conn", qos: .userInitiated)
+                let connQueue = DispatchQueue(label: "com.marshaljlee.jxrouter.webcontrol.conn", qos: .userInitiated)
                 connection.start(queue: connQueue)
                 self.receiveRequest(connection)
             }

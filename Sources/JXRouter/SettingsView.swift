@@ -111,10 +111,20 @@ struct SettingsView: View {
     @State private var ggufGpuLayers: Int = 0
     @State private var ggufContextSize: Int = 0
     @State private var ggufPort: String = "8081"
+    @State private var ggufChatTemplate: String = ""
+    @State private var ggufCacheTypeK: String = ""
+    @State private var ggufCacheTypeV: String = ""
+    @State private var ggufFlashAttn: Bool = true
+    @State private var ggufContextShift: Bool = true
     @State private var ggufModels: [GGUFModelFile] = []
     @State private var scannedMmprojFiles: [String] = []
+    @State private var showingMMProjSearch = false
     @State private var ggufScanState: String = ""
+    /// Extra folders the user asked to scan for GGUF models.
+    @State private var ggufSearchPaths: [String] = []
     @State private var ggufScanTask: Task<Void, Never>?
+    /// What the auto-configurer decided for the currently selected model.
+    @State private var autoConfigSummary: String = ""
     // Custom backend URLs per provider (stored as JSON dict in ConfigManager)
     @State private var providerUrlOverrides: [String: String] = [:]
     // API keys
@@ -791,6 +801,8 @@ struct SettingsView: View {
                     .font(.system(size: DesignToken.caption2Size))
                     .foregroundStyle(Color.dsTextTertiary)
 
+                llamaRuntimeSection
+
                 // Model selection
                 HStack(spacing: 8) {
                     Menu {
@@ -886,6 +898,53 @@ struct SettingsView: View {
                     Text(ggufScanState)
                         .font(.system(size: DesignToken.caption2Size))
                         .foregroundStyle(Color.dsTextTertiary)
+                }
+
+                // Extra folders to search, on top of the built-in roots.
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("Model Folders")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextTertiary)
+                        Spacer()
+                        Button {
+                            addModelFolder()
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Add a folder to scan for .gguf models")
+                    }
+                    if ggufSearchPaths.isEmpty {
+                        Text("Searching ~/Models, ~/Downloads and /Volumes/*/Models. Add a folder to search elsewhere.")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(ggufSearchPaths, id: \.self) { folder in
+                            HStack(spacing: 6) {
+                                Image(systemName: "folder")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color.dsTextTertiary)
+                                Text(folder)
+                                    .font(.system(size: DesignToken.caption2Size))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Button {
+                                    ggufSearchPaths.removeAll { $0 == folder }
+                                    saveConfigImmediately()
+                                    Task { await scanGGUFModels() }
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.small)
+                                .help("Remove this folder")
+                            }
+                        }
+                    }
                 }
 
                 // Selected model details
@@ -989,6 +1048,11 @@ struct SettingsView: View {
                                 chooseMmprojFile()
                             }
 
+                            Button("Find Online…") {
+                                showingMMProjSearch = true
+                            }
+                            .disabled(ggufModelPath.isEmpty)
+
                             Button("None (Disable Vision)") {
                                 ggufMmprojPath = ""
                                 LocalModelManager.shared.ggufMmprojPath = ""
@@ -1034,6 +1098,31 @@ struct SettingsView: View {
                         .foregroundStyle(Color.dsTextTertiary)
                 }
                 .padding(.top, 2)
+                .sheet(isPresented: $showingMMProjSearch) {
+                    MMProjSearchSheet(
+                        modelPath: ggufModelPath,
+                        architecture: ggufModels.first(where: { $0.path == ggufModelPath })?.architecture ?? "",
+                        quantization: ggufModels.first(where: { $0.path == ggufModelPath })?.quantization ?? ""
+                    ) { path in
+                        ggufMmprojPath = path
+                        LocalModelManager.shared.ggufMmprojPath = path
+                        config.ggufMmprojPath = path
+                        if !scannedMmprojFiles.contains(path) {
+                            scannedMmprojFiles.insert(path, at: 0)
+                        }
+                    }
+                }
+
+                if !autoConfigSummary.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto-configured for this model")
+                            .font(.system(size: DesignToken.caption2Size, weight: .semibold))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Text(autoConfigSummary)
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextTertiary)
+                    }
+                }
 
                 // Run/Stop control
                 HStack(spacing: 8) {
@@ -1045,18 +1134,54 @@ struct SettingsView: View {
                         .foregroundStyle(Color.dsTextSecondary)
                         .lineLimit(1)
                     Spacer()
-                    if LocalModelManager.shared.isRunning && LocalModelManager.shared.provider == .gguf {
+                    let ggufRunning = LocalModelManager.shared.isRunning && LocalModelManager.shared.provider == .gguf
+                    // The load button stays available while a server is up:
+                    // picking a different model in the menu only updates the
+                    // config, so without this there was no way to switch
+                    // models short of Stop → Load.
+                    Button(action: { runGGUFModel() }) {
+                        Label(ggufRunning ? "Reload Model" : "Load Model", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(ggufModelPath.isEmpty)
+                    .help("Start llama-server with the selected model, replacing whatever is loaded")
+                    if ggufRunning {
                         Button("Stop") { stopGGUFModel() }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                    } else {
-                        Button(action: { runGGUFModel() }) {
-                            Label("Load Model", systemImage: "play.fill")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .disabled(ggufModelPath.isEmpty)
                     }
+                }
+
+                // Load progress. llama.cpp publishes no percentage of its own,
+                // so this follows the server's resident set against the file
+                // size (see ModelLoadProgress); an estimated fraction is
+                // labelled as one rather than passed off as measured.
+                if LocalModelManager.shared.isLoadingModel {
+                    let mgr = LocalModelManager.shared
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: mgr.loadFraction, total: 1.0)
+                            .progressViewStyle(.linear)
+                        HStack(spacing: 6) {
+                            Text(mgr.loadPhaseLabel)
+                            if !mgr.loadProgressIsMeasured {
+                                Text("(estimating)")
+                                    .foregroundStyle(Color.dsTextTertiary)
+                            }
+                            Spacer()
+                            Text("\(Int((mgr.loadFraction * 100).rounded()))%")
+                                .monospacedDigit()
+                        }
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextSecondary)
+                        if !mgr.loadBytesText.isEmpty {
+                            Text(mgr.loadBytesText)
+                                .font(.system(size: DesignToken.caption2Size))
+                                .foregroundStyle(Color.dsTextTertiary)
+                                .monospacedDigit()
+                        }
+                    }
+                    .padding(.top, 2)
                 }
 
                 // Advanced settings
@@ -1068,22 +1193,101 @@ struct SettingsView: View {
                             .foregroundStyle(Color.dsTextSecondary)
                         TextField("8081", text: $ggufPort)
                             .textFieldStyle(.roundedBorder)
-                            .frame(width: 70)
+                            .frame(width: 65)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Context Size")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Picker("", selection: $ggufContextSize) {
+                            Text("Auto (fit this Mac)").tag(0)
+                            Text("32K (32,768)").tag(32768)
+                            Text("64K (65,536)").tag(65536)
+                            Text("128K (131,072)").tag(131072)
+                            Text("256K (262,144)").tag(262144)
+                        }
+                        .frame(width: 170)
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("GPU Layers")
                             .font(.system(size: DesignToken.caption2Size))
                             .foregroundStyle(Color.dsTextSecondary)
                         Picker("", selection: $ggufGpuLayers) {
+                            Text("Auto").tag(LocalModelAutoConfig.autoGPULayers)
                             Text("CPU").tag(0)
                             Text("GPU (All)").tag(-1)
                         }
                         .pickerStyle(.segmented)
-                        .frame(width: 160)
+                        .frame(width: 140)
                     }
                     Spacer()
                 }
-                Text("GPU (All) offloads every layer to the Metal GPU — fastest on Apple Silicon. CPU runs purely on the processor and uses far less memory.")
+
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Chat Template")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Menu {
+                            Button("Auto (Embedded / Companion)") { ggufChatTemplate = "" }
+                            Divider()
+                            Button("Agentic Tool Calling (ChatML / Qwen)") { ggufChatTemplate = "agentic-qwen" }
+                            Button("Agentic Tool Calling (Llama 3)") { ggufChatTemplate = "agentic-llama3" }
+                            Divider()
+                            Button("Built-in: ChatML") { ggufChatTemplate = "chatml" }
+                            Button("Built-in: Llama 3") { ggufChatTemplate = "llama3" }
+                            Button("Built-in: Mistral v3") { ggufChatTemplate = "mistral" }
+                            Button("Built-in: DeepSeek") { ggufChatTemplate = "deepseek" }
+                            Divider()
+                            Button("Choose Custom .jinja File…") { chooseCustomJinjaTemplate() }
+                        } label: {
+                            HStack {
+                                Text(chatTemplateDisplayName(ggufChatTemplate))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: DesignToken.caption2Size))
+                                    .foregroundStyle(Color.dsTextTertiary)
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.dsControlBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dsBorder, lineWidth: 1))
+                        .frame(width: 240)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("KV Cache Type")
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Picker("", selection: $ggufCacheTypeK) {
+                            Text("Default (q8_0)").tag("")
+                            Text("Q8_0 (Recommended)").tag("q8_0")
+                            Text("Q4_0 (Memory Saver)").tag("q4_0")
+                            Text("FP16 (Full Precision)").tag("f16")
+                        }
+                        .frame(width: 170)
+                        .onChange(of: ggufCacheTypeK) { newValue in
+                            ggufCacheTypeV = newValue
+                        }
+                    }
+                    Spacer()
+                }
+
+                HStack(spacing: 20) {
+                    Toggle("Flash Attention (-fa on)", isOn: $ggufFlashAttn)
+                        .font(.system(size: DesignToken.captionSize))
+                    Toggle("Context Shift (--context-shift)", isOn: $ggufContextShift)
+                        .font(.system(size: DesignToken.captionSize))
+                    Spacer()
+                }
+
+                Text("GPU (All) offloads every layer to Metal GPU. Context Shift dynamically slides tokens on long conversations without aborting. Agentic template formats tools as XML for Claude Code.")
                     .font(.system(size: DesignToken.caption2Size))
                     .foregroundStyle(Color.dsTextTertiary)
             }
@@ -1091,6 +1295,36 @@ struct SettingsView: View {
     }
 
     // MARK: - GGUF Helpers
+
+    /// Open file dialog to choose a custom .jinja chat template.
+    private func chooseCustomJinjaTemplate() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Chat Template (.jinja)"
+        panel.allowedContentTypes = [.item]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            ggufChatTemplate = url.path
+            LocalModelManager.shared.ggufChatTemplate = url.path
+            config.ggufChatTemplate = url.path
+        }
+    }
+
+    /// Display label for selected chat template.
+    private func chatTemplateDisplayName(_ val: String) -> String {
+        switch val {
+        case "": return "Auto (Companion / Jinja)"
+        case "agentic-qwen": return "Agentic (ChatML / Qwen)"
+        case "agentic-llama3": return "Agentic (Llama 3)"
+        case "chatml": return "Built-in (ChatML)"
+        case "llama3": return "Built-in (Llama 3)"
+        case "mistral": return "Built-in (Mistral v3)"
+        case "deepseek": return "Built-in (DeepSeek)"
+        default:
+            return (val as NSString).lastPathComponent
+        }
+    }
 
     /// The currently selected GGUF model's display name.
     private var selectedGGUFDisplayName: String {
@@ -1152,7 +1386,10 @@ struct SettingsView: View {
         let mgr = LocalModelManager.shared
         switch mgr.status {
         case .stopped: return "llama-server not running"
-        case .starting: return "Loading model…"
+        case .starting:
+            return mgr.isLoadingModel && mgr.loadFraction > 0
+                ? "Loading model… \(Int((mgr.loadFraction * 100).rounded()))%"
+                : "Loading model…"
         case .running(let pid):
             if mgr.provider == .gguf {
                 let alias = !mgr.ggufModelAlias.isEmpty ? " (\(mgr.ggufModelAlias))" : ""
@@ -1164,43 +1401,157 @@ struct SettingsView: View {
     }
 
     /// Select a GGUF model and sync it to the manager + config.
+    /// Select a GGUF model, derive every launch setting from its own metadata,
+    /// and point Claude's routing tiers at it.
     private func selectGGUFModel(_ model: GGUFModelFile) {
         ggufModelPath = model.path
         ggufModelAlias = model.suggestedAlias
-        let matchedMmproj = model.mmprojPath ?? GGUFModelScanner.findMatchingMmproj(forModelPath: model.path, knownMmproj: scannedMmprojFiles) ?? ""
+        let matchedMmproj = model.mmprojPath
+            ?? GGUFModelScanner.findMatchingMmproj(forModelPath: model.path, knownMmproj: scannedMmprojFiles)
+            ?? ""
         ggufMmprojPath = matchedMmproj
+
         let mgr = LocalModelManager.shared
         mgr.selectedGGUFPath = model.path
         mgr.ggufModelAlias = model.suggestedAlias
         mgr.ggufMmprojPath = matchedMmproj
-        // Auto-apply a sensible GPU default for large models: offload all
-        // layers when the model is small enough, CPU for very large ones.
-        mgr.ggufGpuLayers = model.isLargeModel ? 0 : -1
-        ggufGpuLayers = mgr.ggufGpuLayers
-        // The server port is shared with the provider routing.
+        // Auto: hand offload and context sizing to llama.cpp's fitter — it
+        // knows the real memory budget, and pinning these is what produced
+        // both the context overflows and the accidental CPU-only runs.
+        mgr.ggufGpuLayers = LocalModelAutoConfig.autoGPULayers
+        mgr.ggufContextSize = 0
+        ggufGpuLayers = LocalModelAutoConfig.autoGPULayers
+        ggufContextSize = 0
         mgr.provider = .gguf
         mgr.port = Int(ggufPort) ?? 8081
-        // Persist immediately so the router always resolves the right alias,
-        // even before the debounced autosave fires.
+
         config.ggufModelPath = model.path
         config.ggufModelAlias = model.suggestedAlias
         config.ggufMmprojPath = matchedMmproj
-        if provider == "gguf" {
-            self.model = model.suggestedAlias
-            config.model = model.suggestedAlias
-            setTierModel(.defaultModel, model.suggestedAlias)
-        }
+        config.ggufGpuLayers = LocalModelAutoConfig.autoGPULayers
+        config.ggufContextSize = 0
+
+        // Derive context, template and tool format from the model, then route
+        // every Claude tier at it so traffic lands here immediately.
+        let plan = LocalModelAutoConfig.plan(
+            forModelPath: model.path,
+            alias: model.suggestedAlias,
+            overrides: currentOverrides()
+        )
+        LocalModelAutoConfig.applyRouting(plan, port: mgr.port)
+
+        provider = "gguf"
+        self.model = model.suggestedAlias
+        setTierModel(.defaultModel, model.suggestedAlias)
+        setTierModel(.opus, model.suggestedAlias)
+        setTierModel(.sonnet, model.suggestedAlias)
+        setTierModel(.haiku, model.suggestedAlias)
+        routeLocalTiersToGGUF()
+        autoConfigSummary = plan.summary
         saveConfigImmediately()
         print("[Settings] Selected GGUF model: \(model.name) (\(model.path)), mmproj: \(matchedMmproj)")
+    }
+
+    /// Point every Claude tier that currently targets a local backend at the
+    /// GGUF runtime, so the model just selected actually receives the traffic.
+    /// Cloud tiers are left alone (see `LocalModelAutoConfig.localProviderIDs`).
+    private func routeLocalTiersToGGUF() {
+        for tier in [TierKey.opus, TierKey.sonnet, TierKey.haiku] {
+            let current = tierProviders[tier.rawValue] ?? ""
+            guard current != "gguf", LocalModelAutoConfig.localProviderIDs.contains(current) else { continue }
+            setTierProvider(tier, "gguf")
+        }
+    }
+
+    /// The launch settings currently chosen in the UI.
+    private func currentOverrides() -> LocalModelAutoConfig.Overrides {
+        LocalModelAutoConfig.Overrides(
+            contextSize: ggufContextSize,
+            gpuLayers: ggufGpuLayers,
+            cacheTypeK: ggufCacheTypeK,
+            cacheTypeV: ggufCacheTypeV,
+            flashAttention: ggufFlashAttn,
+            contextShift: ggufContextShift,
+            chatTemplate: ggufChatTemplate,
+            mmprojPath: ggufMmprojPath,
+            threads: 0
+        )
+    }
+
+    /// The plan JXRouter would use to launch the currently selected model.
+    private func currentPlan() -> LocalModelPlan {
+        LocalModelAutoConfig.plan(
+            forModelPath: ggufModelPath,
+            alias: ggufModelAlias,
+            overrides: currentOverrides()
+        )
+    }
+
+    /// Built-in llama.cpp runtime: which build is in use and whether a newer
+    /// official build can be installed.
+    private var llamaRuntimeSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape.2.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.dsAccent)
+                Text("llama.cpp Runtime")
+                    .font(.system(size: DesignToken.captionSize, weight: .semibold))
+                    .foregroundStyle(Color.dsTextPrimary)
+                Spacer()
+                Text(LlamaRuntime.shared.statusSummary)
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextSecondary)
+            }
+
+            if !LlamaRuntime.shared.phase.message.isEmpty {
+                HStack(spacing: 6) {
+                    if LlamaRuntime.shared.phase.isBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(LlamaRuntime.shared.phase.message)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("Check for Update") {
+                    Task { await LlamaRuntime.shared.checkForUpdate() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(LlamaRuntime.shared.phase.isBusy)
+
+                if !LlamaRuntime.shared.isInstalled || LlamaRuntime.shared.updateAvailable {
+                    Button(LlamaRuntime.shared.isInstalled ? "Update" : "Install llama.cpp") {
+                        Task { await LlamaRuntime.shared.install() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(LlamaRuntime.shared.phase.isBusy)
+                }
+                Spacer()
+            }
+        }
+        .task {
+            await LlamaRuntime.shared.resolve()
+            if autoConfigSummary.isEmpty, !ggufModelPath.isEmpty {
+                autoConfigSummary = currentPlan().summary
+            }
+        }
     }
 
     /// Scan the default locations for GGUF models and mmproj companion files.
     private func scanGGUFModels() async {
         ggufScanTask?.cancel()
         ggufScanState = "Scanning…"
+        let extra = ggufSearchPaths
         let (models, mmprojs) = await Task.detached(priority: .userInitiated) {
-            let m = GGUFModelScanner.scan()
-            let p = GGUFModelScanner.scanMmprojFiles()
+            let m = GGUFModelScanner.scan(extraPaths: extra)
+            let p = GGUFModelScanner.scanMmprojFiles(extraPaths: extra)
             return (m, p)
         }.value
         ggufModels = models
@@ -1233,12 +1584,33 @@ struct SettingsView: View {
                 config.ggufMmprojPath = matched
             }
         }
-        ggufScanState = models.isEmpty ? "No GGUF models found in ~/Models, ~/Downloads, or /Volumes." : "Found \(models.count) model\(models.count == 1 ? "" : "s")\(mmprojs.isEmpty ? "" : ", \(mmprojs.count) mmproj")."
+        ggufScanState = models.isEmpty
+            ? (extra.isEmpty
+                ? "No GGUF models found in ~/Models, ~/Downloads, or /Volumes."
+                : "No GGUF models found in the default folders or your \(extra.count) added folder\(extra.count == 1 ? "" : "s").")
+            : "Found \(models.count) model\(models.count == 1 ? "" : "s")\(mmprojs.isEmpty ? "" : ", \(mmprojs.count) mmproj")."
+    }
+
+    /// Add a folder to scan for GGUF models (directories only).
+    private func addModelFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.message = "Choose a folder containing .gguf models"
+        guard panel.runModal() == .OK else { return }
+        let added = panel.urls.map(\.path).filter { !ggufSearchPaths.contains($0) }
+        guard !added.isEmpty else { return }
+        ggufSearchPaths.append(contentsOf: added)
+        saveConfigImmediately()
+        Task { await scanGGUFModels() }
     }
 
     /// Run the selected GGUF model through llama-server, then make it the
     /// active routed provider so Claude Code routes through it immediately —
     /// select a model, load it, ready to use (like Unsloth's model picker).
+    /// Load the selected GGUF model and make it the active routed provider so
+    /// Claude Code reaches it immediately — select a model, load it, use it.
     private func runGGUFModel() {
         let mgr = LocalModelManager.shared
         mgr.provider = .gguf
@@ -1247,37 +1619,61 @@ struct SettingsView: View {
         mgr.ggufMmprojPath = ggufMmprojPath
         mgr.ggufGpuLayers = ggufGpuLayers
         mgr.ggufContextSize = ggufContextSize
+        mgr.ggufChatTemplate = ggufChatTemplate
+        mgr.ggufCacheTypeK = ggufCacheTypeK
+        mgr.ggufCacheTypeV = ggufCacheTypeV
+        mgr.ggufFlashAttn = ggufFlashAttn
+        mgr.ggufContextShift = ggufContextShift
         if let p = Int(ggufPort) { mgr.port = p }
-        // Set the routed provider/model so this model becomes active across the app.
+
+        // Derive the launch plan and route Claude at this model before the
+        // server even starts.
+        let plan = LocalModelAutoConfig.plan(
+            forModelPath: ggufModelPath,
+            alias: ggufModelAlias,
+            overrides: currentOverrides()
+        )
+        LocalModelAutoConfig.applyRouting(plan, port: mgr.port)
+
         provider = "gguf"
-        model = mgr.ggufModelAlias
+        model = plan.alias
         config.provider = "gguf"
-        config.model = mgr.ggufModelAlias
+        config.model = plan.alias
         config.ggufModelPath = ggufModelPath
-        config.ggufModelAlias = mgr.ggufModelAlias
+        config.ggufModelAlias = plan.alias
         config.ggufMmprojPath = ggufMmprojPath
-        setTierModel(.defaultModel, mgr.ggufModelAlias)
+        config.ggufGpuLayers = ggufGpuLayers
+        config.ggufContextSize = ggufContextSize
+        config.ggufChatTemplate = ggufChatTemplate
+        config.ggufCacheTypeK = ggufCacheTypeK
+        config.ggufCacheTypeV = ggufCacheTypeV
+        config.ggufFlashAttn = ggufFlashAttn
+        config.ggufContextShift = ggufContextShift
+        setTierModel(.defaultModel, plan.alias)
+        setTierModel(.opus, plan.alias)
+        setTierModel(.sonnet, plan.alias)
+        setTierModel(.haiku, plan.alias)
+        routeLocalTiersToGGUF()
+        autoConfigSummary = plan.summary
         saveConfigImmediately()
 
         Task {
             await mgr.start(forceRestart: true)
-            // Detect from live server in case server confirmed alias
+            // Adopt the alias the live server actually registered.
             let (_, liveAlias) = await mgr.detectRunningGGUF(customPort: Int(ggufPort))
             if let alias = liveAlias, !alias.isEmpty {
                 await MainActor.run {
                     self.model = alias
                     self.config.model = alias
                     setTierModel(.defaultModel, alias)
+                    setTierModel(.opus, alias)
+                    setTierModel(.sonnet, alias)
+                    setTierModel(.haiku, alias)
                     saveConfigImmediately()
                 }
             }
             await fetchTierModels(for: .defaultModel)
             await fetchLocalEndpointModels()
-            if let first = tierLiveModels[TierKey.defaultModel.rawValue]?.first, !first.isEmpty {
-                setTierModel(.defaultModel, first)
-                config.model = first
-                saveConfigImmediately()
-            }
         }
     }
 
@@ -2039,6 +2435,31 @@ struct SettingsView: View {
 
     private var systemTab: some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing20) {
+            // Source-of-truth gateway (ported from the Go build)
+            sectionGroup("Source of Truth") {
+                GatewaySettingsSection()
+            }
+
+            sectionGroup("Machine") {
+                HardwareProfileRow()
+            }
+
+            sectionGroup("Local Inference Engine") {
+                InProcessEngineRow()
+            }
+
+            sectionGroup("App Activity") {
+                RoutingTelemetryRow()
+            }
+
+            sectionGroup("Output Rules") {
+                STE100Row()
+            }
+
+            sectionGroup("Environment") {
+                EnvManagerSection()
+            }
+
             // Theme & Appearance controls
             sectionGroup("Theme & Appearance") {
                 VStack(alignment: .leading, spacing: DesignToken.spacing12) {
@@ -2367,6 +2788,11 @@ struct SettingsView: View {
         hasher.combine(ggufGpuLayers)
         hasher.combine(ggufContextSize)
         hasher.combine(ggufPort)
+        hasher.combine(ggufChatTemplate)
+        hasher.combine(ggufCacheTypeK)
+        hasher.combine(ggufCacheTypeV)
+        hasher.combine(ggufFlashAttn)
+        hasher.combine(ggufContextShift)
         hasher.combine(providerUrlOverrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" })
         hasher.combine(enableSystemProxy)
         hasher.combine(appRoutes.map { "\($0.bundleIdentifier ?? "")|\($0.appName)|\($0.enabled)" })
@@ -2440,6 +2866,16 @@ struct SettingsView: View {
         ggufGpuLayers = config.ggufGpuLayers
         ggufContextSize = config.ggufContextSize
         ggufPort = String(config.ggufPort)
+        ggufChatTemplate = config.ggufChatTemplate
+        ggufCacheTypeK = config.ggufCacheTypeK
+        ggufCacheTypeV = config.ggufCacheTypeV
+        ggufFlashAttn = config.ggufFlashAttn
+        ggufContextShift = config.ggufContextShift
+        LocalModelManager.shared.ggufChatTemplate = ggufChatTemplate
+        LocalModelManager.shared.ggufCacheTypeK = ggufCacheTypeK
+        LocalModelManager.shared.ggufCacheTypeV = ggufCacheTypeV
+        LocalModelManager.shared.ggufFlashAttn = ggufFlashAttn
+        LocalModelManager.shared.ggufContextShift = ggufContextShift
         customUrl = config.baseUrl(for: "custom")
         customKey = config.apiKey(for: "custom")
         customProviders = config.customProviders
@@ -2457,6 +2893,7 @@ struct SettingsView: View {
             customProviderKeys["custom"] = customKey
         }
         providerUrlOverrides = config.providerBackendUrls
+        ggufSearchPaths = config.ggufSearchPaths
         reloadApiKeysFromConfig()
         enableSystemProxy = manager.systemProxyEnabled
         routeOpenAI = config.routeOpenAI
@@ -2563,14 +3000,21 @@ struct SettingsView: View {
         config.ggufModelAlias = ggufModelAlias
         config.ggufGpuLayers = ggufGpuLayers
         config.ggufContextSize = ggufContextSize
+        config.ggufChatTemplate = ggufChatTemplate
+        config.ggufCacheTypeK = ggufCacheTypeK
+        config.ggufCacheTypeV = ggufCacheTypeV
+        config.ggufFlashAttn = ggufFlashAttn
+        config.ggufContextShift = ggufContextShift
         if let ggufPortVal = Int(ggufPort) { config.ggufPort = ggufPortVal }
+        config.ggufSearchPaths = ggufSearchPaths
         // Custom provider: endpoint + key (persisted, auto-fetchable).
         var overrides = providerUrlOverrides.filter { !$0.value.isEmpty }
         if !customUrl.trimmingCharacters(in: .whitespaces).isEmpty {
             overrides["custom"] = customUrl.trimmingCharacters(in: .whitespaces)
         }
         config.providerBackendUrls = overrides
-        config.setApiKey(chainKey: ConfigManager.KeychainKey.custom, value: customKey)
+        // The custom key is written by the diff below. Writing it here as well
+        // cleared it on every save where the field happened to be empty.
         // Named custom providers: persist definitions + per-provider keys.
         for def in customProviders {
             config.upsertCustomProvider(def, apiKey: customProviderKeys[def.id] ?? "")
@@ -2606,20 +3050,47 @@ struct SettingsView: View {
             ("key:xai", ConfigManager.KeychainKey.xai),
             ("key:antigravity", ConfigManager.KeychainKey.antigravity),
         ]
+        // An empty field may only clear a stored key when the user emptied it.
+        // A field that was never populated — a Keychain read that returned a
+        // placeholder, or a reload that raced a stalled keychain — must not
+        // wipe the real secret. Comparing against the stored value (rather than
+        // just the previous snapshot) deleted keys whenever a read came back
+        // empty, which is what made keys "disappear".
         for write in keyWrites {
             let value = current[write.field] ?? ""
-            if lastSavedValues[write.field] != value || config.getApiKey(chainKey: write.chainKey) != value {
+            let previous = lastSavedValues[write.field] ?? ""
+            if value.isEmpty {
+                if !previous.isEmpty {
+                    config.setApiKey(chainKey: write.chainKey, value: "")
+                }
+                continue
+            }
+            if previous != value || config.getApiKey(chainKey: write.chainKey) != value {
                 config.setApiKey(chainKey: write.chainKey, value: value)
             }
         }
-        if lastSavedValues["customKey"] != customKey || config.getApiKey(chainKey: ConfigManager.KeychainKey.custom) != customKey {
+        let previousCustomKey = lastSavedValues["customKey"] ?? ""
+        if customKey.isEmpty {
+            if !previousCustomKey.isEmpty {
+                config.setApiKey(chainKey: ConfigManager.KeychainKey.custom, value: "")
+            }
+        } else if previousCustomKey != customKey
+                    || config.getApiKey(chainKey: ConfigManager.KeychainKey.custom) != customKey {
             config.setApiKey(chainKey: ConfigManager.KeychainKey.custom, value: customKey)
         }
         for def in customProviders {
             let value = customProviderKeys[def.id] ?? ""
             let field = "customProvider:\(def.id)"
             let chainKey = ConfigManager.customProviderKey(def.id)
-            if lastSavedValues[field] != "\(def.name)|\(def.baseUrl)|\(value)" || config.getApiKey(chainKey: chainKey) != value {
+            let snapshot = "\(def.name)|\(def.baseUrl)|\(value)"
+            let previous = lastSavedValues[field] ?? ""
+            if value.isEmpty {
+                if !previous.isEmpty {
+                    config.setApiKey(chainKey: chainKey, value: "")
+                }
+                continue
+            }
+            if previous != snapshot || config.getApiKey(chainKey: chainKey) != value {
                 config.setApiKey(chainKey: chainKey, value: value)
             }
         }
@@ -2785,6 +3256,12 @@ struct SettingsView: View {
         values["ggufGpuLayers"] = String(ggufGpuLayers)
         values["ggufContextSize"] = String(ggufContextSize)
         values["ggufPort"] = ggufPort
+        values["ggufSearchPaths"] = ggufSearchPaths.joined(separator: "\u{1f}")
+        values["ggufChatTemplate"] = ggufChatTemplate
+        values["ggufCacheTypeK"] = ggufCacheTypeK
+        values["ggufCacheTypeV"] = ggufCacheTypeV
+        values["ggufFlashAttn"] = String(ggufFlashAttn)
+        values["ggufContextShift"] = String(ggufContextShift)
         values["customUrl"] = customUrl
         values["customKey"] = customKey
         values["enableSystemProxy"] = String(enableSystemProxy)
@@ -2850,6 +3327,11 @@ struct SettingsView: View {
         ggufGpuLayers = 0
         ggufContextSize = 0
         ggufPort = "8081"
+        ggufChatTemplate = ""
+        ggufCacheTypeK = ""
+        ggufCacheTypeV = ""
+        ggufFlashAttn = true
+        ggufContextShift = true
         customUrl = ""
         customKey = ""
         customProviders = []

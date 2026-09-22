@@ -1,15 +1,15 @@
 import Foundation
-
-// MARK: - Stubs (only referenced as types by ConfigManager; never exercised)
-
-/// Minimal stand-in so ConfigManager.swift compiles in the test bundle.
-/// The app target compiles the real implementation.
-class ProviderRouter {}
-
-/// Minimal stand-in for the app's MessageTranslator.
-enum MessageTranslator {
-    static func isReasoningCapable(providerId: String, model: String) -> Bool { false }
-}
+// This is a HOSTLESS logic-test bundle: the app sources it needs are compiled
+// straight into it (see the target's Sources phase), so there is no separate
+// module to import and no host app to launch. That matters here because the
+// app is an LSUIElement menu-bar agent, and a host-app test run never
+// establishes a connection — "test runner hung before establishing
+// connection" — which is why this bundle does not use TEST_HOST.
+//
+// The ProviderRouter / MessageTranslator stubs that used to live here are
+// gone for the same reason: in a single-module bundle they shadow the real
+// types, and the MessageTranslator stub broke the standalone harness, which
+// needs the genuine implementation.
 
 // MARK: - In-memory Keychain backend
 

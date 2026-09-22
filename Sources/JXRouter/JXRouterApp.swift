@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // "inactive" background-only app — but this app must keep serving the
         // proxy (Claude Code & co. route through it continuously), so opt out
         // of automatic termination explicitly.
-        ProcessInfo.processInfo.disableAutomaticTermination("com.jxproxy.proxy-server")
+        ProcessInfo.processInfo.disableAutomaticTermination("com.marshaljlee.jxrouter.proxy-server")
 
         // Create the status-bar + window manager (replaces MenuBarExtra).
         statusItemManager = StatusItemManager(proxyManager: manager)
@@ -110,6 +110,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ClaudeSettingsWriter.shared.remove()
         }
 
+        // Revert any config left mid-edit by a previous hard crash (kill -9),
+        // then clear the stale backups.
+        let recovered = ConfigRollbackLedger.shared.recoverStale()
+        if !recovered.isEmpty {
+            print("[AppDelegate] Recovered \(recovered.count) config file(s) left over from a crash")
+        }
+
         // Auto-start the proxy on app launch if enabled in Settings.
         if UserDefaults.standard.bool(forKey: "autoStartProxy") {
             Task { @MainActor in
@@ -138,6 +145,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             ProxyManager.shared.stopProxy()
         }
+        // Clean quit: the config changes stand, so drop the backups rather
+        // than reverting them.
+        RollbackSentinel.shared.disarm()
     }
 
     // MARK: - Termination Signal Handling
@@ -147,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handler, the default action terminates the process immediately and
     /// skips every cleanup path.
     private func installSignalHandlers() {
-        let queue = DispatchQueue(label: "com.jxproxy.termination-signals")
+        let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.termination-signals")
         for sig in [SIGTERM, SIGINT, SIGHUP] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
@@ -166,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !signalCleanupDone else { return }
         signalCleanupDone = true
         print("[AppDelegate] ⚠ Termination signal received — disabling system proxy")
+        // Revert ~/.claude first: leaving those settings behind would point
+        // Claude Code at a proxy that is about to stop existing. Runs before
+        // exit(0), so it must be synchronous.
+        RollbackSentinel.shared.fireSynchronously()
         ProxyManager.shared.emergencyCleanup()
         exit(0)
     }

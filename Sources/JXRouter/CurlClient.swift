@@ -85,10 +85,28 @@ struct CurlClient {
             args += ["-H", "\(key): \(value)"]
         }
         if !body.isEmpty {
-            args += ["-d", String(data: body, encoding: .utf8) ?? ""]
+            if body.count > 262_144 {
+                // Large payloads (Claude Code bodies with base64 images can
+                // pass 1MB) go via stdin: an argv copy can exceed macOS
+                // ARG_MAX and kill the spawn with E2BIG, which surfaced as an
+                // unexplained "network error" for the whole fallback chain.
+                args += ["--data-binary", "@" + Self.writeTempBody(body)]
+            } else {
+                args += ["-d", String(data: body, encoding: .utf8) ?? ""]
+            }
         }
         if stream {
             args += ["-N"] // No-buffer for streaming
+            // Stall-based budget, NOT a hard cap: a hard --max-time kills long
+            // generations mid-stream. The stall window MUST cover local
+            // prefill silence: llama-server returns HTTP headers immediately,
+            // then emits ZERO bytes while prefilling an 80-120k-token Claude
+            // Code prompt (~300-450 tok/s = up to 6+ minutes of silence).
+            // A 240s window aborted healthy prefills mid-flight and surfaced
+            // as an invisible empty response. 600s matches the local attempt
+            // budget; the client watchdog is fed by the router's ping task.
+            // A truly dead upstream still dies in time for the chain.
+            args += ["--speed-limit", "1", "--speed-time", "600", "--max-time", "3600"]
         }
         args.append(url.absoluteString)
         return args
@@ -110,6 +128,26 @@ struct CurlClient {
             return (outData, errData, process.terminationStatus)
         } catch {
             return (Data(), Data(), 1)
+        }
+    }
+
+    /// Writes a large request body to a unique temp file for curl's
+    /// --data-binary @path input, avoiding ARG_MAX on the argv. Best-effort:
+    /// falls back to a zero-byte file (curl then sends an empty body, which
+    /// upstreams reject loudly instead of the spawn failing silently).
+    private static func writeTempBody(_ body: Data) -> String {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("jxproxy-body-\(UUID().uuidString).json")
+        do {
+            try body.write(to: url)
+            // Fire-and-forget cleanup: the file is only needed for the curl
+            // invocation that immediately follows.
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 120) {
+                try? FileManager.default.removeItem(at: url)
+            }
+            return url.path
+        } catch {
+            return "/dev/null"
         }
     }
 

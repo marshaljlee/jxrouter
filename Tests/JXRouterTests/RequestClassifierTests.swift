@@ -1,5 +1,4 @@
 import XCTest
-@testable import JXRouter
 
 /// Tests for the RequestClassifier that decides whether an HTTP request
 /// should be routed through JXProxy's AI providers, passed through directly,

@@ -39,112 +39,244 @@ enum LocalChatTemplateEngine {
             }
         }
 
-        /// Complete embedded Jinja2 chat template with function calling / tools support.
+        /// Complete embedded Jinja2 chat template with full agentic function calling / tools support
+        /// directly mirroring Section 7.1 of the llama.cpp / llama-server definitive reference.
         /// Can be written to a file for `llama-server --chat-template-file <path>`.
         var jinjaSource: String {
             switch self {
             case .chatml, .standard:
+                // Production-Ready Agentic Jinja2 Template (Qwen / ChatML Standard)
+                // From Section 7.1 of llama-server Definitive Reference
                 return """
-                {%- for message in messages -%}
-                    {{- '<|im_start|>' + message['role'] + '\\n' -}}
-                    {%- if message['content'] is string -%}
-                        {{- message['content'] -}}
-                    {%- else -%}
-                        {%- for block in message['content'] -%}
-                            {%- if block['type'] == 'text' -%}
-                                {{- block['text'] -}}
-                            {%- endif -%}
-                        {%- endfor -%}
-                    {%- endif -%}
-                    {{- '<|im_end|>\\n' -}}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<|im_start|>assistant\\n' -}}
-                {%- endif -%}
+                {%- if tools %}
+                    {{- '<|im_start|>system\\n' }}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- messages[0]['content'] }}
+                    {%- else %}
+                        {{- 'You are a helpful assistant with tool-calling capabilities.' }}
+                    {%- endif %}
+                    {{- '\\n\\n# Tools\\n\\nYou have access to the following functions:\\n\\n' }}
+                    {%- for tool in tools %}
+                        {{- 'Use the function `' ~ tool.function.name ~ '` to: ' ~ tool.function.description ~ '\\n' }}
+                        {{- 'JSON Schema:\\n' }}
+                        {{- tool.function | tojson }}
+                        {{- '\\n\\n' }}
+                    {%- endfor %}
+                    {{- 'To call a function, respond with a JSON object inside <tool_call></tool_call> tags:\\n' }}
+                    {{- '<tool_call>\\n{"name": "function_name", "arguments": {"arg_1": "val_1"}}\\n</tool_call>\\n' }}
+                    {{- '<|im_end|>\\n' }}
+                {%- else %}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- '<|im_start|>system\\n' ~ messages[0]['content'] ~ '<|im_end|>\\n' }}
+                    {%- endif %}
+                {%- endif %}
+
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '<|im_start|>user\\n' ~ message.content ~ '<|im_end|>\\n' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- '<|im_start|>assistant\\n' }}
+                        {%- if message.content %}
+                            {{- message.content }}
+                        {%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '<tool_call>\\n{"name": "' ~ tool_call.function.name ~ '", "arguments": ' ~ tool_call.function.arguments | tojson ~ '}\\n</tool_call>\\n' }}
+                            {%- endfor %}
+                        {%- endif %}
+                        {{- '<|im_end|>\\n' }}
+                    {%- elif message.role == 'tool' %}
+                        {{- '<|im_start|>user\\n<tool_response>\\n' ~ message.content ~ '\\n</tool_response><|im_end|>\\n' }}
+                    {%- endif %}
+                {%- endfor %}
+
+                {%- if add_generation_prompt %}
+                    {{- '<|im_start|>assistant\\n' }}
+                {%- endif %}
                 """
             case .llama3:
+                // Production-Ready Agentic Jinja2 Template (Llama 3.1 / 3.2 / 3.3 Standard)
+                // From Section 7.1 of llama-server Definitive Reference
                 return """
-                {{- '<|begin_of_text|>' -}}
-                {%- for message in messages -%}
-                    {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' -}}
-                    {%- if message['content'] is string -%}
-                        {{- message['content'] -}}
-                    {%- else -%}
-                        {%- for block in message['content'] -%}
-                            {%- if block['type'] == 'text' -%}
-                                {{- block['text'] -}}
-                            {%- endif -%}
-                        {%- endfor -%}
-                    {%- endif -%}
-                    {{- '<|eot_id|>' -}}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}
-                {%- endif -%}
+                {{- '<|begin_of_text|>' }}
+                {%- if tools %}
+                    {{- '<|start_header_id|>system<|end_header_id|>\\n\\n' }}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- messages[0]['content'] }}
+                    {%- else %}
+                        {{- 'You are a helpful assistant with tool-calling capabilities.' }}
+                    {%- endif %}
+                    {{- '\\n\\nEnvironment: ipython\\n\\nTools:\\n' }}
+                    {%- for tool in tools %}
+                        {{- tool.function | tojson ~ '\\n' }}
+                    {%- endfor %}
+                    {{- '\\nTo call a tool, output the function call JSON.\\n' }}
+                    {{- '<|eot_id|>' }}
+                {%- else %}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- '<|start_header_id|>system<|end_header_id|>\\n\\n' ~ messages[0]['content'] ~ '<|eot_id|>' }}
+                    {%- endif %}
+                {%- endif %}
+
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '<|start_header_id|>user<|end_header_id|>\\n\\n' ~ message.content ~ '<|eot_id|>' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}
+                        {%- if message.content %}
+                            {{- message.content }}
+                        {%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '{"name": "' ~ tool_call.function.name ~ '", "parameters": ' ~ tool_call.function.arguments | tojson ~ '}' }}
+                            {%- endfor %}
+                        {%- endif %}
+                        {{- '<|eot_id|>' }}
+                    {%- elif message.role == 'tool' %}
+                        {{- '<|start_header_id|>ipython<|end_header_id|>\\n\\n' ~ message.content ~ '<|eot_id|>' }}
+                    {%- endif %}
+                {%- endfor %}
+
+                {%- if add_generation_prompt %}
+                    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}
+                {%- endif %}
                 """
             case .deepseek3, .deepseek:
                 return """
-                {%- for message in messages -%}
-                    {%- if message['role'] == 'system' -%}
-                        {{- message['content'] + '\\n\\n' -}}
-                    {%- elif message['role'] == 'user' -%}
-                        {{- '<｜User｜>' + message['content'] -}}
-                    {%- elif message['role'] == 'assistant' -%}
-                        {{- '<｜Assistant｜>' + message['content'] -}}
-                    {%- endif -%}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<｜Assistant｜>' -}}
-                {%- endif -%}
+                {%- if tools %}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- messages[0]['content'] + '\\n\\n' }}
+                    {%- endif %}
+                    {{- '# Tools\\n\\nYou have access to the following tools:\\n\\n' }}
+                    {%- for tool in tools %}
+                        {{- '```json\\n' ~ tool.function | tojson ~ '\\n```\\n\\n' }}
+                    {%- endfor %}
+                    {{- 'To call a function, respond with: <tool_call>\\n{"name": "function_name", "arguments": {}}\\n</tool_call>\\n\\n' }}
+                {%- else %}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- messages[0]['content'] + '\\n\\n' }}
+                    {%- endif %}
+                {%- endif %}
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '<｜User｜>' + message.content }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- '<｜Assistant｜>' }}
+                        {%- if message.content %}
+                            {{- message.content }}
+                        {%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '<tool_call>\\n{"name": "' ~ tool_call.function.name ~ '", "arguments": ' ~ tool_call.function.arguments | tojson ~ '}\\n</tool_call>' }}
+                            {%- endfor %}
+                        {%- endif %}
+                    {%- elif message.role == 'tool' %}
+                        {{- '<｜User｜><tool_response>\\n' + message.content + '\\n</tool_response>' }}
+                    {%- endif %}
+                {%- endfor %}
+                {%- if add_generation_prompt %}
+                    {{- '<｜Assistant｜>' }}
+                {%- endif %}
                 """
             case .phi4, .phi3:
                 return """
-                {%- for message in messages -%}
-                    {{- '<|' + message['role'] + '|>\\n' + message['content'] + '<|end|>\\n' -}}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<|assistant|>\\n' -}}
-                {%- endif -%}
+                {%- if tools %}
+                    {{- '<|system|>\\n' }}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- messages[0]['content'] + '\\n\\n' }}
+                    {%- endif %}
+                    {{- 'You have access to tools. Call tools using <tool_call>{"name": "...", "arguments": {...}}</tool_call>\\n' }}
+                    {%- for tool in tools %}
+                        {{- tool.function | tojson ~ '\\n' }}
+                    {%- endfor %}
+                    {{- '<|end|>\\n' }}
+                {%- else %}
+                    {%- if messages[0]['role'] == 'system' %}
+                        {{- '<|system|>\\n' + messages[0]['content'] + '<|end|>\\n' }}
+                    {%- endif %}
+                {%- endif %}
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '<|user|>\\n' + message.content + '<|end|>\\n' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- '<|assistant|>\\n' }}
+                        {%- if message.content %}{{- message.content }}{%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '<tool_call>{"name": "' ~ tool_call.function.name ~ '", "arguments": ' ~ tool_call.function.arguments | tojson ~ '}</tool_call>' }}
+                            {%- endfor %}
+                        {%- endif %}
+                        {{- '<|end|>\\n' }}
+                    {%- elif message.role == 'tool' %}
+                        {{- '<|user|>\\n<tool_response>\\n' + message.content + '\\n</tool_response><|end|>\\n' }}
+                    {%- endif %}
+                {%- endfor %}
+                {%- if add_generation_prompt %}
+                    {{- '<|assistant|>\\n' }}
+                {%- endif %}
                 """
             case .mistral:
                 return """
-                {%- for message in messages -%}
-                    {%- if message['role'] == 'user' -%}
-                        {{- '[INST] ' + message['content'] + ' [/INST]' -}}
-                    {%- elif message['role'] == 'assistant' -%}
-                        {{- ' ' + message['content'] + ' ' -}}
-                    {%- elif message['role'] == 'system' -%}
-                        {{- '[INST] ' + message['content'] + ' [/INST]' -}}
-                    {%- endif -%}
-                {%- endfor -%}
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '[INST] ' + message.content + ' [/INST]' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- ' ' }}
+                        {%- if message.content %}{{- message.content }}{%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '[TOOL_CALLS] [{"name": "' ~ tool_call.function.name ~ '", "arguments": ' ~ tool_call.function.arguments | tojson ~ '}]' }}
+                            {%- endfor %}
+                        {%- endif %}
+                        {{- ' ' }}
+                    {%- elif message.role == 'system' %}
+                        {{- '[INST] ' + message.content + ' [/INST]' }}
+                    {%- elif message.role == 'tool' %}
+                        {{- '[INST] [TOOL_RESULTS] ' + message.content + ' [/TOOL_RESULTS] [/INST]' }}
+                    {%- endif %}
+                {%- endfor %}
                 """
             case .gemma:
                 return """
-                {%- for message in messages -%}
-                    {{- '<start_of_turn>' + message['role'] + '\\n' + message['content'] + '<end_of_turn>\\n' -}}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<start_of_turn>model\\n' -}}
-                {%- endif -%}
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '<start_of_turn>user\\n' + message.content + '<end_of_turn>\\n' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- '<start_of_turn>model\\n' }}
+                        {%- if message.content %}{{- message.content }}{%- endif %}
+                        {%- if message.tool_calls %}
+                            {%- for tool_call in message.tool_calls %}
+                                {{- '<tool_call>\\n{"name": "' ~ tool_call.function.name ~ '", "arguments": ' ~ tool_call.function.arguments | tojson ~ '}\\n</tool_call>' }}
+                            {%- endfor %}
+                        {%- endif %}
+                        {{- '<end_of_turn>\\n' }}
+                    {%- elif message.role == 'tool' %}
+                        {{- '<start_of_turn>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><end_of_turn>\\n' }}
+                    {%- endif %}
+                {%- endfor %}
+                {%- if add_generation_prompt %}
+                    {{- '<start_of_turn>model\\n' }}
+                {%- endif %}
                 """
             case .llama2:
                 return """
-                {%- for message in messages -%}
-                    {%- if message['role'] == 'user' -%}
-                        {{- '[INST] ' + message['content'] + ' [/INST]' -}}
-                    {%- elif message['role'] == 'assistant' -%}
-                        {{- ' ' + message['content'] + ' ' -}}
-                    {%- endif -%}
-                {%- endfor -%}
+                {%- for message in messages %}
+                    {%- if message.role == 'user' %}
+                        {{- '[INST] ' + message.content + ' [/INST]' }}
+                    {%- elif message.role == 'assistant' %}
+                        {{- ' ' + message.content + ' ' }}
+                    {%- endif %}
+                {%- endfor %}
                 """
             case .commandR:
                 return """
-                {%- for message in messages -%}
-                    {{- '<|START_OF_TURN_TOKEN|><|' + message['role']|upper + '_TOKEN|>' + message['content'] + '<|END_OF_TURN_TOKEN|>' -}}
-                {%- endfor -%}
-                {%- if add_generation_prompt -%}
-                    {{- '<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>' -}}
-                {%- endif -%}
+                {%- for message in messages %}
+                    {%- let role_token = message.role == 'system' ? 'SYSTEM' : (message.role == 'user' ? 'USER' : 'CHATBOT') %}
+                    {{- '<|START_OF_TURN_TOKEN|><|' + role_token + '_TOKEN|>' + message.content + '<|END_OF_TURN_TOKEN|>' }}
+                {%- endfor %}
+                {%- if add_generation_prompt %}
+                    {{- '<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>' }}
+                {%- endif %}
                 """
             }
         }
@@ -198,12 +330,42 @@ enum LocalChatTemplateEngine {
     }
 
     /// Exports a Jinja template file for a given template family and returns the file path.
+    @discardableResult
     static func exportJinjaTemplateFile(for family: ChatTemplateFamily) -> String {
-        let templatesDir = "/tmp/jxrouter_templates"
-        try? FileManager.default.createDirectory(atPath: templatesDir, withIntermediateDirectories: true)
-        let filePath = "\(templatesDir)/\(family.rawValue).jinja"
-        try? family.jinjaSource.write(toFile: filePath, atomically: true, encoding: .utf8)
-        return filePath
+        exportAgenticTemplate(for: family)
+    }
+
+    /// Exports the production-ready agentic Jinja template file for a given template family.
+    /// Saves to ~/.config/llama/templates/ (persistent) and /tmp/jxrouter_templates/ (ephemeral).
+    @discardableResult
+    static func exportAgenticTemplate(for family: ChatTemplateFamily) -> String {
+        let userTemplatesDir = NSString(string: "~/.config/llama/templates").expandingTildeInPath
+        let tmpTemplatesDir = "/tmp/jxrouter_templates"
+        try? FileManager.default.createDirectory(atPath: userTemplatesDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: tmpTemplatesDir, withIntermediateDirectories: true)
+
+        let filename = "\(family.rawValue)_tool_template.jinja"
+        let userPath = "\(userTemplatesDir)/\(filename)"
+        let tmpPath = "\(tmpTemplatesDir)/\(family.rawValue).jinja"
+
+        let content = family.jinjaSource
+        try? content.write(toFile: userPath, atomically: true, encoding: .utf8)
+        try? content.write(toFile: tmpPath, atomically: true, encoding: .utf8)
+
+        return userPath
+    }
+
+    /// Exports the agentic template for a template family name or model string.
+    @discardableResult
+    static func exportAgenticTemplate(for name: String) -> String {
+        let family = ChatTemplateFamily(rawValue: name.lowercased()) ?? detectTemplate(forModelName: name)
+        return exportAgenticTemplate(for: family)
+    }
+
+    /// Resolves an agentic template file for a model path and alias.
+    static func agenticTemplatePath(forModelPath path: String, alias: String) -> String {
+        let family = detectTemplate(forModelName: "\(path) \(alias)")
+        return exportAgenticTemplate(for: family)
     }
 
     // MARK: - Tool Prompt Injection for Local Inference
@@ -355,7 +517,9 @@ enum LocalChatTemplateEngine {
                                 let id = "call_\(UUID().uuidString.prefix(8))"
                                 let args = (dict["arguments"] as? [String: Any]) ?? [:]
                                 let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                                toolCalls.append([
+                                // insert(at: 0): reversed() iteration + append would
+                                // emit multi-block calls in REVERSE document order.
+                                toolCalls.insert([
                                     "id": id,
                                     "type": "function",
                                     "function": [
@@ -364,14 +528,14 @@ enum LocalChatTemplateEngine {
                                     ],
                                     "name": name,
                                     "input": args
-                                ])
+                                ], at: 0)
                             }
                         }
                     } else if let dict = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
                               let name = dict["name"] as? String {
                         let id = "call_\(UUID().uuidString.prefix(8))"
                         let args = (dict["arguments"] as? [String: Any]) ?? [:]
-                        toolCalls.append([
+                        toolCalls.insert([
                             "id": id,
                             "type": "function",
                             "function": [
@@ -380,7 +544,7 @@ enum LocalChatTemplateEngine {
                             ],
                             "name": name,
                             "input": args
-                        ])
+                        ], at: 0)
                     }
                 }
                 if let fullRange = Range(match.range(at: 0), in: cleanText) {

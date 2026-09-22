@@ -18,9 +18,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     /// to prefill before a single token is generated, and the model can be
     /// cold (first request after spawn). A 15s cloud-style cap would abandon
     /// every large local request and burn the whole chain on the cloud
-    /// fallbacks. Local attempts get a much longer budget; the chain's total
-    /// duration cap and the proxy's per-request timeout are sized to fit.
-    private let localAttemptTimeout: TimeInterval = 240.0
+    /// fallbacks. Measured on this machine: ~400-500 tok/s prefill, so a full
+    /// 80-100k-token Claude Code system prompt needs 3-4+ MINUTES. The local
+    /// budget must cover that entire prefill before the first streamed byte.
+    private let localAttemptTimeout: TimeInterval = 600.0
     /// The PRIMARY provider (the user's chosen provider, chain index 0) gets a
     /// much longer budget than fallbacks. Real Claude Code requests carry the
     /// whole conversation (300-400KB): the primary must prefill that before a
@@ -100,13 +101,13 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     func route(method: String, path: String, headers: [String: String], body: Data) async throws -> ProviderResponse {
         switch path {
         case "/v1/messages", "/v1/v1/messages", "/messages":
-            return try await handleMessages(method: method, body: body)
+            return try await handleMessages(method: method, headers: headers, body: body)
         case "/v1/chat/completions", "/v1/v1/chat/completions", "/chat/completions":
             return try await handleChatCompletions(method: method, body: body)
         case "/v1/responses", "/v1/v1/responses", "/responses":
             return try await handleResponses(method: method, body: body)
-        case "/v1/messages/count_tokens":
-            return handleTokenCount(body: body)
+        case "/v1/messages/count_tokens", "/v1/v1/messages/count_tokens", "/count_tokens":
+            return await handleTokenCount(body: body)
         case "/v1/models":
             return handleModelList()
         case "/health", "/", "/api/hello", "/v1/api/hello":
@@ -123,7 +124,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     
     // MARK: - Messages Handler
     
-    private func handleMessages(method: String, body: Data) async throws -> ProviderResponse {
+    private func handleMessages(method: String, headers: [String: String], body: Data) async throws -> ProviderResponse {
         if method == "HEAD" || method == "OPTIONS" {
             return ProviderResponse(statusCode: 204, headers: ["Allow": "POST, HEAD, OPTIONS"], body: Data())
         }
@@ -143,16 +144,16 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         var failures: [(providerId: String, statusCode: Int)] = []
         let chainStart = CFAbsoluteTimeGetCurrent()
         // Total fallback chain cap — sized so a slow local prefill (up to the
-        // 240s local attempt budget) can complete instead of being cut off.
-        let maxChainDuration: TimeInterval = 300.0
-        
+        // 600s local attempt budget) can complete instead of being cut off.
+        let maxChainDuration: TimeInterval = 900.0
+
         for (index, providerId) in providerChain.enumerated() {
             let elapsed = CFAbsoluteTimeGetCurrent() - chainStart
             guard elapsed < maxChainDuration else {
                 failures.append((providerId, 504))
                 break
             }
-            
+
             if index > 0 {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 guard CFAbsoluteTimeGetCurrent() - chainStart < maxChainDuration else {
@@ -160,7 +161,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     break
                 }
             }
-            
+
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
                 // Tier model overrides (e.g. Sonnet → minimaxai/minimax-m3) apply
@@ -175,7 +176,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 // burns through to a 503).
                 let budget = attemptTimeout(for: providerId, index: index)
                 var response = try await Self.withAttemptTimeout(seconds: budget) {
-                    try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, maxTime: Int(budget))
+                    try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, maxTime: Int(budget), clientHeaders: headers)
                 }
                 // Model-rejection rescue: a provider that refuses the REQUESTED
                 // model (400 model unavailable, 401 "model not supported", 404
@@ -190,7 +191,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 if [400, 401, 404].contains(response.statusCode), defaultModelForProvider(providerId) != nil {
                     print("[ProviderRouter] \(providerId) rejected model — retrying with its default model")
                     response = try await Self.withAttemptTimeout(seconds: budget) {
-                        try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget))
+                        try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget), clientHeaders: headers)
                     }
                 }
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
@@ -307,7 +308,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         var lastError: Error?
         var failures: [(providerId: String, statusCode: Int)] = []
         let chainStart = CFAbsoluteTimeGetCurrent()
-        let maxChainDuration: TimeInterval = 300.0
+        let maxChainDuration: TimeInterval = 900.0
         for (index, providerId) in chain.enumerated() {
             let elapsed = CFAbsoluteTimeGetCurrent() - chainStart
             guard elapsed < maxChainDuration else {
@@ -392,7 +393,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         if providerId == "llamaapp" || providerId == "llamacpp" {
             baseUrl = "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
         }
-        let effectiveMaxTime = isLocalProvider(providerId) ? 300 : maxTime
+        let effectiveMaxTime = isLocalProvider(providerId) ? 720 : maxTime
         guard let url = URL(string: "\(baseUrl)/chat/completions") else {
             return errorResponse(statusCode: 500, type: "api_error", message: "Invalid provider URL: \(baseUrl)")
         }
@@ -479,6 +480,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             }
         }
         var chain = [primary]
+        let globalPrimary = ConfigManager.resolveProviderName(config.provider)
+        if globalPrimary != primary && providerIsValid(globalPrimary) {
+            chain.append(globalPrimary)
+        }
         let fallbacks = config.fallbackProviders
             .components(separatedBy: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -506,7 +511,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
     // MARK: - Routing
     
-    private func routeToProvider(providerId: String, request: MessagesRequest, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30) async throws -> ProviderResponse {
+    private func routeToProvider(providerId: String, request: MessagesRequest, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30, clientHeaders: [String: String] = [:]) async throws -> ProviderResponse {
         let resolvedModel = resolveModel(request.model, for: providerId, applyTierOverride: applyTierMapping, forceDefaultModel: forceDefaultModel)
         let apiKey = config.apiKey(for: providerId)
         var baseUrl = config.baseUrl(for: providerId)
@@ -574,15 +579,16 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             }
         }
         
-        // Local runtimes prefill large prompts on the local machine (30s+ for
-        // a 60k-token request, longer when the model is cold) — their curl
-        // calls get a much longer --max-time so the chain doesn't abandon them.
-        // Cloud maxTime comes from the caller (primary vs fallback budget).
-        let effectiveMaxTime = isLocalProvider(providerId) ? 300 : maxTime
+        // Local runtimes prefill large prompts on the local machine (a real
+        // Claude Code system prompt is 80-100k tokens at ~400-500 tok/s =
+        // 3-4+ minutes) — their curl calls get a much longer --max-time so
+        // the chain doesn't abandon them. Cloud maxTime comes from the caller
+        // (primary vs fallback budget).
+        let effectiveMaxTime = isLocalProvider(providerId) ? 720 : maxTime
 
         switch providerId {
         case "direct":
-            return try await routeToAnthropicDirect(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl)
+            return try await routeToAnthropicDirect(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, clientHeaders: clientHeaders)
         case "openrouter":
             return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: true, maxTime: effectiveMaxTime)
         case "opencode-zen", "opencode-go", "openai":
@@ -604,7 +610,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func routeToAnthropicDirect(request: MessagesRequest, model: String, apiKey: String, baseUrl: String) async throws -> ProviderResponse {
+    private func routeToAnthropicDirect(request: MessagesRequest, model: String, apiKey: String, baseUrl: String, clientHeaders: [String: String] = [:]) async throws -> ProviderResponse {
         guard !apiKey.isEmpty else { return errorResponse(statusCode: 401, type: "authentication_error", message: "ANTHROPIC_API_KEY not configured") }
         // The direct Anthropic path forwards the body untouched, so reasoning is
         // preserved natively and the per-provider reasoning policy does not apply
@@ -626,12 +632,24 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         let effectiveMaxTime = 60
 
         let body = (try? JSONSerialization.data(withJSONObject: bodyDict)) ?? Data()
-        let headers: [String: String] = [
+        var headers: [String: String] = [
             "Content-Type": "application/json",
             "x-api-key": apiKey,
             "anthropic-version": "2023-06-01",
             "Host": host
         ]
+        // Forward anthropic-beta VERBATIM to Anthropic-family upstreams —
+        // Claude Code's beta features depend on the header, and Anthropic's
+        // own gateway guidance forbids allowlisting values. Foreign (OpenAI-
+        // compatible) upstreams never see it; it is stripped at that boundary.
+        if let beta = clientHeaders["anthropic-beta"], !beta.isEmpty {
+            headers["anthropic-beta"] = beta
+        }
+        // Forward a client-supplied anthropic-version when present (still
+        // defaulting to the canonical 2023-06-01).
+        if let version = clientHeaders["anthropic-version"], !version.isEmpty {
+            headers["anthropic-version"] = version
+        }
         
         if request.stream {
             let (response, stream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: body, resolveIP: ip, maxTime: effectiveMaxTime)
@@ -710,7 +728,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             }
 
             let statusCode = response.statusCode
-            guard statusCode == 200 else { return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: data) }
+            guard statusCode == 200 else {
+                let converted = MessageTranslator.convertOpenAIErrorToAnthropic(data: data, statusCode: statusCode)
+                return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: converted)
+            }
             return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: request.model, enableThinking: reasoningEnabled))
         }
     }
@@ -743,12 +764,28 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             for await chunk in inputStream {
                 fullData.append(chunk)
             }
-            return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: fullData)
+            let converted = MessageTranslator.convertOpenAIErrorToAnthropic(data: fullData, statusCode: statusCode)
+            return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: converted)
         }
 
         var hasStarted = false
         var hasFinished = false
         let (stream, continuation) = AsyncStream.makeStream(of: Data.self)
+
+        // SSE keep-alive: Claude Code aborts any stream silent for 300s and
+        // counts every relayed byte (pings included). Local prefills of 60k+
+        // token prompts take minutes before the first token — without pings
+        // every large local request dies as a timeout. 15s interval per the
+        // gateway-protocol guidance (10–15s).
+        let pingFlag = StreamCompletionFlag()
+        let pingTask = Task {
+            while !pingFlag.isSet {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard !pingFlag.isSet else { break }
+                let ping = SSEFormatter.format(event: "ping", data: "{\"type\":\"ping\"}")
+                continuation.yield(Data(ping.utf8))
+            }
+        }
 
         Task {
             // No throwing call exists in this body (AsyncStream<Data> iteration
@@ -760,6 +797,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             var streamState = MessageTranslator.OpenAIStreamState()
             // FIX #3: Label the outer for-await loop so we can break out of it on [DONE].
             streamLoop: for await chunk in inputStream {
+                pingFlag.noteActivity()
                 buffer.append(chunk)
 
                 while let newlineRange = buffer.range(of: Data("\n".utf8)) {
@@ -788,7 +826,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
                     let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, state: &streamState, enableThinking: reasoningEnabled)
                     for event in events {
-                        if event.contains("content_block_start") { hasStarted = true }
+                        // message_start counts as "started" too: a truncated
+                        // stream that only ever sent message_start must not get
+                        // a SECOND message_start from the defensive tail below.
+                        if event.contains("message_start")
+                            || event.contains("content_block_start") { hasStarted = true }
                         if event.contains("message_delta") {
                             continuation.yield(Data(event.utf8))
                             if !hasFinished {
@@ -826,7 +868,10 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     let inputTokens = (streamState.usage?["prompt_tokens"] as? Int) ?? 0
                     let startPayload = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_\(UUID().uuidString.prefix(12))\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"\(request.model)\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":\(inputTokens),\"output_tokens\":0}}}"
                     continuation.yield(Data(SSEFormatter.format(event: "message_start", data: startPayload).utf8))
-                    let blockStart = SSEFormatter.format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
+                    // Non-empty text block: empty text blocks poison Claude Code
+                    // transcripts on replay ("text content blocks must be
+                    // non-empty") — use a single space instead.
+                    let blockStart = SSEFormatter.format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" \"}}")
                     continuation.yield(Data(blockStart.utf8))
                     continuation.yield(Data(SSEFormatter.blockStop(index: 0).utf8))
                     let msgDelta = SSEFormatter.format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}")
@@ -836,6 +881,8 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 continuation.yield(Data(stopEvent.utf8))
                 hasFinished = true
             }
+            pingFlag.set()
+            pingTask.cancel()
             continuation.finish()
         }
 
@@ -984,7 +1031,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func handleTokenCount(body: Data) -> ProviderResponse {
+    private func handleTokenCount(body: Data) async -> ProviderResponse {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Invalid JSON")
         }
@@ -997,18 +1044,81 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 }
             }
         }
+        // Honest counting first: when a local llama-server runtime is live, use
+        // its REAL tokenizer (/tokenize) instead of the chars/4 heuristic —
+        // fabricated counts trigger Claude Code auto-compact storms and context
+        // overflow (ccr#1252). The heuristic remains only as a marked fallback.
+        if let system = json["system"] as? String { totalChars += system.count }
+        if let count = await Self.localTokenCount(json: json) {
+            return ProviderResponse(
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"],
+                body: (try? JSONSerialization.data(withJSONObject: ["input_tokens": count])) ?? Data()
+            )
+        }
         let result: [String: Any] = ["input_tokens": Int(ceil(Double(totalChars) / 4.0)), "estimated": true]
         return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: result)) ?? Data())
     }
+
+    /// Count tokens with the REAL tokenizer of a live local llama-server
+    /// (/tokenize endpoint). Returns nil when no local runtime is reachable.
+    private static func localTokenCount(json: [String: Any]) async -> Int? {
+        // Assemble the full text payload exactly like a prompt would be.
+        var parts: [String] = []
+        if let system = json["system"] as? String, !system.isEmpty {
+            parts.append(system)
+        } else if let systemBlocks = json["system"] as? [[String: Any]] {
+            for block in systemBlocks {
+                if let t = block["text"] as? String { parts.append(t) }
+            }
+        }
+        if let messages = json["messages"] as? [[String: Any]] {
+            for msg in messages {
+                if let content = msg["content"] as? String {
+                    parts.append(content)
+                } else if let blocks = msg["content"] as? [[String: Any]] {
+                    for block in blocks {
+                        if let t = block["text"] as? String { parts.append(t) }
+                        if let think = block["thinking"] as? String { parts.append(think) }
+                    }
+                }
+            }
+        }
+        guard !parts.isEmpty else { return nil }
+        let text = parts.joined(separator: "\n")
+
+        // Try the live llama-server (built-in GGUF loader first, then llama.app).
+        let ports: [Int] = [Int(ConfigManager.shared.ggufPort), LocalServerDiscovery.liveLlamaPort()]
+        for port in ports where port > 0 {
+            guard let url = URL(string: "http://127.0.0.1:\(port)/tokenize") else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 5
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["content": text])
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let out = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tokens = out["tokens"] as? [Int] else { continue }
+            return tokens.count
+        }
+        return nil
+    }
     
     private func handleModelList() -> ProviderResponse {
-        let now = Int(Date().timeIntervalSince1970)
-        // Only models the user can actually reach — see ConfigManager.accessibleModels().
+        // Anthropic /v1/models shape — clients reaching the router through the
+        // MITM/DirectTLS path are Anthropic SDK consumers (Claude Code's
+        // gateway model discovery parses {type:"list", data:[{type:"model",
+        // id, display_name, created_at}], has_more}). The old OpenAI shape
+        // (object/owned_by/created ints) broke Claude Code's model picker.
         let accessible = config.accessibleModels()
+        let now = ISO8601DateFormatter().string(from: Date())
         let models: [[String: Any]] = accessible.map { entry in
-            ["id": entry.id, "object": "model", "created": now, "owned_by": entry.ownedBy]
+            ["type": "model", "id": entry.id, "display_name": entry.id, "created_at": now]
         }
-        let result: [String: Any] = ["data": models]
+        var result: [String: Any] = ["type": "list", "data": models, "has_more": false]
+        if let firstId = accessible.first?.id { result["first_id"] = firstId }
+        if let lastId = accessible.last?.id { result["last_id"] = lastId }
         return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: result)) ?? Data())
     }
     
@@ -1022,4 +1132,28 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: (try? JSONSerialization.data(withJSONObject: body)) ?? Data())
     }
 
+}
+
+/// Thread-safe completion flag shared between the SSE translation pump and the
+/// keep-alive ping task (the pump runs on a detached Task, the ping on another —
+/// both need to observe/set completion without a data race).
+final class StreamCompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isSet = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isSet
+    }
+
+    func set() {
+        lock.lock()
+        defer { lock.unlock() }
+        _isSet = true
+    }
+
+    /// Upstream activity observed — pings continue on the regular interval;
+    /// kept as an explicit hook for adaptive intervals if ever needed.
+    func noteActivity() {}
 }

@@ -30,8 +30,8 @@ struct PEMIdentityLoader {
         guard let privKey = SecKeyCreateWithData(derData as CFData, attributes as CFDictionary, nil) else { return nil }
 
         // Store cert + key in keychain, then query for the identity
-        let certTag = "com.jxproxy.cert-\(UUID().uuidString)"
-        let keyTag = "com.jxproxy.key-\(UUID().uuidString)"
+        let certTag = "com.marshaljlee.jxrouter.cert-\(UUID().uuidString)"
+        let keyTag = "com.marshaljlee.jxrouter.key-\(UUID().uuidString)"
 
         let certQuery: [String: Any] = [
             kSecClass as String: kSecClassCertificate,

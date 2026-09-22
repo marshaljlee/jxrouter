@@ -5,6 +5,19 @@ struct AppIdentifier {
     struct AppInfo {
         let name: String
         let bundleIdentifier: String?
+        /// Owning process, when lsof could attribute the connection to one.
+        let pid: Int32?
+
+        /// Declared explicitly rather than relying on the synthesized memberwise
+        /// initializer: a property with a default value (`= nil`) is *omitted*
+        /// from the memberwise init, so `AppInfo(name:bundleIdentifier:pid:)`
+        /// would not exist. `pid` defaults to nil so existing call sites are
+        /// unaffected.
+        init(name: String, bundleIdentifier: String?, pid: Int32? = nil) {
+            self.name = name
+            self.bundleIdentifier = bundleIdentifier
+            self.pid = pid
+        }
     }
 
     static func identifyApp(sourcePort: UInt16) -> AppInfo? {
@@ -28,10 +41,13 @@ struct AppIdentifier {
 
             // Find the app by PID
             let apps = NSWorkspace.shared.runningApplications
+            let pidValue = Int32(pid)
             if let app = apps.first(where: { String($0.processIdentifier) == pid }) {
-                return AppInfo(name: app.localizedName ?? app.bundleIdentifier ?? "Unknown", bundleIdentifier: app.bundleIdentifier)
+                return AppInfo(name: app.localizedName ?? app.bundleIdentifier ?? "Unknown",
+                               bundleIdentifier: app.bundleIdentifier,
+                               pid: pidValue)
             }
-            return AppInfo(name: pid, bundleIdentifier: nil)
+            return AppInfo(name: pid, bundleIdentifier: nil, pid: pidValue)
         } catch {
             return nil
         }

@@ -63,6 +63,15 @@ final class ClaudeSettingsWriter {
         env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:\(proxyPort)"
         env["ANTHROPIC_API_KEY"] = authToken
         env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+        // Claude Code's own API client timeout. Local GGUF prefill of a real
+        // Claude Code system prompt (80-120k tokens at ~300-450 tok/s) needs
+        // 4-7 minutes of NO streamed bytes before the first token. Claude
+        // Code's default ~60s request timeout aborted every one of those
+        // requests mid-prefill (server logs: 13 identical attempts, each
+        // cancelled at ~316s) — the model actually finished prefilling and
+        // generated the answer, but the client was already gone. 30 minutes
+        // covers a cold 262k prefill plus generation with headroom.
+        env["API_TIMEOUT_MS"] = "1800000"
         // Neutralise hardcoded shell overrides — empty string is falsy, so
         // Claude Code falls back to native tier names which JXProxy routes.
         env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = ""
@@ -131,6 +140,10 @@ final class ClaudeSettingsWriter {
     }
 
     private func writeSettings(_ json: [String: Any]) -> Bool {
+        // Capture the pristine file before the first byte changes, so a
+        // SIGINT/SIGTERM mid-write can be reverted by the rollback sentinel.
+        try? ConfigRollbackLedger.shared.guardFile(settingsURL.path)
+
         let dir = settingsURL.deletingLastPathComponent()
         if !fileManager.fileExists(atPath: dir.path) {
             try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 
 /// Standalone test suite for MessageTranslator validating tool calling, multimodal
 /// images, sequential SSE block lifecycle, and reasoning parameter handling.
@@ -598,5 +599,16 @@ struct TestRunner {
     static func main() {
         let ok = MessageTranslatorTests.runAll()
         exit(ok ? 0 : 1)
+    }
+}
+
+/// Bridges the standalone harness above into XCTest so it runs with the rest
+/// of the suite instead of only when invoked by hand.
+final class MessageTranslatorRunnerTests: XCTestCase {
+    func testStandaloneHarness() {
+        XCTAssertTrue(
+            MessageTranslatorTests.runAll(),
+            "MessageTranslator standalone suite reported failures"
+        )
     }
 }

@@ -17,7 +17,7 @@ import Network
 /// PEM files directly, avoiding the keychain import prompt entirely.
 final class DirectTLSHandler: @unchecked Sendable {
     private var tlsListener: NWListener?
-    private let queue = DispatchQueue(label: "com.jxproxy.directtls", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.directtls", qos: .userInitiated)
     private weak var providerRouter: ProviderRouter?
 
     /// F3: per-connection idle timers (dispatch sources) keyed by connection.

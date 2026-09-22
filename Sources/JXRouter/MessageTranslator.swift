@@ -141,6 +141,22 @@ enum MessageTranslator {
         return toolChoice
     }
 
+    /// Text of the most recent user turn, for content-based routing decisions
+    /// (STE100 path selection). Returns "" when the last turn is multimodal-only
+    /// or there is no user turn at all.
+    private static func lastUserText(_ request: MessagesRequest) -> String {
+        for msg in request.messages.reversed() {
+            guard let role = msg["role"] as? String, role == "user" else { continue }
+            if let text = msg["content"] as? String, !text.isEmpty { return text }
+            if let blocks = msg["content"] as? [[String: Any]] {
+                let text = blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                if !text.isEmpty { return text }
+            }
+            return ""
+        }
+        return ""
+    }
+
     // MARK: - Anthropic → OpenAI Translation
 
     /// Convert an Anthropic Messages request to an OpenAI Chat Completions body.
@@ -167,11 +183,34 @@ enum MessageTranslator {
             }
         }
 
+        // Source-of-truth gateway: prepend the watched project tree so the
+        // model answers from real file contents instead of guessing. No-op
+        // when the gateway is off or has not scanned yet.
+        var effectiveSystem = baseSystem
+        if let gatewayBlock = SourceOfTruthGateway.shared.contextBlock() {
+            effectiveSystem = (effectiveSystem.map { $0 + "\n\n" + gatewayBlock }) ?? gatewayBlock
+        }
+
+        // ASD-STE100 output rules, opt-in. Routed by path rather than applied
+        // blindly: a turn carrying a tool schema, or whose last user message is
+        // machine-readable (patch, diff, JSON, fenced code), passes through
+        // untouched so normalization can never corrupt a payload.
+        if ConfigManager.shared.ste100Enforce {
+            let steConfig = STE100.Config.default
+            let stePath = STE100.path(toolsPresent: !rawTools.isEmpty,
+                                      messageText: lastUserText(request),
+                                      exemptToolsAndCode: steConfig.exemptToolsAndCode)
+            let steDirective = STE100.systemDirective(for: stePath, config: steConfig)
+            if !steDirective.isEmpty {
+                effectiveSystem = (effectiveSystem.map { $0 + "\n\n" + steDirective }) ?? steDirective
+            }
+        }
+
         if shouldInjectTools {
-            let injectedSystem = LocalChatTemplateEngine.injectToolsIntoSystemPrompt(system: baseSystem, tools: rawTools)
+            let injectedSystem = LocalChatTemplateEngine.injectToolsIntoSystemPrompt(system: effectiveSystem, tools: rawTools)
             messages.append(["role": "system", "content": injectedSystem])
-        } else if let baseSystem = baseSystem {
-            messages.append(["role": "system", "content": baseSystem])
+        } else if let effectiveSystem = effectiveSystem {
+            messages.append(["role": "system", "content": effectiveSystem])
         }
 
         // Process messages preserving tool_use, tool_result, and multimodal images
@@ -192,6 +231,7 @@ enum MessageTranslator {
             var imageParts: [[String: Any]] = []
             var toolUseBlocks: [[String: Any]] = []
             var toolResultBlocks: [[String: Any]] = []
+            var thinkingParts: [String] = []
 
             for block in blocks {
                 let blockType = block["type"] as? String ?? ""
@@ -216,7 +256,17 @@ enum MessageTranslator {
                         ])
                     }
                 case "thinking":
-                    // Exclude internal thinking blocks from forwarded user/assistant text
+                    // Preserve thinking blocks on ingress: replay them to
+                    // reasoning-capable upstreams via `reasoning_content` so
+                    // multi-turn thinking context survives the OpenAI hop
+                    // (Anthropic's replay contract requires thinking history).
+                    // Non-reasoning upstreams simply ignore the field.
+                    if let text = block["thinking"] as? String, !text.isEmpty {
+                        thinkingParts.append(text)
+                    }
+                case "redacted_thinking":
+                    // Opaque encrypted payload — cannot be re-serialized into
+                    // the OpenAI dialect; drop it (logged class of loss).
                     break
                 default:
                     if let text = block["text"] as? String, !text.isEmpty {
@@ -231,10 +281,24 @@ enum MessageTranslator {
                 if !textContent.isEmpty {
                     assistantMsg["content"] = textContent
                 }
+                // Replay prior thinking as reasoning_content so reasoning-capable
+                // upstreams (DeepSeek R1, Qwen3-thinking, …) keep the reasoning
+                // chain instead of restarting cold every turn. Gated on the
+                // provider's reasoning capability: strict upstreams reject
+                // unknown message fields, so a reasoning-disabled provider must
+                // never see it (dropped-and-logged class of loss).
+                if !thinkingParts.isEmpty && enableThinking {
+                    assistantMsg["reasoning_content"] = thinkingParts.joined(separator: "\n")
+                }
                 if !toolUseBlocks.isEmpty {
                     var toolCalls: [[String: Any]] = []
                     for tu in toolUseBlocks {
-                        let id = tu["id"] as? String ?? "call_\(UUID().uuidString.prefix(8))"
+                        // Round-trip ids verbatim: Claude Code replays tool_use
+                        // ids in tool_result blocks; a fresh UUID here breaks
+                        // id pairing on strict upstreams. Synthesize ONLY when
+                        // the block arrived without an id.
+                        let id = tu["id"] as? String
+                            ?? "call_\(UUID().uuidString.prefix(8))"
                         let name = tu["name"] as? String ?? "unknown"
                         let inputObj = tu["input"] ?? [:]
                         let inputData = (try? JSONSerialization.data(withJSONObject: inputObj))
@@ -255,19 +319,10 @@ enum MessageTranslator {
                 }
                 messages.append(assistantMsg)
             } else {
-                // User role: add user message followed by discrete role: "tool" messages
-                if !imageParts.isEmpty {
-                    var userParts: [[String: Any]] = []
-                    if !textParts.isEmpty {
-                        userParts.append(["type": "text", "text": textParts.joined(separator: "\n")])
-                    }
-                    userParts.append(contentsOf: imageParts)
-                    messages.append(["role": "user", "content": userParts])
-                } else if !textParts.isEmpty || toolResultBlocks.isEmpty {
-                    messages.append(["role": "user", "content": textParts.joined(separator: "\n")])
-                }
-
-                // Map Anthropic tool_result blocks to OpenAI role: "tool" messages
+                // User role: OpenAI requires every `role:"tool"` message to
+                // IMMEDIATELY follow the assistant tool_calls message — no user
+                // text may sit between them. Emit tool results first, then the
+                // user text as its own message.
                 for tr in toolResultBlocks {
                     let toolUseId = tr["tool_use_id"] as? String ?? "unknown"
                     var resultContent = ""
@@ -283,11 +338,25 @@ enum MessageTranslator {
                               let str = String(data: trData, encoding: .utf8) {
                         resultContent = str
                     }
+                    if tr["is_error"] as? Bool == true, !resultContent.hasPrefix("ERROR") {
+                        resultContent = "ERROR: " + resultContent
+                    }
                     messages.append([
                         "role": "tool",
                         "tool_call_id": toolUseId,
                         "content": resultContent
                     ])
+                }
+
+                if !imageParts.isEmpty {
+                    var userParts: [[String: Any]] = []
+                    if !textParts.isEmpty {
+                        userParts.append(["type": "text", "text": textParts.joined(separator: "\n")])
+                    }
+                    userParts.append(contentsOf: imageParts)
+                    messages.append(["role": "user", "content": userParts])
+                } else if !textParts.isEmpty || toolResultBlocks.isEmpty {
+                    messages.append(["role": "user", "content": textParts.joined(separator: "\n")])
                 }
             }
         }
@@ -296,6 +365,10 @@ enum MessageTranslator {
             "model": model,
             "messages": messages,
         ]
+
+        if request.stream {
+            result["stream"] = true
+        }
 
         // Map and sanitize tool definitions (unless injected into system prompt)
         if !shouldInjectTools {
@@ -312,13 +385,23 @@ enum MessageTranslator {
 
         let isReasoning = isReasoningModel(model: model)
 
-        // Tokens limit mapping
+        // Tokens limit mapping: reasoning models (o-series, R1, reasoner)
+        // reject `max_tokens` — send `max_completion_tokens` for all of them.
         if let maxTokens = request.maxTokens {
-            if isReasoning && model.contains("o1") {
+            if isReasoning {
                 result["max_completion_tokens"] = maxTokens
             } else {
                 result["max_tokens"] = maxTokens
             }
+        }
+
+        // stop_sequences → stop (OpenAI caps `stop` at 4 entries; truncate+log).
+        if let stopSeqs = request.json["stop_sequences"] as? [String], !stopSeqs.isEmpty {
+            let clamped = Array(stopSeqs.prefix(4))
+            if clamped.count < stopSeqs.count {
+                print("[MessageTranslator] Clamped stop_sequences \(stopSeqs.count) → 4 for OpenAI upstream")
+            }
+            result["stop"] = clamped
         }
 
         // Temperature: OpenAI reasoning models forbid temperature (returns HTTP 400)
@@ -327,10 +410,8 @@ enum MessageTranslator {
         }
 
         if request.stream {
-            result["stream"] = true
-        }
-
-        if enableThinking {
+            // Always request usage in the final chunk — Claude Code's context
+            // math reads it. Providers that ignore stream_options just omit it.
             result["stream_options"] = ["include_usage": true]
         }
 
@@ -338,6 +419,41 @@ enum MessageTranslator {
     }
 
     // MARK: - OpenAI → Anthropic Response Translation
+
+    /// Convert an OpenAI error response (or generic HTTP failure) to Anthropic error format
+    /// so Claude Code and Anthropic SDK clients parse the failure cleanly.
+    static func convertOpenAIErrorToAnthropic(data: Data, statusCode: Int) -> Data {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            // Already in Anthropic error format?
+            if json["type"] as? String == "error" && json["error"] is [String: Any] {
+                return data
+            }
+            // OpenAI error format: {"error": {"message": "...", "type": "...", "code": ...}}
+            if let errObj = json["error"] as? [String: Any] {
+                let msg = (errObj["message"] as? String) ?? "Upstream error (HTTP \(statusCode))"
+                let errType = (errObj["type"] as? String) ?? (statusCode == 400 ? "invalid_request_error" : "api_error")
+                let anthropic: [String: Any] = [
+                    "type": "error",
+                    "error": [
+                        "type": errType,
+                        "message": msg
+                    ]
+                ]
+                if let converted = try? JSONSerialization.data(withJSONObject: anthropic) {
+                    return converted
+                }
+            }
+        }
+        let rawStr = String(data: data, encoding: .utf8) ?? "HTTP \(statusCode) error"
+        let fallback: [String: Any] = [
+            "type": "error",
+            "error": [
+                "type": statusCode == 400 ? "invalid_request_error" : "api_error",
+                "message": rawStr
+            ]
+        ]
+        return (try? JSONSerialization.data(withJSONObject: fallback)) ?? data
+    }
 
     /// Convert an OpenAI Chat Completions JSON response to Anthropic Messages format.
     static func convertOpenAIResponseToAnthropic(data: Data, model: String, enableThinking: Bool) -> Data {
@@ -357,7 +473,23 @@ enum MessageTranslator {
             }
 
             // Text block and structured or extracted tool calls
-            let rawText = (message["content"] as? String) ?? ""
+            var rawText = (message["content"] as? String) ?? ""
+
+            // Handle inline <think> tags in non-streaming text
+            if rawText.contains("<think>") {
+                let thinkRegex = try? NSRegularExpression(pattern: #"<think>\s*([\s\S]*?)\s*</think>"#, options: [])
+                if let match = thinkRegex?.firstMatch(in: rawText, options: [], range: NSRange(location: 0, length: rawText.utf16.count)),
+                   let thinkRange = Range(match.range(at: 1), in: rawText),
+                   let fullRange = Range(match.range(at: 0), in: rawText) {
+                    let inlineThink = String(rawText[thinkRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if enableThinking && !inlineThink.isEmpty && !content.contains(where: { $0["type"] as? String == "thinking" }) {
+                        content.insert(["type": "thinking", "thinking": inlineThink], at: 0)
+                    }
+                    rawText.removeSubrange(fullRange)
+                    rawText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+
             var structuredToolCalls = message["tool_calls"] as? [[String: Any]] ?? []
 
             if structuredToolCalls.isEmpty && !rawText.isEmpty {
@@ -398,10 +530,13 @@ enum MessageTranslator {
             }
 
             if content.isEmpty {
-                content.append(["type": "text", "text": ""])
+                // Anthropic rejects empty text blocks on replay ("text content
+                // blocks must be non-empty") — a single space keeps the block
+                // valid without polluting the transcript.
+                content.append(["type": "text", "text": " "])
             }
         } else {
-            content.append(["type": "text", "text": ""])
+            content.append(["type": "text", "text": " "])
         }
 
         let stopReason: String
@@ -413,12 +548,16 @@ enum MessageTranslator {
             case "tool_calls": stopReason = "tool_use"
             case "stop": stopReason = "end_turn"
             case "length": stopReason = "max_tokens"
+            case "content_filter": stopReason = "refusal"
             default: stopReason = "end_turn"
             }
         } else {
             stopReason = "end_turn"
         }
 
+        // Usage MUST be reshaped to Anthropic semantics — Claude Code's context
+        // math reads input_tokens/output_tokens; raw prompt_tokens keys make
+        // every token estimate silently wrong.
         let result: [String: Any] = [
             "id": id,
             "type": "message",
@@ -426,9 +565,30 @@ enum MessageTranslator {
             "content": content,
             "model": model,
             "stop_reason": stopReason,
-            "usage": json["usage"] ?? ["input_tokens": 0, "output_tokens": 0],
+            "usage": Self.anthropicUsage(fromOpenAI: json["usage"]),
         ]
         return (try? JSONSerialization.data(withJSONObject: result)) ?? data
+    }
+
+    /// Map an OpenAI usage object (prompt_tokens/completion_tokens/…) into the
+    /// Anthropic usage shape (input_tokens/output_tokens/cache fields).
+    static func anthropicUsage(fromOpenAI raw: Any?) -> [String: Any] {
+        guard let usage = raw as? [String: Any] else {
+            return ["input_tokens": 0, "output_tokens": 0]
+        }
+        var mapped: [String: Any] = [
+            "input_tokens": (usage["prompt_tokens"] as? Int) ?? 0,
+            "output_tokens": (usage["completion_tokens"] as? Int) ?? 0,
+        ]
+        if let details = usage["prompt_tokens_details"] as? [String: Any],
+           let cached = details["cached_tokens"] as? Int, cached > 0 {
+            mapped["cache_read_input_tokens"] = cached
+        }
+        if let details = usage["completion_tokens_details"] as? [String: Any],
+           let reasoning = details["reasoning_tokens"] as? Int, reasoning > 0 {
+            mapped["output_tokens_details"] = ["thinking_tokens": reasoning]
+        }
+        return mapped
     }
 
     // MARK: - OpenAI SSE → Anthropic SSE Translation
@@ -452,6 +612,15 @@ enum MessageTranslator {
         var insideInlineThink: Bool = false
         var insideInlineToolCall: Bool = false
         var toolCallBuffer: String = ""
+        /// Trailing partial opening-marker bytes held back from text emission.
+        /// Opening tags split across delta chunks (one token per chunk) would
+        /// otherwise leak as visible text; this buffer holds the partial
+        /// prefix and prepends it to the next chunk.
+        var pendingMarkerSuffix: String = ""
+        /// Total characters streamed as visible text/thinking/tool-arg deltas —
+        /// the floor estimate for output_tokens when the upstream never sends
+        /// a usage chunk (llama-server stream builds omit it).
+        var streamedCharCount: Int = 0
 
         /// Preserves backward compatibility for unclosed block inspections.
         var openedBlocks: [Int] {
@@ -494,6 +663,7 @@ enum MessageTranslator {
 
         // 1. Explicit Reasoning Content (reasoning_content field)
         if enableThinking, let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
+            state.streamedCharCount += reasoning.count
             if state.activeBlockType != "thinking" {
                 // If another block was open, close it first
                 if let active = state.activeBlockIndex {
@@ -511,9 +681,16 @@ enum MessageTranslator {
             events.append(thinkDelta)
         }
 
-        // 2. Text Content & Inline <think> Tag Extraction
+        // 2. Text Content & Inline Think Tag Extraction
         if let rawContent = delta["content"] as? String, !rawContent.isEmpty {
+            state.streamedCharCount += rawContent.count
+            // Prepend any partial opening-marker bytes held back from the
+            // previous chunk so tags split across chunks still assemble.
             var contentToProcess = rawContent
+            if !state.pendingMarkerSuffix.isEmpty {
+                contentToProcess = state.pendingMarkerSuffix + contentToProcess
+                state.pendingMarkerSuffix = ""
+            }
 
             if enableThinking {
                 // Check if we are inside or encountering <think> tags from local models
@@ -563,6 +740,29 @@ enum MessageTranslator {
                         contentToProcess = ""
                     }
                 }
+            } else {
+                // When thinking is disabled, strip <think>...</think> blocks from output (jxrouter reference parity)
+                if !state.insideInlineThink && contentToProcess.contains("<think>") {
+                    let parts = contentToProcess.components(separatedBy: "<think>")
+                    let prefixText = parts[0]
+                    state.insideInlineThink = true
+                    let remainder = parts.dropFirst().joined(separator: "<think>")
+                    if remainder.contains("</think>") {
+                        let subParts = remainder.components(separatedBy: "</think>")
+                        state.insideInlineThink = false
+                        contentToProcess = prefixText + subParts.dropFirst().joined(separator: "</think>")
+                    } else {
+                        contentToProcess = prefixText
+                    }
+                } else if state.insideInlineThink {
+                    if contentToProcess.contains("</think>") {
+                        let parts = contentToProcess.components(separatedBy: "</think>")
+                        state.insideInlineThink = false
+                        contentToProcess = parts.dropFirst().joined(separator: "</think>")
+                    } else {
+                        contentToProcess = ""
+                    }
+                }
             }
 
             // Check for inline <tool_call> tags emitted by local models
@@ -583,9 +783,14 @@ enum MessageTranslator {
             }
 
             if state.insideInlineToolCall {
-                if contentToProcess.contains("</tool_call>") {
-                    let parts = contentToProcess.components(separatedBy: "</tool_call>")
-                    state.toolCallBuffer += parts[0]
+                // The closing tag may be SPLIT across chunks, with its opening
+                // fragment already swallowed into toolCallBuffer — testing
+                // contentToProcess alone misses it and the tag bytes end up
+                // embedded in the args. Test the COMBINED buffer+chunk.
+                let combinedToolBuffer = state.toolCallBuffer + contentToProcess
+                if combinedToolBuffer.contains("</tool_call>") {
+                    let parts = combinedToolBuffer.components(separatedBy: "</tool_call>")
+                    state.toolCallBuffer = parts[0]
                     contentToProcess = parts.dropFirst().joined(separator: "</tool_call>")
                     state.insideInlineToolCall = false
 
@@ -618,7 +823,39 @@ enum MessageTranslator {
             }
 
             if !contentToProcess.isEmpty {
-                events.append(contentsOf: emitTextChunk(contentToProcess, state: &state))
+                // Split-marker guard: if this chunk ENDS with a partial prefix
+                // of an opening marker (e.g. "<tool_ca"), hold those bytes back
+                // instead of emitting them as visible text — the rest of the
+                // tag arrives in the next chunk(s) and the prepend above
+                // reassembles it. Without this, per-token streaming leaks tag
+                // fragments into the transcript.
+                var holdLength = 0
+                let openMarkers = ["<tool_call>", "<think>"]
+                if !state.insideInlineToolCall && !state.insideInlineThink {
+                    for marker in openMarkers {
+                        let maxOverlap = min(marker.count - 1, contentToProcess.count)
+                        if maxOverlap > 0 {
+                            let tail = String(contentToProcess.suffix(maxOverlap))
+                            // Longest suffix of content that is a prefix of marker
+                            for len in stride(from: maxOverlap, through: 1, by: -1) {
+                                let tailPiece = String(contentToProcess.suffix(len))
+                                if marker.hasPrefix(tailPiece) {
+                                    holdLength = max(holdLength, len)
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+                if holdLength > 0 {
+                    let emitPart = String(contentToProcess.dropLast(holdLength))
+                    state.pendingMarkerSuffix = String(contentToProcess.suffix(holdLength))
+                    if !emitPart.isEmpty {
+                        events.append(contentsOf: emitTextChunk(emitPart, state: &state))
+                    }
+                } else {
+                    events.append(contentsOf: emitTextChunk(contentToProcess, state: &state))
+                }
             }
         }
 
@@ -645,6 +882,7 @@ enum MessageTranslator {
                     state.nextBlockIndex += 1
                     let id = tc["id"] as? String ?? "call_\(UUID().uuidString.prefix(8))"
                     let name = fn?["name"] as? String ?? "unknown"
+                    state.streamedCharCount += argChunk.count
 
                     state.toolCallsByIndex[callIdx] = ToolCallProgress(
                         id: id,
@@ -669,6 +907,7 @@ enum MessageTranslator {
                 } else {
                     let current = state.toolCallsByIndex[callIdx]!
                     if !argChunk.isEmpty {
+                        state.streamedCharCount += argChunk.count
                         let argDelta = SSEFormatter.format(
                             event: "content_block_delta",
                             data: "{\"type\":\"content_block_delta\",\"index\":\(current.blockIndex),\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\(jsonEscape(argChunk))}}"
@@ -682,6 +921,14 @@ enum MessageTranslator {
 
         // 4. Stream Finish / Completion
         if let finishReason {
+            // Flush any held-back partial opening marker at end-of-stream —
+            // it never completed into a real tag, so it is ordinary text and
+            // must not be silently dropped.
+            if !state.pendingMarkerSuffix.isEmpty, !state.insideInlineToolCall {
+                events.append(contentsOf: emitTextChunk(state.pendingMarkerSuffix, state: &state))
+                state.pendingMarkerSuffix = ""
+            }
+
             // Close active text or thinking block
             if let active = state.activeBlockIndex {
                 events.append(SSEFormatter.blockStop(index: active))
@@ -695,9 +942,11 @@ enum MessageTranslator {
             }
             state.toolCallsByIndex.removeAll()
 
-            // If nothing was emitted at all, emit empty text block
+            // If nothing was emitted at all, emit a non-empty text block — an
+            // EMPTY text block poisons Claude Code transcripts on replay
+            // ("text content blocks must be non-empty", claude-code#88536).
             if state.nextBlockIndex == 0 {
-                let emptyStart = SSEFormatter.format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
+                let emptyStart = SSEFormatter.format(event: "content_block_start", data: "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\" \"}}")
                 events.append(emptyStart)
                 events.append(SSEFormatter.blockStop(index: 0))
                 state.nextBlockIndex = 1
@@ -710,11 +959,22 @@ enum MessageTranslator {
                 switch finishReason {
                 case "stop": anthropicStop = "end_turn"
                 case "length": anthropicStop = "max_tokens"
+                case "content_filter": anthropicStop = "refusal"
                 default: anthropicStop = "end_turn"
                 }
             }
 
-            let usage = state.usage ?? ["prompt_tokens": 0, "completion_tokens": 0]
+            // message_delta usage is Anthropic-shaped and CUMULATIVE — Claude
+            // Code's context math reads output_tokens; the raw OpenAI dict
+            // (prompt_tokens/completion_tokens) broke every token estimate.
+            // When the upstream never sent a usage chunk (llama-server builds
+            // omit it even with include_usage), estimate output tokens from
+            // the streamed deltas (chars/4 floor) instead of reporting a
+            // dishonest zero.
+            var usage = Self.anthropicUsage(fromOpenAI: state.usage)
+            if (usage["output_tokens"] as? Int) == 0 {
+                usage["output_tokens"] = max(1, state.streamedCharCount / 4)
+            }
             let msgDelta = SSEFormatter.format(event: "message_delta", data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(anthropicStop)\",\"stop_sequence\":null},\"usage\":\(jsonDictString(usage))}")
             events.append(msgDelta)
         }

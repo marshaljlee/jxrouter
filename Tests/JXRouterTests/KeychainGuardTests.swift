@@ -1,5 +1,4 @@
 import XCTest
-@testable import JXRouter
 
 /// Tests for the KeychainManager guard that prevents key-clearing while the
 /// Keychain daemon is unresponsive (e.g. at login when the keychain prompt

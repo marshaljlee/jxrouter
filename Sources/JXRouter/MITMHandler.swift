@@ -141,5 +141,5 @@ final class MITMHandler: @unchecked Sendable {
         RequestClassifier(routeOpenAI: ConfigManager.shared.routeOpenAI).isKnownAiHost(host)
     }
 
-    private let queue = DispatchQueue(label: "com.jxproxy.mitm", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.mitm", qos: .userInitiated)
 }

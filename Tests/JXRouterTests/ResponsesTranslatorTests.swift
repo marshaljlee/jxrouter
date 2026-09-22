@@ -1,5 +1,4 @@
 import XCTest
-@testable import JXRouter
 
 /// Tests for the ResponsesTranslator that converts between OpenAI Responses
 /// API format and Chat Completions format.

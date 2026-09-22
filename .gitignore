@@ -52,9 +52,28 @@ repomix-output.xml
 .app-lifecycle/
 .context-bridge/
 .session-state/
-.jetro/
 .freebuff/
 .omo/
 settings.local*.json
 .claude/settings.local*.json
 handoff.md
+
+# Editor & Extension Auto-Injections
+.jetro/
+.cursor/
+.windsurfrules*
+.mcp.json
+.vscode/
+
+# iCloud CloudDocs sync conflict artifacts
+* 2.*
+* 2
+
+# Prebuilt in-process llama.cpp engine. Sources are committed; the ~7 MB
+# dylib is a build product — regenerate it with LlamaEngine/build.sh.
+LlamaEngine/*.dylib
+LlamaEngine/*.o
+
+# Agent session state (per-tool scratch, never app source)
+.workbuddy-ai/
+

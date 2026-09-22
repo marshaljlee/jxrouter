@@ -35,7 +35,19 @@ protocol KeychainBackend {
 }
 
 enum KeychainManager {
-    static let service = "com.jxproxy"
+    /// Keychain service this build reads and writes. Matches the bundle
+    /// identifier so secrets are unambiguously JXRouter's.
+    ///
+    /// Earlier builds used `com.jxproxy`. Renaming the service does not lose
+    /// those secrets: `ConfigManager.migrateLegacyKeychainServices()` copies
+    /// anything still stored under the old name into this one on first launch,
+    /// leaving the source items in place.
+    static let service = "com.marshaljlee.jxrouter"
+
+    /// The service name used before the bundle was re-established as
+    /// `com.marshaljlee.jxrouter`. Kept here (next to `service`) so the rename
+    /// and its migration can never drift apart.
+    static let legacyService = "com.jxproxy"
 
     /// Test seam — when non-nil, every operation routes to this backend
     /// instead of the real Keychain. Internal: never set by app code; the
@@ -60,6 +72,18 @@ enum KeychainManager {
     private nonisolated(unsafe) static var cache: [String: String]?
     private static let cacheLock = NSLock()
 
+    /// Per-key results used when the batched enumeration is unusable (see
+    /// `enumerationFailed`). Kept separate from `cache` because `cache` is
+    /// authoritative once loaded, while these are opportunistic per-item hits.
+    private nonisolated(unsafe) static var directCache: [String: String] = [:]
+
+    /// True when the batched `kSecMatchLimitAll` enumeration failed. On some
+    /// systems `SecItemCopyMatching` with `kSecMatchLimitAll` returns
+    /// errSecParam (-50) even for a well-formed query, while a single-item
+    /// query for the same item succeeds. Treating that failure as "no keys
+    /// stored" silently blanked every API key field.
+    private nonisolated(unsafe) static var enumerationFailed = false
+
     /// Serve `key` from the cache, batch-loading all items on first access.
     /// Once the cache is loaded it is AUTHORITATIVE: a nil result means "the
     /// key is absent" (e.g. just deleted) — NOT a miss — so it never triggers
@@ -68,14 +92,33 @@ enum KeychainManager {
         if testingBackend != nil { return nil } // tests bypass the cache
         cacheLock.lock()
         let loaded = cache
+        let fallback = directCache
         cacheLock.unlock()
-        if let loaded { return loaded[key] }
-        // First access this session: one batched read of every item.
+        if let loaded { return loaded[key] }   // batched read succeeded: authoritative
+        if let known = fallback[key] { return known }
+        // First access for this key: try one batched read of every item.
         let all = getAll(service: service, bypassCache: true)
         cacheLock.lock()
-        cache = all
+        let failed = enumerationFailed
+        if !failed && !all.isEmpty {
+            cache = all
+        }
         cacheLock.unlock()
-        return all[key]
+        if !failed {
+            if let hit = all[key] { return hit }
+            // Genuinely no items for this service — nothing more to try.
+            if !all.isEmpty { return nil }
+        }
+        // The batched enumeration failed (or returned nothing). NEVER fall back
+        // to "no key stored" — that is what made every API key field look empty
+        // even though the secrets were on disk. Read this one item directly.
+        let direct = copyMatchingSingle(key)
+        if let direct {
+            cacheLock.lock()
+            directCache[key] = direct
+            cacheLock.unlock()
+        }
+        return direct
     }
 
     private static func cacheUpdate(_ key: String, value: String?) {
@@ -84,6 +127,7 @@ enum KeychainManager {
         if cache != nil {
             if let value { cache?[key] = value } else { cache?.removeValue(forKey: key) }
         }
+        if let value { directCache[key] = value } else { directCache.removeValue(forKey: key) }
         cacheLock.unlock()
     }
 
@@ -93,6 +137,8 @@ enum KeychainManager {
         if testingBackend != nil { return }
         cacheLock.lock()
         cache = nil
+        directCache = [:]
+        enumerationFailed = false
         cacheLock.unlock()
     }
 
@@ -155,6 +201,32 @@ enum KeychainManager {
             return nil
         }
         return (box.status, box.result)
+    }
+
+    /// Read a single item by account. Used as the fallback when the batched
+    /// `kSecMatchLimitAll` query is rejected: a single-item query for the same
+    /// secret succeeds, so a stored key is still found.
+    /// Read a single item from an arbitrary service. Needed by the legacy
+    /// service migration, which has to read the service name an older build
+    /// used. Single-item queries are used deliberately: the batched
+    /// `kSecMatchLimitAll` query can be rejected (errSecParam) on some Macs.
+    static func value(fromService legacyService: String, key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: legacyService,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecUseAuthenticationContext as String: noPromptContext(),
+        ]
+        guard let (status, result) = copyMatching(query as CFDictionary),
+              status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static func copyMatchingSingle(_ key: String) -> String? {
+        value(fromService: service, key: key)
     }
 
     /// Set to a future date after the first timeout so Keychain reads are
@@ -352,8 +424,16 @@ enum KeychainManager {
         guard let (status, result) = copyMatching(query as CFDictionary),
               status == errSecSuccess,
               let items = result as? [[String: Any]] else {
+            // Distinguish "no items" from "the enumeration query itself was
+            // rejected" — the latter must not be reported as an empty keychain.
+            cacheLock.lock()
+            enumerationFailed = true
+            cacheLock.unlock()
             return [:]
         }
+        cacheLock.lock()
+        enumerationFailed = false
+        cacheLock.unlock()
 
         var dict: [String: String] = [:]
         for item in items {
@@ -382,36 +462,42 @@ enum KeychainManager {
     /// updating is permitted), and fails silently otherwise. No password
     /// dialog is ever shown.
     ///
+    /// - Parameter accounts: the accounts to repair. This used to walk the
+    ///   items found by the batched `kSecMatchLimitAll` enumeration, but that
+    ///   query can be rejected (errSecParam) on some Macs — which silently
+    ///   reduced the list to nothing and meant the repair never ran at all.
+    ///   The caller now supplies the known account names.
+    ///
     /// - Returns: false when any item's repair is still pending (write
     ///   refused or the keychain stayed busy), so the caller can schedule a
     ///   bounded retry.
-    static func repairAccessControlForAllKeys() -> Bool {
+    static func repairAccessControlForAllKeys(accounts: [String]) -> Bool {
         guard testingBackend == nil, !isUnavailable, let access = selfTrustedAccess() else { return false }
         var allRepaired = true
         // Items written by an older or differently-signed build list only
         // that writer in their ACL, so the app prompts on EVERY read — the
         // "keeps asking for keychain password" symptom.
-        for serviceName in [service] {
-            let accounts = getAll(service: serviceName, bypassCache: true).keys
-            for account in accounts {
-                var query: [String: Any] = [
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: serviceName,
-                    kSecAttrAccount as String: account,
-                ]
-                query[kSecUseAuthenticationContext as String] = noPromptContext()
-                guard let status = timed(45.0, {
-                    SecItemUpdate(query as CFDictionary, [kSecAttrAccess: access] as CFDictionary)
-                }) else {
-                    print("[Keychain] ACL repair for \(account) timed out — will retry next launch")
-                    enterCooldown()
-                    allRepaired = false
-                    continue
-                }
-                if status != errSecSuccess {
-                    print("[Keychain] ACL repair for \(account) failed: \(status)")
-                    allRepaired = false
-                }
+        for account in accounts {
+            // Only repair items that exist. Updating a missing item returns
+            // errSecItemNotFound, which is not a repair failure.
+            guard value(fromService: service, key: account) != nil else { continue }
+            var query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+            ]
+            query[kSecUseAuthenticationContext as String] = noPromptContext()
+            guard let status = timed(45.0, {
+                SecItemUpdate(query as CFDictionary, [kSecAttrAccess: access] as CFDictionary)
+            }) else {
+                print("[Keychain] ACL repair for \(account) timed out — will retry next launch")
+                enterCooldown()
+                allRepaired = false
+                continue
+            }
+            if status != errSecSuccess {
+                print("[Keychain] ACL repair for \(account) failed: \(status)")
+                allRepaired = false
             }
         }
         return allRepaired

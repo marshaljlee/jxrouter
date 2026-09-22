@@ -1,5 +1,4 @@
 import XCTest
-@testable import JXRouter
 
 /// Tests for the endpoint-matching key inheritance: a custom provider whose
 /// base URL matches a built-in provider's endpoint inherits its API key

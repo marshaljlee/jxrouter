@@ -54,6 +54,19 @@ final class LocalModelManager {
         if case .running = status { return true }
         return false
     }
+
+    /// True while a GGUF model is being loaded — i.e. while the Settings
+    /// progress bar should be on screen.
+    var isLoadingModel: Bool = false
+    /// 0…1 fraction of the model mapped in so far.
+    var loadFraction: Double = 0
+    /// What llama-server is doing right now ("Loading weights", …).
+    var loadPhaseLabel: String = ""
+    /// "6.2 GB / 10.5 GB" — empty when the file size is unknown.
+    var loadBytesText: String = ""
+    /// False when the percentage is a time-based estimate, not a measurement.
+    var loadProgressIsMeasured: Bool = false
+
     var port: Int = 9931
     var host: String = "127.0.0.1"
 
@@ -78,7 +91,39 @@ final class LocalModelManager {
     /// Path to a multimodal projector file (--mmproj). Empty = auto-detect matching projector.
     var ggufMmprojPath: String = ""
 
+    /// KV cache K quantization (e.g. "q8_0", "q4_0", "f16", empty = preset).
+    var ggufCacheTypeK: String = ""
+
+    /// KV cache V quantization (e.g. "q8_0", "q4_0", "f16", empty = preset).
+    var ggufCacheTypeV: String = ""
+
+    /// Flash Attention (default true per reference guide).
+    var ggufFlashAttn: Bool = true
+
+    /// Context shift (default true per reference guide).
+    var ggufContextShift: Bool = true
+
+    /// Qwen3.5 model file path (set when user selects Qwen3.5).
+    var qwen3ModelPath: String = ""
+
+    /// Qwen3.5 multimodal projector path (--mmproj).
+    var qwen3MmprojPath: String = ""
+
+    /// Chat template override for Qwen3.5 (empty = auto-detect via LlamaPresetSettings).
+    var qwen3ChatTemplate: String = ""
+
+    /// Context size override for Qwen3.5 (0 = use model's default).
+    var qwen3CtxSize: Int = 0
+
     private var process: Process?
+    /// In-process llama.cpp server, when that path is in use instead of a
+    /// spawned `llama-server`. Nil whenever the subprocess path is serving.
+    private var inferenceServer: LocalInferenceServer?
+
+    /// Pipe carrying llama-server's stderr during a load (tee'd to the log).
+    private var loadPipe: Pipe?
+    /// Samples the child's resident size to drive the load progress bar.
+    private var loadMonitor: ModelLoadMonitor?
 
     // MARK: - Lifecycle
 
@@ -179,6 +224,12 @@ final class LocalModelManager {
     /// Stop the local model server — quit the Llama app, kill ollama, or
     /// terminate the llama-server child process (GGUF).
     func stop() {
+        endLoadProgress()
+        if let inferenceServer {
+            inferenceServer.stop()
+            self.inferenceServer = nil
+            print("[LocalModel] In-process engine stopped")
+        }
         if case .running(let pid) = status, pid > 0 {
             kill(pid: pid)
             print("[LocalModel] Server stopped (was PID \(pid))")
@@ -247,6 +298,41 @@ final class LocalModelManager {
         }
     }
 
+    /// Kill conflicting local llama workers holding device memory to avoid Metal GPU OOM.
+    func killConflictingLocalServers(exceptPort: Int) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-axo", "pid,command="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do {
+            try task.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            if let output = String(data: data, encoding: .utf8) {
+                let lines = output.split(separator: "\n")
+                for line in lines {
+                    let str = String(line).trimmingCharacters(in: .whitespaces)
+                    guard str.contains("llama serve") || str.contains("llama-server") else { continue }
+                    // Keep idle master preset router on 9931, but kill active worker processes
+                    if str.contains("--models-preset") && str.contains("--port 9931") {
+                        continue
+                    }
+                    if str.contains("--port \(exceptPort)") {
+                        continue
+                    }
+                    let parts = str.split(separator: " ")
+                    if let first = parts.first, let pid = Int32(first) {
+                        print("[LocalModel] Terminating conflicting llama worker (PID \(pid)) to reclaim GPU memory")
+                        kill(pid: pid)
+                    }
+                }
+            }
+        } catch {
+            print("[LocalModel] Failed to check conflicting servers: \(error)")
+        }
+    }
+
     /// Build a specific, actionable failure message when the Llama app's local
     /// server doesn't come up. llama.app shells out to the Homebrew llama.cpp
     /// binary, which aborts on startup when the loaded model + context size
@@ -284,10 +370,23 @@ final class LocalModelManager {
     }
 
     /// Start the GGUF model server (llama-server) with the selected model.
-    /// Uses settings mirrored from llama.app (models.user.ini & models.ini)
-    /// including 128K context, single-slot allocation, Flash Attention,
-    /// context shift, and companion Jinja templates with XML tool calling.
+    ///
+    /// Every launch setting is derived from the model's own GGUF metadata by
+    /// `LocalModelAutoConfig` — context size, GPU offload, chat template and
+    /// tool-call format — so a freshly selected model serves Claude Code with a
+    /// context it can actually hold and calls tools in its native format.
     private func startGGUF(forceRestart: Bool = false) async {
+        // Fall back to persisted config when the manager's fields are unset.
+        if selectedGGUFPath.isEmpty { selectedGGUFPath = ConfigManager.shared.ggufModelPath }
+        if ggufModelAlias.isEmpty || ggufModelAlias == "local-model" {
+            let cfgAlias = ConfigManager.shared.ggufModelAlias
+            if !cfgAlias.isEmpty && cfgAlias != "local-model" { ggufModelAlias = cfgAlias }
+        }
+        if ggufMmprojPath.isEmpty { ggufMmprojPath = ConfigManager.shared.ggufMmprojPath }
+        if ggufChatTemplate.isEmpty { ggufChatTemplate = ConfigManager.shared.ggufChatTemplate }
+        if ggufCacheTypeK.isEmpty { ggufCacheTypeK = ConfigManager.shared.ggufCacheTypeK }
+        if ggufCacheTypeV.isEmpty { ggufCacheTypeV = ConfigManager.shared.ggufCacheTypeV }
+
         guard !selectedGGUFPath.isEmpty else {
             status = .failed("No GGUF model file selected. Pick a model first.")
             return
@@ -298,20 +397,34 @@ final class LocalModelManager {
             return
         }
 
-        guard let serverPath = findLlamaServer() else {
-            status = .failed("llama-server not found. Install via: brew install llama.cpp")
+        // In-process engine: no child process, no port juggling, no runtime to
+        // install. Falls through to llama-server when the embedded dylib is
+        // unavailable (Intel) or the user has turned it off.
+        if ConfigManager.shared.preferInProcessEngine, InProcessLlamaEngine.shared.isAvailable {
+            await startInProcess(forceRestart: forceRestart)
             return
+        }
+
+        // Resolve the llama.cpp runtime: bundled in the app > installed by
+        // JXRouter > already on this Mac.
+        let rt = LlamaRuntime.shared
+        if rt.runtime == nil { await rt.resolve() }
+        guard let serverPath = rt.runtime?.path ?? findLlamaServer() else {
+            status = .failed("llama-server is not available. Install the built-in llama.cpp runtime in Settings ▸ Local Models.")
+            return
+        }
+
+        if ggufModelAlias.isEmpty || ggufModelAlias == "local-model" {
+            ggufModelAlias = Self.alias(fromModelPath: selectedGGUFPath)
         }
 
         if forceRestart {
             print("[LocalModel] Force restart requested for GGUF model — clearing port \(port)")
-            if let proc = process, proc.isRunning {
-                proc.terminate()
-            }
+            if let proc = process, proc.isRunning { proc.terminate() }
             killProcessOnPort(port: port)
             try? await Task.sleep(nanoseconds: 500_000_000)
         } else if await healthCheck() {
-            // Check if running server is already serving the requested model
+            // Adopt a server already serving the requested model.
             let (livePath, liveAlias) = await detectRunningGGUF(customPort: port)
             let pathMatches = (livePath != nil && livePath == selectedGGUFPath)
             let aliasMatches = (liveAlias != nil && liveAlias == ggufModelAlias)
@@ -320,150 +433,73 @@ final class LocalModelManager {
                 print("[LocalModel] llama-server already running on port \(port) with matching model: \(liveAlias ?? ggufModelAlias)")
                 return
             } else {
-                print("[LocalModel] llama-server on port \(port) is serving different model (\(liveAlias ?? "unknown")). Restarting...")
+                print("[LocalModel] llama-server on port \(port) is serving a different model (\(liveAlias ?? "unknown")). Restarting…")
                 killProcessOnPort(port: port)
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
 
-        // Resolve settings & presets from llama.app
-        let preset = LlamaModelPresetReader.resolvePreset(
-            modelPath: selectedGGUFPath,
-            alias: ggufModelAlias
+        // Free up Metal GPU device memory by terminating other local llama workers.
+        killConflictingLocalServers(exceptPort: port)
+
+        let overrides = LocalModelAutoConfig.Overrides(
+            contextSize: ggufContextSize > 0 ? ggufContextSize : ConfigManager.shared.ggufContextSize,
+            gpuLayers: gpuLayerOverride(),
+            cacheTypeK: ggufCacheTypeK,
+            cacheTypeV: ggufCacheTypeV,
+            flashAttention: ggufFlashAttn && ConfigManager.shared.ggufFlashAttn,
+            contextShift: ggufContextShift && ConfigManager.shared.ggufContextShift,
+            chatTemplate: ggufChatTemplate,
+            mmprojPath: ggufMmprojPath
+        )
+        let plan = LocalModelAutoConfig.plan(
+            forModelPath: selectedGGUFPath,
+            alias: ggufModelAlias,
+            overrides: overrides
         )
 
-        let effectiveContext = ggufContextSize > 0 ? ggufContextSize : preset.contextSize
+        // Persist the projector decision. A stale incompatible mmproj left in
+        // the config is exactly what aborted llama-server on every launch.
+        let resolvedMmproj = plan.multimodalProjector ?? ""
+        if ConfigManager.shared.ggufMmprojPath != resolvedMmproj {
+            ConfigManager.shared.ggufMmprojPath = resolvedMmproj
+        }
+        ggufMmprojPath = resolvedMmproj
 
-        print("[LocalModel] Launching llama-server with llama.app settings: \(serverPath)")
-        print("[LocalModel]   Model: \(selectedGGUFPath)")
-        print("[LocalModel]   Port: \(port)")
-        print("[LocalModel]   Alias: \(ggufModelAlias)")
-        print("[LocalModel]   Context size: \(effectiveContext)")
-        print("[LocalModel]   GPU layers: \(ggufGpuLayers)")
-        print("[LocalModel]   Flash Attention: \(preset.flashAttn ? "on" : "off")")
-        print("[LocalModel]   Context Shift: \(preset.contextShift ? "enabled" : "disabled")")
-        print("[LocalModel]   KV Cache: K=\(preset.cacheTypeK ?? "default"), V=\(preset.cacheTypeV ?? "default")")
-        print("[LocalModel]   Threads: \(preset.threads) (batch: \(preset.threadsBatch))")
-        print("[LocalModel]   Batch / UBatch: \(preset.batchSize) / \(preset.ubatchSize)")
+        // Route Claude Code at this model before launching, so traffic lands
+        // on it the moment the server answers.
+        LocalModelAutoConfig.applyRouting(plan, port: port)
+
+        let binary = serverPath
+        let features = await Task.detached(priority: .utility) {
+            LocalModelAutoConfig.featureSet(forBinaryAt: binary)
+        }.value
+        let args = LocalModelAutoConfig.arguments(
+            for: plan, port: port, binaryPath: binary, features: features
+        )
+
+        // Progress reporting. llama.cpp prints no percentage while loading, so
+        // the bar is driven by the child's resident size — see
+        // ModelLoadProgress for why that is the only real signal available.
+        let modelBytes = (try? FileManager.default.attributesOfItem(atPath: selectedGGUFPath)[.size] as? NSNumber)?.int64Value ?? 0
+        let monitor = ModelLoadMonitor(modelBytes: modelBytes) { [weak self] progress in
+            Task { @MainActor in self?.applyLoadProgress(progress) }
+        }
+        loadMonitor?.cancel()
+        loadMonitor = monitor
+        isLoadingModel = true
+        loadFraction = 0
+        loadPhaseLabel = ModelLoadProgress.Phase.launching.label
+        loadBytesText = modelBytes > 0 ? "0 / \(Self.byteString(modelBytes))" : ""
+        loadProgressIsMeasured = false
+
+        print("[LocalModel] Launching llama-server: \(binary)")
+        print("[LocalModel]   Model:  \(plan.modelPath)  [\(plan.architecture)]")
+        print("[LocalModel]   Alias:  \(plan.alias)   Port: \(port)")
+        print("[LocalModel]   \(plan.summary.replacingOccurrences(of: "\n", with: " | "))")
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: serverPath)
-
-        var args: [String] = []
-        if serverPath.hasSuffix("/llama") && !serverPath.hasSuffix("llama-server") {
-            args.append("serve")
-        }
-
-        // Apply models-preset INI file if available
-        if let presetFile = preset.presetFilePath, FileManager.default.isReadableFile(atPath: presetFile) {
-            args.append(contentsOf: ["--models-preset", presetFile])
-        }
-
-        args.append(contentsOf: ["-m", selectedGGUFPath])
-        args.append(contentsOf: ["--host", "127.0.0.1"])
-        args.append(contentsOf: ["--port", "\(port)"])
-        args.append(contentsOf: ["-a", ggufModelAlias])
-
-        // Multimodal projector (mmproj) support for vision models
-        let effectiveMmproj: String? = {
-            if !ggufMmprojPath.isEmpty && FileManager.default.isReadableFile(atPath: ggufMmprojPath) {
-                return ggufMmprojPath
-            }
-            if let pMmproj = preset.mmproj, FileManager.default.isReadableFile(atPath: pMmproj) {
-                return pMmproj
-            }
-            return GGUFModelScanner.findMatchingMmproj(forModelPath: selectedGGUFPath)
-        }()
-
-        if let mmproj = effectiveMmproj, !mmproj.isEmpty, FileManager.default.isReadableFile(atPath: mmproj) {
-            args.append(contentsOf: ["--mmproj", mmproj])
-            if ggufGpuLayers != 0 {
-                args.append("--mmproj-offload")
-            }
-            print("[LocalModel]   Multimodal projector (mmproj): \(mmproj)")
-        }
-
-        // GPU offloading
-        if ggufGpuLayers > 0 {
-            args.append(contentsOf: ["-ngl", "\(ggufGpuLayers)"])
-        } else if ggufGpuLayers == -1 {
-            args.append(contentsOf: ["-ngl", "999"])
-        }
-
-        // Context size (defaults to 131,072 from preset, ensuring Claude Code requests fit)
-        args.append(contentsOf: ["-c", "\(effectiveContext)"])
-
-        // Context shift (shifts context on long conversations instead of hard abort)
-        if preset.contextShift {
-            args.append("--context-shift")
-        }
-
-        // Flash attention
-        if preset.flashAttn {
-            args.append(contentsOf: ["-fa", "on"])
-        }
-
-        // KV cache quantization (q8_0 / q4_0)
-        if let ctk = preset.cacheTypeK, !ctk.isEmpty {
-            args.append(contentsOf: ["-ctk", ctk])
-        }
-        if let ctv = preset.cacheTypeV, !ctv.isEmpty {
-            args.append(contentsOf: ["-ctv", ctv])
-        }
-
-        // Load mode (mlock)
-        if let lm = preset.loadMode, !lm.isEmpty {
-            args.append(contentsOf: ["--load-mode", lm])
-        }
-
-        // Threading & batch sizing
-        args.append(contentsOf: ["-t", "\(preset.threads)"])
-        args.append(contentsOf: ["-tb", "\(preset.threadsBatch)"])
-        args.append(contentsOf: ["-b", "\(preset.batchSize)"])
-        args.append(contentsOf: ["-ub", "\(preset.ubatchSize)"])
-
-        // Speculative decoding default & fit target
-        if preset.specDefault {
-            args.append("--spec-default")
-        }
-        if let ft = preset.fitTarget {
-            args.append(contentsOf: ["--fit-target", "\(ft)"])
-        }
-
-        // Sampling parameters
-        if let temp = preset.temp { args.append(contentsOf: ["--temp", String(format: "%.2f", temp)]) }
-        if let minP = preset.minP { args.append(contentsOf: ["--min-p", String(format: "%.2f", minP)]) }
-        if let topP = preset.topP { args.append(contentsOf: ["--top-p", String(format: "%.2f", topP)]) }
-        if let topK = preset.topK { args.append(contentsOf: ["--top-k", "\(topK)"]) }
-        if let repPen = preset.repeatPenalty { args.append(contentsOf: ["--repeat-penalty", String(format: "%.2f", repPen)]) }
-        if let repLastN = preset.repeatLastN { args.append(contentsOf: ["--repeat-last-n", "\(repLastN)"]) }
-        if let dryMult = preset.dryMultiplier { args.append(contentsOf: ["--dry-multiplier", String(format: "%.2f", dryMult)]) }
-        if let dryBase = preset.dryBase { args.append(contentsOf: ["--dry-base", String(format: "%.2f", dryBase)]) }
-        if let dryLen = preset.dryAllowedLength { args.append(contentsOf: ["--dry-allowed-length", "\(dryLen)"]) }
-
-        // Chat template & Jinja activation
-        args.append("--jinja")
-        if let jinjaFile = preset.chatTemplateFile, FileManager.default.isReadableFile(atPath: jinjaFile) {
-            args.append(contentsOf: ["--chat-template-file", jinjaFile])
-            print("[LocalModel]   Chat template file: \(jinjaFile)")
-        } else if !ggufChatTemplate.isEmpty {
-            args.append(contentsOf: ["--chat-template", ggufChatTemplate])
-            print("[LocalModel]   Chat template override: \(ggufChatTemplate)")
-        }
-        if let kwargs = preset.chatTemplateKwargs, !kwargs.isEmpty {
-            args.append(contentsOf: ["--chat-template-kwargs", kwargs])
-        }
-        if let reasoningFormat = preset.reasoningFormat, !reasoningFormat.isEmpty {
-            args.append(contentsOf: ["--reasoning-format", reasoningFormat])
-        }
-
-        // Concurrency: Single slot dedicated to the active session so the full context
-        // is available for Claude Code's extensive prompts instead of being sliced into 4.
-        args.append(contentsOf: ["-to", "600"]) // 10min timeout
-        args.append(contentsOf: ["--parallel", "1"])
-        args.append(contentsOf: ["--models-max", "1"])
-
-        proc.arguments = args
+        proc.executableURL = URL(fileURLWithPath: binary)
 
         // Redirect stdout/stderr to log files
         let stdoutPath = "/tmp/llama-server-stdout.log"
@@ -474,27 +510,196 @@ final class LocalModelManager {
         let stdoutHandle = FileHandle(forWritingAtPath: stdoutPath) ?? FileHandle.standardOutput
         let stderrHandle = FileHandle(forWritingAtPath: stderrPath) ?? FileHandle.standardError
         proc.standardOutput = stdoutHandle
-        proc.standardError = stderrHandle
+        // stderr runs through a pipe so load milestones can be read as they
+        // happen, and is tee'd into the log file that diagnoseGGUFFailure(:)
+        // reads after a launch that never came up.
+        let stderrPipe = Pipe()
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak monitor] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            stderrHandle.write(data)
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.split(separator: "\n") where !line.isEmpty {
+                monitor?.note(line: String(line))
+            }
+        }
+        proc.standardError = stderrPipe
+        proc.arguments = args
 
         do {
             try proc.run()
             process = proc
+            loadPipe = stderrPipe
+            monitor.attach(pid: proc.processIdentifier)
             print("[LocalModel] llama-server launched (PID \(proc.processIdentifier))")
 
-            if await waitForHealth(timeout: 60) {
+            if await waitForHealth(timeout: 180) {
+                monitor.finish()
                 status = .running(pid: proc.processIdentifier)
                 print("[LocalModel] llama-server is up (port \(port))")
+                // Let the bar rest at 100% long enough to read, then retire it.
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    self?.endLoadProgress()
+                }
             } else {
-                // Read stderr for diagnostics
                 let diag = diagnoseGGUFFailure(stderrPath: stderrPath)
+                monitor.cancel()
+                endLoadProgress()
                 status = .failed(diag)
                 proc.terminate()
                 process = nil
             }
         } catch {
+            monitor.cancel()
+            endLoadProgress()
             status = .failed("Failed to launch llama-server: \(error.localizedDescription)")
             process = nil
         }
+    }
+
+    // MARK: - In-Process GGUF Hosting
+
+    /// Serve the GGUF from inside this process via the embedded llama.cpp.
+    ///
+    /// The server speaks the same HTTP surface as `llama-server`, so the health
+    /// checks, adoption logic and provider routing above are unchanged.
+    private func startInProcess(forceRestart: Bool) async {
+        if forceRestart {
+            inferenceServer?.stop()
+            inferenceServer = nil
+        } else if await healthCheck() {
+            status = .running(pid: 0)
+            print("[LocalModel] in-process server already serving on port \(port)")
+            return
+        }
+
+        let cfg = LocalInferenceServer.Config(
+            port: UInt16(max(1, min(65535, port))),
+            modelPath: selectedGGUFPath,
+            modelAlias: ggufModelAlias,
+            nCtx: Int32(ggufContextSize),
+            nBatch: 2048,
+            nUBatch: 512,
+            nGPULayers: Int32(ggufGpuLayers),
+            flashAttn: ggufFlashAttn
+        )
+
+        isLoadingModel = true
+        loadFraction = 0
+        loadPhaseLabel = "Loading weights"
+        loadProgressIsMeasured = true
+        loadBytesText = ""
+
+        let server = LocalInferenceServer()
+        do {
+            try await server.start(cfg) { [weak self] fraction in
+                // The engine reports on the main queue already, but hop
+                // explicitly so main-actor isolation is provable.
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.loadFraction = max(self.loadFraction, fraction)
+                    self.loadPhaseLabel = "Loading weights"
+                    self.loadProgressIsMeasured = true
+                }
+            }
+        } catch {
+            endLoadProgress()
+            status = .failed("In-process engine failed: \(error.localizedDescription). Disable it in Settings ▸ System to use llama-server instead.")
+            return
+        }
+
+        inferenceServer = server
+        endLoadProgress()
+
+        guard await waitForHealth(timeout: 10) else {
+            server.stop()
+            inferenceServer = nil
+            status = .failed("In-process engine loaded the model but the server did not answer on port \(port).")
+            return
+        }
+
+        status = .running(pid: 0)
+        print("[LocalModel] in-process llama.cpp serving \(ggufModelAlias) on port \(port)")
+    }
+
+    /// Publish one load-progress sample from the monitor on the main actor.
+    private func applyLoadProgress(_ progress: ModelLoadProgress) {
+        // Never move backwards: resident size can dip when the kernel
+        // compresses or reclaims pages, and that must not drag the bar back.
+        loadFraction = max(loadFraction, progress.fraction)
+        loadPhaseLabel = progress.phase.label
+        loadProgressIsMeasured = progress.isMeasured
+        loadBytesText = progress.bytesTotal > 0
+            ? "\(Self.byteString(progress.bytesLoaded)) / \(Self.byteString(progress.bytesTotal))"
+            : ""
+    }
+
+    /// Retire the progress bar and release the stderr pipe handler.
+    private func endLoadProgress() {
+        loadMonitor?.cancel()
+        loadMonitor = nil
+        if let pipe = loadPipe {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            loadPipe = nil
+        }
+        isLoadingModel = false
+        loadFraction = 0
+        loadPhaseLabel = ""
+        loadBytesText = ""
+        loadProgressIsMeasured = false
+    }
+
+    /// Human-readable size for the load progress readout.
+    ///
+    /// Formatted inline rather than through a cached `ByteCountFormatter`: a
+    /// static stored property on a @MainActor type is main-actor isolated, so
+    /// reaching it from a nonisolated helper warns now and breaks in Swift 6.
+    nonisolated static func byteString(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        return String(format: "%.0f MB", Double(bytes) / 1_048_576)
+    }
+
+    /// GPU offload override: "auto" wins whenever either source asks for it.
+    private func gpuLayerOverride() -> Int {
+        let auto = LocalModelAutoConfig.autoGPULayers
+        if ggufGpuLayers == auto || ConfigManager.shared.ggufGpuLayers == auto { return auto }
+        return ConfigManager.shared.ggufGpuLayers
+    }
+
+    /// A router-safe alias derived from a model filename.
+    nonisolated static func alias(fromModelPath path: String) -> String {
+        let stem = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        let cleaned = stem
+            .replacingOccurrences(of: #"[^a-zA-Z0-9_-]"#, with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return cleaned.isEmpty ? "local-model" : cleaned
+    }
+
+    /// Whether a GGUF's embedded chat template (tokenizer.chat_template) renders
+    /// OpenAI-style tool calls. Detection matches actual Jinja tool SYNTAX
+    /// (iteration over `tools`, `tool_calls` conditionals, `<|tool|>` markers) —
+    /// a bare prose word like "tools" inside a description must not count.
+    /// Tool-capable native templates are used as-is with --jinja; models
+    /// without them get the exported agentic family template instead.
+    nonisolated static func embeddedTemplateSupportsTools(_ template: String) -> Bool {
+        guard !template.isEmpty else { return false }
+        let syntaxMarkers = [
+            "for tool in tools",          // Jinja loop over tool definitions
+            "tools is not none",           // ChatML tool branch
+            "tools is defined",
+            "tool_calls",                  // assistant tool-call rendering
+            "tool_call",                   // singular variant
+            "<|tool|>",                    // ChatML tool markers
+            "<tool_call>",                 // XML-style tool markers
+            "function_call",              // Hermes/Functionary style
+            "tool use",                    // Anthropic-style markers
+        ]
+        return syntaxMarkers.contains { template.contains($0) }
     }
 
     /// Diagnose why llama-server failed to start by reading stderr.
@@ -519,32 +724,22 @@ final class LocalModelManager {
         return "llama-server failed to start (check /tmp/llama-server-stderr.log)"
     }
 
-    /// Find the llama-server binary. Checks Homebrew and common locations.
+    /// Find the llama-server binary.
+    ///
+    /// Prefers the runtime JXRouter bundles or installs for itself (those are
+    /// the copies it can update), then falls back to a Homebrew / system copy.
     nonisolated static func findLlamaServer() -> String? {
+        if let resolved = LlamaRuntime.bestAvailablePath() { return resolved }
+
+        // Legacy search: only reached when no candidate answered `--version`.
         let candidates = [
             "/opt/homebrew/bin/llama-server",
             "/usr/local/bin/llama-server",
             "/opt/homebrew/bin/llama",
             "/usr/local/bin/llama",
         ]
-        for c in candidates {
-            if FileManager.default.isExecutableFile(atPath: c) {
-                // If the binary is `llama` (the multi-call binary), we need
-                // to invoke it as `llama-server` — symlink or rename.
-                if c.hasSuffix("llama-server") { return c }
-                // The `llama` multi-call binary accepts `server` as subcommand
-                if c.hasSuffix("llama") {
-                    // Check if there's a llama-server symlink
-                    let serverLink = c.replacingOccurrences(of: "/llama", with: "/llama-server")
-                    if FileManager.default.isExecutableFile(atPath: serverLink) {
-                        return serverLink
-                    }
-                    // Fall back to using `llama server` via shell
-                    return c
-                }
-            }
-        }
-        // Try `which` with a proper PATH
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) { return c }
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         task.arguments = ["llama-server"]
@@ -557,9 +752,7 @@ final class LocalModelManager {
         } catch { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let p = path, !p.isEmpty, FileManager.default.isExecutableFile(atPath: p) {
-            return p
-        }
+        if let p = path, !p.isEmpty, FileManager.default.isExecutableFile(atPath: p) { return p }
         return nil
     }
 
@@ -836,7 +1029,7 @@ final class LocalModelManager {
 /// so that JXRouter's built-in GGUF model loader runs with identical, battle-tested
 /// hardware acceleration, context lengths, chat templates, and sampling parameters.
 struct LlamaPresetSettings: Sendable {
-    var contextSize: Int = 131072
+    var contextSize: Int = 262144
     var batchSize: Int = 2048
     var ubatchSize: Int = 2048
     var threads: Int = 12
@@ -862,6 +1055,7 @@ struct LlamaPresetSettings: Sendable {
     var dryMultiplier: Double? = 0.8
     var dryBase: Double? = 1.75
     var dryAllowedLength: Int? = 2
+    var sleepIdleSeconds: Int? = -1
     var presetFilePath: String?
 }
 
@@ -911,7 +1105,13 @@ enum LlamaModelPresetReader {
                     settings.chatTemplateKwargs = #"{"tool_call_format":"xml","enable_thinking":false,"plain_language":false,"reasoning_effort":"low"}"#
                 }
                 if settings.reasoningFormat == nil {
-                    settings.reasoningFormat = "deepseek-legacy"
+                    // "deepseek", matching `LocalModelAutoConfig` and
+                    // llama.cpp's own default (common/common.h:664).
+                    // "deepseek-legacy" leaves <think> inline in streaming
+                    // deltas; "deepseek" lifts them into
+                    // `message.reasoning_content` instead, which keeps agentic
+                    // turns free of reasoning noise in the content stream.
+                    settings.reasoningFormat = "deepseek"
                 }
             }
         }
@@ -971,17 +1171,61 @@ enum LlamaModelPresetReader {
             }
         }
 
-        // 2. Exact or substring section header match
+        // Helper to normalize section name / alias:
+        // "local/ornith:q8_0" -> ("ornith", "q8_0")
+        func parseSectionHeader(_ raw: String) -> (base: String, quant: String?) {
+            var s = raw.lowercased()
+            if s.hasPrefix("local/") {
+                s = String(s.dropFirst(6))
+            }
+            if let colonIdx = s.firstIndex(of: ":") {
+                let base = String(s[..<colonIdx]).trimmingCharacters(in: .whitespaces)
+                let quant = String(s[s.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+                return (base, quant.isEmpty ? nil : quant)
+            }
+            return (s.trimmingCharacters(in: .whitespaces), nil)
+        }
+
+        // 2. Exact or normalized section header / alias match
         for (sec, dict) in sections {
             let s = sec.lowercased()
             if s == "*" { continue }
             if s == cleanAlias || s == cleanModelStem || s.contains(cleanModelStem) || (!cleanAlias.isEmpty && s.contains(cleanAlias)) {
                 return dict
             }
+
+            // Check normalized header: e.g. [local/ornith:Q8_0] -> base "ornith", quant "q8_0"
+            let parsed = parseSectionHeader(s)
+            if !parsed.base.isEmpty {
+                let baseMatches = cleanModelStem.contains(parsed.base) || (!cleanAlias.isEmpty && cleanAlias.contains(parsed.base))
+                if baseMatches {
+                    if let quant = parsed.quant {
+                        if cleanModelStem.contains(quant) || (!cleanAlias.isEmpty && cleanAlias.contains(quant)) {
+                            return dict
+                        }
+                    } else {
+                        return dict
+                    }
+                }
+            }
+
+            // Check explicit alias list in section body: alias = local/ornith:Q8_0, ornith
             if let aliases = dict["alias"]?.lowercased() {
                 let parts = aliases.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                if parts.contains(cleanAlias) || parts.contains(cleanModelStem) {
-                    return dict
+                for p in parts {
+                    if p == cleanAlias || p == cleanModelStem || cleanModelStem.contains(p) || (!cleanAlias.isEmpty && cleanAlias.contains(p)) {
+                        return dict
+                    }
+                    let parsedPart = parseSectionHeader(p)
+                    if !parsedPart.base.isEmpty && (cleanModelStem.contains(parsedPart.base) || (!cleanAlias.isEmpty && cleanAlias.contains(parsedPart.base))) {
+                        if let quant = parsedPart.quant {
+                            if cleanModelStem.contains(quant) || (!cleanAlias.isEmpty && cleanAlias.contains(quant)) {
+                                return dict
+                            }
+                        } else {
+                            return dict
+                        }
+                    }
                 }
             }
         }
@@ -1071,6 +1315,9 @@ enum LlamaModelPresetReader {
         }
         if let val = section["dry-allowed-length"] ?? section["dry_allowed_length"], let intVal = Int(val) {
             settings.dryAllowedLength = intVal
+        }
+        if let val = section["sleep-idle-seconds"] ?? section["sleep_idle_seconds"], let intVal = Int(val) {
+            settings.sleepIdleSeconds = intVal
         }
     }
 

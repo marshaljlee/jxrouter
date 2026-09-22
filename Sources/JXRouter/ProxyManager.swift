@@ -926,7 +926,7 @@ final class ProxyManager {
         lines.append("FALLBACK_PROVIDERS=\(config.fallbackProviders)")
         // Note: secrets are in Keychain, not exported
         lines.append("")
-        lines.append("# API keys are stored in macOS Keychain (service: com.jxproxy)")
+        lines.append("# API keys are stored in macOS Keychain (service: com.marshaljlee.jxrouter)")
         lines.append("# To export keys, use: security dump-keychain -d ~/Library/Keychains/login.keychain-db")
         return lines.joined(separator: "\n")
     }

@@ -79,7 +79,20 @@ final class ConfigManager: @unchecked Sendable {
         static let ggufGpuLayers = "ggufGpuLayers"
         static let ggufContextSize = "ggufContextSize"
         static let ggufPort = "ggufPort"
+        static let ggufSearchPaths = "ggufSearchPaths"
         static let ggufMmprojPath = "ggufMmprojPath"
+        static let ggufChatTemplate = "ggufChatTemplate"
+        static let ggufCacheTypeK = "ggufCacheTypeK"
+        static let ggufCacheTypeV = "ggufCacheTypeV"
+        static let ggufFlashAttn = "ggufFlashAttn"
+        static let ggufContextShift = "ggufContextShift"
+        static let preferInProcessEngine = "preferInProcessEngine"
+        /// ASD-STE100 simplified-English output rules for local models.
+        static let ste100Enforce = "ste100Enforce"
+static let qwen3ModelPath = "Qwen3.5ModelPath"
+static let qwen3MmprojPath = "Qwen3.5MmprojPath"
+static let qwen3ChatTemplate = "Qwen3.5ChatTemplate"
+static let qwen3CtxSize = "Qwen3.5CtxSize"
         static let authToken = "authToken"
         static let authTokenResetDone = "authTokenResetDone"
         static let appRoutesJSON = "appRoutesJSON"
@@ -126,6 +139,17 @@ final class ConfigManager: @unchecked Sendable {
         static let custom = "CUSTOM_API_KEY"
         static let telegramBotToken = "TELEGRAM_BOT_TOKEN"
         static let authToken = "JXPROXY_AUTH_TOKEN"
+
+        /// Every account name this app may store. The batched keychain
+        /// enumeration is unreliable (errSecParam on some Macs), so anything
+        /// that needs to walk stored secrets takes this list instead.
+        static var allChainKeys: [String] {
+            [openai, openrouter, opencode, anthropic, nvidia, deepseek, gemini,
+             mistral, codestral, cohere, groq, fireworks, sambanova, cerebras,
+             huggingface, githubModels, wafer, kimi, kimiCode, minimax, xai,
+             cloudflareApiToken, zai, ollamaCloud, aiGateway, antigravity, custom,
+             telegramBotToken]
+        }
     }
 
     /// UserDefaults key for storing API keys JSON dictionary.
@@ -329,9 +353,9 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.ggufModelAlias); publish() }
     }
 
-    /// GPU layers to offload (-1 = all, 0 = CPU only, N = N layers).
+    /// GPU layers to offload (-1 = all [default on Apple Silicon], 0 = CPU only, N = N layers).
     var ggufGpuLayers: Int {
-        get { defaults.object(forKey: UDKey.ggufGpuLayers) as? Int ?? 0 }
+        get { defaults.object(forKey: UDKey.ggufGpuLayers) as? Int ?? -1 }
         set { defaults.set(newValue, forKey: UDKey.ggufGpuLayers); publish() }
     }
 
@@ -347,10 +371,58 @@ final class ConfigManager: @unchecked Sendable {
         set { defaults.set(newValue, forKey: UDKey.ggufPort); publish() }
     }
 
+    /// Extra folders to scan for GGUF models, on top of the built-in roots
+    /// (`~/Models`, `~/.local/share/llama.cpp/models`, `~/Downloads` and
+    /// `/Volumes/*/Models`). Set in Settings → Local Model → Model Folders.
+    var ggufSearchPaths: [String] {
+        get { defaults.stringArray(forKey: UDKey.ggufSearchPaths) ?? [] }
+        set { defaults.set(newValue, forKey: UDKey.ggufSearchPaths); publish() }
+    }
+
     /// Path to the multimodal projector (mmproj) GGUF file for vision models.
     var ggufMmprojPath: String {
         get { defaults.string(forKey: UDKey.ggufMmprojPath) ?? "" }
         set { defaults.set(newValue, forKey: UDKey.ggufMmprojPath); publish() }
+    }
+
+    /// Chat template selection (empty = auto, "agentic-qwen", "agentic-llama3", or template name/path).
+    var ggufChatTemplate: String {
+        get { defaults.string(forKey: UDKey.ggufChatTemplate) ?? "" }
+        set { defaults.set(newValue, forKey: UDKey.ggufChatTemplate); publish() }
+    }
+
+    /// KV cache K quantization type (e.g. "q8_0", "q4_0", "f16", or empty for auto/preset).
+    var ggufCacheTypeK: String {
+        get { defaults.string(forKey: UDKey.ggufCacheTypeK) ?? "" }
+        set { defaults.set(newValue, forKey: UDKey.ggufCacheTypeK); publish() }
+    }
+
+    /// KV cache V quantization type (e.g. "q8_0", "q4_0", "f16", or empty for auto/preset).
+    var ggufCacheTypeV: String {
+        get { defaults.string(forKey: UDKey.ggufCacheTypeV) ?? "" }
+        set { defaults.set(newValue, forKey: UDKey.ggufCacheTypeV); publish() }
+    }
+
+    /// Flash Attention enabled (default true per reference guide).
+    var ggufFlashAttn: Bool {
+        get { defaults.object(forKey: UDKey.ggufFlashAttn) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: UDKey.ggufFlashAttn); publish() }
+    }
+
+    /// Context shift enabled for infinite conversation context (default true per reference guide).
+    var ggufContextShift: Bool {
+        get { defaults.object(forKey: UDKey.ggufContextShift) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: UDKey.ggufContextShift); publish() }
+    }
+
+    /// Run GGUF models inside JXRouter instead of spawning `llama-server`.
+    ///
+    /// On by default, but it is a no-op unless the embedded engine actually
+    /// loads — the engine is arm64-only, so Intel Macs silently keep using
+    /// the subprocess path.
+    var preferInProcessEngine: Bool {
+        get { defaults.object(forKey: UDKey.preferInProcessEngine) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: UDKey.preferInProcessEngine); publish() }
     }
 
     /// Auth token for proxy authentication. Defaults to the documented token
@@ -359,6 +431,14 @@ final class ConfigManager: @unchecked Sendable {
     var authToken: String {
         get { defaults.string(forKey: UDKey.authToken) ?? "jxproxy" }
         set { defaults.set(newValue, forKey: UDKey.authToken); publish() }
+    }
+
+    /// Prepend ASD-STE100 output rules to the system prompt for local models.
+    /// Off by default: it changes output style for every request, so existing
+    /// users keep current behaviour until they opt in.
+    var ste100Enforce: Bool {
+        get { defaults.object(forKey: UDKey.ste100Enforce) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: UDKey.ste100Enforce); publish() }
     }
 
     /// Whether the remote web-control server (mobile web-wrapper apps) is
@@ -472,7 +552,7 @@ final class ConfigManager: @unchecked Sendable {
     /// Shell config files scanned for `export KEY=…` lines, in order. Internal
     /// (not private) so tests can point the importer at temp files instead of
     /// the developer's real configs.
-    private(set) var shellConfigPaths: [String] = [
+    var shellConfigPaths: [String] = [
         "~/.zshrc",
         "~/.zshenv",
         "~/.zprofile",
@@ -805,6 +885,128 @@ final class ConfigManager: @unchecked Sendable {
         defaults.removeObject(forKey: Self.udApiKeysKey)
     }
 
+    /// Keychain service names used by earlier builds, newest first. Secrets
+    /// stored under an old service are invisible to this build — the keys were
+    /// saved, just not where we now look, which read as "the app never saves my
+    /// keys".
+    ///
+    /// `KeychainManager.legacyService` ("com.jxproxy") is the service this app
+    /// used before the bundle was re-established as `com.marshaljlee.jxrouter`;
+    /// it is first so a key present in more than one old service is taken from
+    /// the build the user most recently ran.
+    private static let legacyKeychainServices = [KeychainManager.legacyService] + preRenameLegacyServices
+
+    /// Services that predate the `com.jxproxy` era. Separated out because the
+    /// old boolean flag (below) only ever vouched for these two, so adopting it
+    /// must not mark `KeychainManager.legacyService` as already swept.
+    private static let preRenameLegacyServices = ["com.jxrouter-g", "com.proxyswitch"]
+
+    /// Legacy services still waiting for a sweep, given the set already swept.
+    ///
+    /// Pure, and internal rather than private, so the per-service latch is
+    /// testable without touching UserDefaults or the Keychain: the sweep order
+    /// (newest build first) and the "a later-added service still gets swept"
+    /// property are the two things that silently break a service rename.
+    static func pendingLegacyServices(sweptServices: Set<String>) -> [String] {
+        legacyKeychainServices.filter { !sweptServices.contains($0) }
+    }
+
+    /// The legacy services an install has already swept, adopting the
+    /// pre-per-service boolean flag when that is all it recorded.
+    ///
+    /// Pure — the caller persists the result. Split from
+    /// `pendingLegacyServices` so a test can assert the exact set an install
+    /// with the old flag ends up with: the two pre-rename services (already
+    /// done) but NOT `KeychainManager.legacyService`, which that install has
+    /// never swept.
+    static func sweptLegacyServices(recorded: Set<String>, legacyBoolMigrated: Bool) -> Set<String> {
+        var swept = recorded
+        if legacyBoolMigrated { swept.formUnion(preRenameLegacyServices) }
+        return swept
+    }
+
+    /// The legacy services already swept, recorded per service name.
+    ///
+    /// Per-service rather than one boolean: a single flag latched by an older
+    /// build would also suppress a service added later — exactly the case of
+    /// "com.jxproxy", which existing installs still have to sweep even though
+    /// they already ran the migration for the two earlier names.
+    private static let udMigratedKeychainServices = "migratedLegacyKeychainServices"
+
+    /// The pre-per-service boolean flag, kept only so it can be adopted into
+    /// `udMigratedKeychainServices` once and then removed.
+    private static let udLegacyServicesMigratedBool = "legacyKeychainServicesMigrated"
+
+    /// One-shot, non-destructive copy of secrets from earlier builds' keychain
+    /// services into the current one. Source items are left in place and an
+    /// existing value is never overwritten. Skipped while the Keychain is
+    /// unavailable, so a transient read failure can never clobber a live key.
+    private func migrateLegacyKeychainServices() {
+        // Only the app singleton touches the real Keychain; unit-test instances
+        // use scratch defaults and stay hermetic.
+        guard defaults === UserDefaults.standard else { return }
+
+        let recorded = Set(defaults.stringArray(forKey: Self.udMigratedKeychainServices) ?? [])
+        let hadOldFlag = defaults.bool(forKey: Self.udLegacyServicesMigratedBool)
+        // Adopt the old boolean: installs that already swept the two original
+        // services must not redo them, but the service added with the bundle
+        // rename still has to run for them.
+        var swept = Self.sweptLegacyServices(recorded: recorded, legacyBoolMigrated: hadOldFlag)
+        if hadOldFlag {
+            defaults.removeObject(forKey: Self.udLegacyServicesMigratedBool)
+            defaults.set(swept.sorted(), forKey: Self.udMigratedKeychainServices)
+        }
+        let pending = Self.pendingLegacyServices(sweptServices: swept)
+        guard !pending.isEmpty else { return }
+        guard !KeychainManager.isUnavailable else {
+            print("[ConfigManager] Legacy keychain migration deferred — Keychain unavailable.")
+            return
+        }
+
+        let current = KeychainManager.service
+        // Named custom providers carry their own per-id keys, so a renamed
+        // service would otherwise lose those secrets too.
+        let chainKeys = KeychainKey.allChainKeys
+            + customProviders.map { ConfigManager.customProviderKey($0.id) }
+        var migrated: [String] = []
+
+        for legacy in pending {
+            var serviceTimedOut = false
+            for key in chainKeys {
+                // Bail out of this service as soon as the Keychain stops
+                // answering: one timeout is already 3s, and continuing would
+                // burn one per remaining key and stall launch.
+                if KeychainManager.isUnavailable { serviceTimedOut = true; break }
+                // Direct read, never the cache — the cache can be stale and this
+                // decides whether an existing secret gets overwritten.
+                if KeychainManager.value(fromService: current, key: key) != nil { continue }
+                guard let value = KeychainManager.value(fromService: legacy, key: key) else { continue }
+                do {
+                    try KeychainManager.store(key: key, value: value)
+                    migrated.append("\(key) (from \(legacy))")
+                } catch {
+                    print("[ConfigManager] Failed to migrate \(key) from \(legacy): \(error)")
+                }
+            }
+            // Latch per service, and only when the Keychain actually answered
+            // during that service's pass. A pass that timed out imported
+            // nothing, so it must be retried next launch rather than skipped.
+            if serviceTimedOut || KeychainManager.isUnavailable {
+                print("[ConfigManager] Legacy keychain migration for \(legacy) hit a Keychain timeout — will retry next launch.")
+            } else {
+                swept.insert(legacy)
+            }
+        }
+
+        KeychainManager.invalidateCache()
+        defaults.set(swept.sorted(), forKey: Self.udMigratedKeychainServices)
+        if migrated.isEmpty {
+            print("[ConfigManager] Legacy keychain migration: nothing to import.")
+        } else {
+            print("[ConfigManager] Legacy keychain migration imported: \(migrated.joined(separator: ", "))")
+        }
+    }
+
     // MARK: - Migration Flag
 
     var hasMigrated: Bool {
@@ -837,6 +1039,10 @@ final class ConfigManager: @unchecked Sendable {
 
         // Hygiene sweep: migrate any legacy plaintext apiKeysDict into Keychain (ticket 0001).
         migrateLegacyApiKeysDict()
+
+        // Recover secrets written by earlier builds under a different keychain
+        // service name (one-shot, non-destructive).
+        migrateLegacyKeychainServices()
 
         if !hasMigrated {
             migrateFromConfigEnv()
@@ -926,7 +1132,7 @@ final class ConfigManager: @unchecked Sendable {
     /// the main thread so startup never blocks on (or prompts from) the
     /// Keychain.
     private func scheduleStartupKeychainRecovery() {
-        let queue = DispatchQueue(label: "com.jxproxy.keychain-recovery")
+        let queue = DispatchQueue(label: "com.marshaljlee.jxrouter.keychain-recovery")
         queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.performKeychainRecoveryPass()
         }
@@ -950,11 +1156,23 @@ final class ConfigManager: @unchecked Sendable {
     private func performKeychainRecoveryPass() {
         keychainRecoveryPasses += 1
 
+        // Legacy-service sweep, retried here rather than only at init. At
+        // launch the Keychain is often still settling (login item: locked
+        // keychain, pending permission prompt), so the init attempt defers —
+        // and without this it would not run again until the NEXT launch,
+        // leaving a freshly renamed service unswept for a whole session.
+        // Riding the same cooldown loop as the rest of the recovery lets it
+        // latch within this session instead. Self-guarding: returns
+        // immediately once every legacy service has been swept.
+        migrateLegacyKeychainServices()
+
         if keychainRecoveryPasses == 1 {
             // First pass: one prompt-free ACL self-heal attempt. The Keychain
             // reads below are also prompt-free (kSecUseAuthenticationUIFail),
             // so this pass can never trigger a password dialog.
-            let repairsDone = KeychainManager.repairAccessControlForAllKeys()
+            let knownAccounts = KeychainKey.allChainKeys
+                + customProviders.map { ConfigManager.customProviderKey($0.id) }
+            let repairsDone = KeychainManager.repairAccessControlForAllKeys(accounts: knownAccounts)
             if !repairsDone {
                 print("[ConfigManager] ACL repair incomplete (silent) — items not trusted by this build stay unreadable until re-entered; not retrying this session.")
             }
@@ -1140,7 +1358,9 @@ final class ConfigManager: @unchecked Sendable {
         case "jan": return "http://127.0.0.1:1337/v1"
         case "unsloth": return "http://127.0.0.1:8000/v1"
         // Direct GGUF hosting via llama-server (Homebrew llama.cpp).
-        case "gguf": return "http://127.0.0.1:\(ggufPort)/v1"
+        case "gguf":
+            let port = ggufPort > 0 ? ggufPort : 8081
+            return "http://127.0.0.1:\(port)/v1"
         case "gemini-oauth": return "https://generativelanguage.googleapis.com/v1beta/openai"
         case "antigravity": return "https://api.antigravity.dev/v1"
         case "custom":
@@ -1204,6 +1424,11 @@ final class ConfigManager: @unchecked Sendable {
             list.append(def)
         }
         customProviders = list
+        // An empty key must not delete the stored secret: the Settings UI calls
+        // this on every save, so a field that was never populated (a failed
+        // Keychain read) would otherwise wipe the real key. Clearing happens
+        // explicitly via `removeCustomProvider` or the settings diff.
+        guard !apiKey.isEmpty else { return }
         setApiKey(chainKey: Self.customProviderKey(def.id), value: apiKey)
     }
 
@@ -1337,7 +1562,7 @@ final class ShellConfigWatcher {
 
     func start() {
         let timer = DispatchSource.makeTimerSource(
-            queue: DispatchQueue(label: "com.jxproxy.shell-config-watch", qos: .utility)
+            queue: DispatchQueue(label: "com.marshaljlee.jxrouter.shell-config-watch", qos: .utility)
         )
         timer.schedule(deadline: .now() + 3, repeating: 5, leeway: .seconds(1))
         timer.setEventHandler { [weak self] in

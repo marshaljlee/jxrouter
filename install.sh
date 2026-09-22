@@ -75,6 +75,66 @@ else
     echo "   WARNING: Resources/ directory not found at $RESOURCES_SRC"
 fi
 
+
+# ---------------------------------------------------------------------------
+# Bundle the llama.cpp runtime (llama-server) into the app so the built-in GGUF
+# loader works with zero setup. Prefers the copy JXRouter already installed or
+# updated; otherwise downloads the newest official macOS build for this Mac.
+# Set JXROUTER_SKIP_LLAMA=1 to skip.
+# ---------------------------------------------------------------------------
+stage_llama_cpp() {
+    local APP_BUNDLE="$1"
+    local RES="$APP_BUNDLE/Contents/Resources/llama-cpp"
+
+    if [ -n "${JXROUTER_SKIP_LLAMA:-}" ]; then
+        echo "   Skipping llama.cpp bundling (JXROUTER_SKIP_LLAMA is set)"
+        return 0
+    fi
+
+    local MANAGED="$HOME/Library/Application Support/JXRouter/llama-cpp/current"
+    if [ -x "$MANAGED/llama-server" ]; then
+        mkdir -p "$RES"
+        cp -R "$MANAGED"/. "$RES"/ 2>/dev/null || true
+        xattr -dr com.apple.quarantine "$RES" 2>/dev/null || true
+        echo "   Bundled llama.cpp from the runtime installed by JXRouter"
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || { echo "   Warning: curl not found - skipping llama.cpp bundle"; return 0; }
+
+    local SUFFIX="arm64"
+    [ "$(uname -m)" = "arm64" ] || SUFFIX="x64"
+    local TAG
+    TAG=$(curl -sL --max-time 30 "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20" \
+          | grep -o '"tag_name": *"b[0-9]*"' | head -1 | grep -o 'b[0-9]*')
+    if [ -z "$TAG" ]; then
+        echo "   Warning: could not resolve a llama.cpp release - the app downloads it on first use"
+        return 0
+    fi
+
+    local TMP="/tmp/jxrouter-llama-$TAG"
+    local ASSET="llama-${TAG}-bin-macos-${SUFFIX}.tar.gz"
+    rm -rf "$TMP"; mkdir -p "$TMP"
+    echo "   Downloading llama.cpp $TAG (macOS $SUFFIX)..."
+    if ! curl -sL --max-time 900 -o "$TMP/$ASSET" \
+         "https://github.com/ggml-org/llama.cpp/releases/download/$TAG/$ASSET"; then
+        echo "   Warning: llama.cpp download failed - the app downloads it on first use"
+        return 0
+    fi
+    rm -rf "$RES"; mkdir -p "$RES"
+    if ! tar -xzf "$TMP/$ASSET" -C "$RES" --strip-components=1; then
+        echo "   Warning: llama.cpp extraction failed - skipping"
+        rm -rf "$RES"
+        return 0
+    fi
+    xattr -dr com.apple.quarantine "$RES" 2>/dev/null || true
+    find "$RES" -maxdepth 1 \( -name 'llama-*' -o -name '*.dylib' \) -exec chmod 755 {} + 2>/dev/null || true
+    echo "   Bundled llama.cpp $TAG into the app"
+}
+
+# Bundle the llama.cpp runtime so the built-in GGUF loader needs no setup.
+stage_llama_cpp "$APP_BUNDLE"
+
 # Bundling resources AFTER Xcode signed the bundle invalidates its
 # code-signature seal ("a sealed resource is missing or invalid") — but only
 # when the bundled resources actually changed. Re-sign ONLY when the seal no
