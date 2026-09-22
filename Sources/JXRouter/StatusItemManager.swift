@@ -291,11 +291,20 @@ final class StatusItemManager: NSObject {
             anchorFrame = window.frame
         } else if let button = statusItem.button, let buttonWindow = button.window {
             let b = buttonWindow.convertToScreen(button.frame)
+            let anchorScreen = buttonWindow.screen ?? NSScreen.main
+            let visible = anchorScreen?.visibleFrame ?? .zero
+            // Mirror `positionWindow()`: `NSRect.y` is the BOTTOM edge, so the
+            // anchor's bottom sits one dashboard-height below the top of the
+            // visible frame. Using `visibleFrame.maxY` directly as the bottom
+            // edge put the whole rect ABOVE the screen, the intersection below
+            // came out empty, `swHeight` was 0, and the panel opened collapsed
+            // to its tab bar (560x118) with no content.
+            let anchorHeight = min(785, visible.height)
             anchorFrame = NSRect(
                 x: b.midX - 190,
-                y: (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? b.minY,
-                width: 380, height: 785
-            ).intersection((buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? .zero)
+                y: visible.maxY - anchorHeight,
+                width: 380, height: anchorHeight
+            ).intersection(visible)
         } else {
             anchorFrame = window.frame
         }
