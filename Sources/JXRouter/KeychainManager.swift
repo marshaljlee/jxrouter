@@ -174,12 +174,23 @@ enum KeychainManager {
         return box.value
     }
 
-    /// Performs `SecItemCopyMatching` with a 3-second timeout. Callers build
-    /// the query with the prompt-free LAContext attached (see
-    /// `noPromptContext`), so reads never show a keychain-unlock or
-    /// authorization dialog. Returns `(status, result)` on success, or `nil`
-    /// on timeout.
-    private static func copyMatching(_ query: CFDictionary) -> (OSStatus, AnyObject?)? {
+    /// Performs `SecItemCopyMatching` with a timeout. Callers build the query
+    /// with the prompt-free LAContext attached (see `noPromptContext`), so reads
+    /// never show a keychain-unlock or authorization dialog. Returns
+    /// `(status, result)` on success, or `nil` on timeout.
+    ///
+    /// - Parameters:
+    ///   - timeout: how long to wait. The default suits a silent read. An
+    ///     interactive read has to wait for a human to answer a dialog, so it
+    ///     passes a far longer one.
+    ///   - cooldownOnTimeout: whether a timeout should put every later read into
+    ///     the retry cooldown. True for silent reads — a stalled daemon means
+    ///     stop hammering it. False for interactive reads, where a timeout
+    ///     usually just means the dialog has not been answered yet and must not
+    ///     abort the rest of the pass.
+    private static func copyMatching(_ query: CFDictionary,
+                                     timeout: TimeInterval = 3.0,
+                                     cooldownOnTimeout: Bool = true) -> (OSStatus, AnyObject?)? {
         let group = DispatchGroup()
         group.enter()
 
@@ -195,9 +206,11 @@ enum KeychainManager {
             group.leave()
         }
 
-        guard group.wait(timeout: .now() + 3.0) != .timedOut else {
-            print("[Keychain] SecItemCopyMatching timed out — entering retry cooldown")
-            enterCooldown()
+        guard group.wait(timeout: .now() + timeout) != .timedOut else {
+            if cooldownOnTimeout {
+                print("[Keychain] SecItemCopyMatching timed out — entering retry cooldown")
+                enterCooldown()
+            }
             return nil
         }
         return (box.status, box.result)
@@ -223,6 +236,68 @@ enum KeychainManager {
               let data = result as? Data,
               let value = String(data: data, encoding: .utf8), !value.isEmpty else { return nil }
         return value
+    }
+
+    /// An LAContext that MAY show the macOS authorization dialog.
+    ///
+    /// Used for exactly one thing: the one-time rescue of secrets an older build
+    /// left behind. Everywhere else `noPromptContext()` is deliberate — it is
+    /// what stopped the app popping "enter your password to unlock keychain" on
+    /// every read. But a legacy item's ACL trusts the app under its OLD name
+    /// (`/Applications/JXProxy.app`, a path the installer still deletes), so it
+    /// cannot be read at all without the user granting access once. Failing
+    /// silently there is what made the migration record "nothing to migrate"
+    /// for secrets that were sitting right there.
+    private static func interactiveContext() -> LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = false
+        return context
+    }
+
+    /// Why a read of a named service produced what it produced.
+    ///
+    /// `value(fromService:key:)` returns `String?`, which conflates "not there"
+    /// with "there, but this build is not trusted to read it". A migration that
+    /// latches on a bare nil therefore records "nothing to migrate" for a secret
+    /// that exists — the exact failure that stranded the custom-provider keys in
+    /// `com.jxproxy`. Anything about to latch must use this instead.
+    enum ServiceReadResult: Equatable {
+        case value(String)
+        case notFound
+        /// Present but unreadable: the item's ACL does not trust this build.
+        /// Distinct from `.notFound`, and must never be latched as "absent".
+        case notPermitted(OSStatus)
+        case timedOut
+    }
+
+    /// Read one secret from an arbitrary service, reporting *why* it failed.
+    ///
+    /// - Parameter allowInteraction: when true the read may show the macOS
+    ///   authorization dialog and waits long enough for a person to answer it.
+    static func read(fromService service: String,
+                     key: String,
+                     allowInteraction: Bool) -> ServiceReadResult {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+        ]
+        if !allowInteraction {
+            query[kSecUseAuthenticationContext as String] = noPromptContext()
+        }
+        guard let (status, result) = copyMatching(query as CFDictionary,
+                                                 timeout: allowInteraction ? 60.0 : 3.0,
+                                                 cooldownOnTimeout: !allowInteraction) else {
+            return .timedOut
+        }
+        if status == errSecItemNotFound { return .notFound }
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8), !value.isEmpty else {
+            return .notPermitted(status)
+        }
+        return .value(value)
     }
 
     private static func copyMatchingSingle(_ key: String) -> String? {

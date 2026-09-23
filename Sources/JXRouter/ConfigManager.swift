@@ -41,10 +41,26 @@ struct CustomProviderDef: Identifiable, Codable, Equatable, Hashable {
     var name: String
     var baseUrl: String
 
+    private enum CodingKeys: String, CodingKey { case id, name, baseUrl }
+
     init(id: String, name: String, baseUrl: String) {
         self.id = id
         self.name = name
         self.baseUrl = baseUrl
+    }
+
+    /// Tolerant decoding, deliberately.
+    ///
+    /// Synthesised `Codable` requires every field on every entry, so adding a
+    /// field in a later build makes every list written by an earlier build
+    /// unreadable. An unreadable list reads as "no providers", and the save
+    /// path used to make that permanent by deleting them all. Defaulting a
+    /// missing field keeps old lists readable across schema changes instead.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(String.self, forKey: .id)) ?? ""
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        baseUrl = (try? c.decode(String.self, forKey: .baseUrl)) ?? ""
     }
 }
 
@@ -948,6 +964,18 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
     /// they already ran the migration for the two earlier names.
     private static let udMigratedKeychainServices = "migratedLegacyKeychainServices"
 
+    /// Legacy-service/account pairs already resolved by
+    /// `rescueStrandedCustomProviderKeys()`, recorded as "<service>|<account>".
+    ///
+    /// The per-service latch above is correct for `KeychainKey.allChainKeys` —
+    /// a set the app controls. It is wrong for custom providers, whose accounts
+    /// the USER adds over time: once a legacy service is latched as swept the
+    /// whole service is skipped, so a provider added afterwards can never be
+    /// rescued. Per (service, account) instead — the same argument that took
+    /// this latch from one boolean to per-service records, applied one level
+    /// down to the set that now grows.
+    private static let udRescuedCustomProviderKeys = "rescuedCustomProviderKeys"
+
     /// The pre-per-service boolean flag, kept only so it can be adopted into
     /// `udMigratedKeychainServices` once and then removed.
     private static let udLegacyServicesMigratedBool = "legacyKeychainServicesMigrated"
@@ -1022,6 +1050,175 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
         }
     }
 
+    /// The (service, account) pairs a rescue pass has still to examine.
+    ///
+    /// Pure and internal so the property that matters is testable without
+    /// UserDefaults or the Keychain: an account the user added AFTER a legacy
+    /// service was latched as swept must still be pending. That is exactly what
+    /// the per-service latch gets wrong, and what stranded the real B.ai /
+    /// TokenRouter / xKiro keys in "com.jxproxy".
+    static func pendingCustomProviderRescues(accounts: [String],
+                                              alreadyDone: Set<String>) -> [String] {
+        var pending: [String] = []
+        for account in accounts {
+            for service in legacyKeychainServices {
+                let token = "\(service)|\(account)"
+                if !alreadyDone.contains(token) { pending.append(token) }
+            }
+        }
+        return pending
+    }
+
+    /// Rescue custom-provider keys the per-service sweep structurally cannot
+    /// reach.
+    ///
+    /// `migrateLegacyKeychainServices()` latches per SERVICE, so once a legacy
+    /// service is recorded as swept it is skipped whole. A custom provider
+    /// created after that latch can therefore never be rescued: its key stays in
+    /// the old service, `resolvedApiKey(for:)` reads only the current service,
+    /// finds nothing, and the settings field comes up empty — so the user
+    /// retypes the same key after every fix. Observed for real: the B.ai /
+    /// TokenRouter / xKiro accounts sat in `com.jxproxy` while
+    /// `com.marshaljlee.jxrouter` had none of them.
+    ///
+    /// Latches per (service, account), a set that grows WITH the providers and
+    /// so cannot go stale. Cheap by construction: it iterates `customProviders`
+    /// — a handful — never `allChainKeys`.
+    ///
+    /// Safety matches the sweep it complements: the source is left in place, a
+    /// value the current service already holds is NEVER overwritten, and a
+    /// Keychain that stops answering aborts the pass so it retries next launch.
+    /// Rescue custom-provider keys the per-service sweep structurally cannot
+    /// reach.
+    ///
+    /// `migrateLegacyKeychainServices()` latches per SERVICE, so once a legacy
+    /// service is recorded as swept it is skipped whole. A custom provider
+    /// created after that latch can therefore never be rescued: its key stays in
+    /// the old service, `resolvedApiKey(for:)` reads only the current service,
+    /// finds nothing, and the settings field comes up empty — so the user
+    /// retypes the same key after every fix. Observed for real: the xKiro and
+    /// TokenRouter accounts sat in `com.jxproxy` and `inferx` in
+    /// `com.jxrouter-g`, while `com.marshaljlee.jxrouter` held none of them.
+    ///
+    /// Latches per (service, account) — a set that grows WITH the providers and
+    /// so cannot go stale.
+    ///
+    /// - Parameter allowInteraction: whether macOS may show its authorization
+    ///   dialog. A legacy item's ACL trusts the app under its OLD name, so an
+    ///   interaction-forbidden read cannot see it at all: it fails exactly like
+    ///   "no such item". The silent pass therefore finds nothing on an affected
+    ///   machine and must NOT record the rest as "nothing to rescue"; only the
+    ///   interactive pass, run while the user is present, can recover them.
+    private func rescueStrandedCustomProviderKeys(allowInteraction: Bool) {
+        guard defaults === UserDefaults.standard else { return }
+        guard !KeychainManager.isUnavailable else {
+            NSLog("[ConfigManager] Custom-provider rescue deferred: Keychain unavailable")
+            return
+        }
+
+        let accounts = customProviders.map { Self.customProviderKey($0.id) }
+        guard !accounts.isEmpty else { return }
+
+        var done = Set(defaults.stringArray(forKey: Self.udRescuedCustomProviderKeys) ?? [])
+        let current = KeychainManager.service
+        var rescued: [String] = []
+        // Reads that told us nothing about whether the secret exists.
+        var unresolved = 0
+
+        // Never overwrite: a value this build can already read is the one in
+        // use, whatever an older service still holds, and such an account needs
+        // nothing at all.
+        var resolvedAccounts = Set<String>()
+        for account in accounts {
+            if case .value = KeychainManager.read(fromService: current, key: account,
+                                                  allowInteraction: false) {
+                resolvedAccounts.insert(account)
+            }
+        }
+
+        // The candidate set is the tested pure helper: every (service, account)
+        // pair not already accounted for, grouped by account because that is the
+        // order it emits.
+        for token in Self.pendingCustomProviderRescues(accounts: accounts, alreadyDone: done) {
+            let parts = token.split(separator: "|", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let legacy = String(parts[0])
+            let account = String(parts[1])
+            // An earlier service already handed this account over. Stopping here
+            // is what keeps the pass to one prompt per account.
+            if resolvedAccounts.contains(account) { continue }
+            // A timeout has already cost seconds; do not burn one per remaining
+            // candidate.
+            if !allowInteraction, KeychainManager.isUnavailable { return }
+
+            switch KeychainManager.read(fromService: legacy, key: account,
+                                        allowInteraction: allowInteraction) {
+            case .value(let value):
+                do {
+                    try KeychainManager.store(key: account, value: value)
+                    rescued.append("\(account) (from \(legacy))")
+                    done.insert(token)
+                    resolvedAccounts.insert(account)
+                } catch {
+                    NSLog("[ConfigManager] Failed to rescue %@ from %@: %@",
+                          account, legacy, String(describing: error))
+                }
+            case .notFound:
+                // Genuinely absent from this service — safe to record.
+                done.insert(token)
+            case .notPermitted(let status):
+                // Present, but this build is not trusted to read it. Recording
+                // that as "absent" is what permanently hides a key the user
+                // still has.
+                unresolved += 1
+                NSLog("[ConfigManager] %@ in %@ needs authorization (OSStatus %d)",
+                      account, legacy, status)
+            case .timedOut:
+                unresolved += 1
+            }
+        }
+
+        if !rescued.isEmpty {
+            KeychainManager.invalidateCache()
+            NSLog("[ConfigManager] Rescued stranded custom-provider keys: %@",
+                  rescued.joined(separator: ", "))
+        }
+        // Latch only when every candidate was actually accounted for. A pass
+        // that could not read an item records nothing, so it retries.
+        if unresolved == 0 {
+            defaults.set(done.sorted(), forKey: Self.udRescuedCustomProviderKeys)
+        }
+        NSLog("[ConfigManager] Custom-provider rescue (%@): rescued=%d unresolved=%d",
+              allowInteraction ? "interactive" : "silent", rescued.count, unresolved)
+    }
+
+    /// Whether the interactive rescue has already started this launch, so the
+    /// startup pass and the Settings panel cannot both prompt.
+    private var interactiveRescueStarted = false
+
+    /// Run the rescue with the user present, so macOS may ask for access.
+    ///
+    /// Off the main thread: an authorization dialog waits for a human, and
+    /// startup must never block on one. Called when the Settings panel opens —
+    /// the one moment the user is both present and thinking about provider keys
+    /// — and once shortly after launch.
+    func rescueStrandedProviderKeysInteractively() {
+        guard !interactiveRescueStarted else { return }
+        interactiveRescueStarted = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.rescueStrandedCustomProviderKeys(allowInteraction: true)
+        }
+    }
+
+    /// Retry the interactive rescue a little after launch, when someone is
+    /// plausibly at the machine to answer the dialog. At most once per launch;
+    /// anything refused or unanswered is retried on the next one.
+    private func scheduleInteractiveProviderRescue() {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.rescueStrandedProviderKeysInteractively()
+        }
+    }
+
     // MARK: - Migration Flag
 
     var hasMigrated: Bool {
@@ -1058,6 +1255,14 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
         // Recover secrets written by earlier builds under a different keychain
         // service name (one-shot, non-destructive).
         migrateLegacyKeychainServices()
+        // ...and the accounts that sweep structurally cannot reach: custom
+        // providers added after their service was latched as swept. Silent — it
+        // can only see secrets this build is already trusted for, and must not
+        // record the rest as "nothing to rescue".
+        rescueStrandedCustomProviderKeys(allowInteraction: false)
+        // Anything still stranded cannot be read without the user's permission,
+        // so it is retried later with the dialog allowed.
+        scheduleInteractiveProviderRescue()
 
         if !hasMigrated {
             migrateFromConfigEnv()
@@ -1178,8 +1383,11 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
         // leaving a freshly renamed service unswept for a whole session.
         // Riding the same cooldown loop as the rest of the recovery lets it
         // latch within this session instead. Self-guarding: returns
-        // immediately once every legacy service has been swept.
+        // immediately once every legacy service has been swept — which is also
+        // why it cannot rescue a custom provider added later, hence the
+        // per-account pass underneath.
         migrateLegacyKeychainServices()
+        rescueStrandedCustomProviderKeys(allowInteraction: false)
 
         if keychainRecoveryPasses == 1 {
             // First pass: one prompt-free ACL self-heal attempt. The Keychain
@@ -1413,14 +1621,47 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
         set { defaults.set(newValue, forKey: UDKey.customProviders) }
     }
 
+    /// The outcome of reading the stored custom-provider list.
+    ///
+    /// `unreadable` exists so a parse failure can never be mistaken for "the
+    /// user has no providers". The distinction is load-bearing: the save path
+    /// prunes every provider it cannot see, so collapsing the two turns one bad
+    /// byte in one entry into the deletion of every provider and every one of
+    /// their Keychain keys. That is how a provider the user is still using
+    /// silently disappears and has to be re-entered from scratch.
+    enum CustomProvidersReadResult: Equatable {
+        case empty
+        case decoded([CustomProviderDef])
+        case unreadable
+    }
+
+    /// Pure, and internal rather than private, so all three outcomes are
+    /// testable without touching UserDefaults.
+    static func readCustomProviders(from raw: String) -> CustomProvidersReadResult {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "[]" else { return .empty }
+        guard let data = trimmed.data(using: .utf8),
+              let list = try? JSONDecoder().decode([CustomProviderDef].self, from: data) else {
+            return .unreadable
+        }
+        // An entry with no id has no Keychain account, so it can be neither
+        // read nor edited — unusable, but it must not take the readable entries
+        // down with it.
+        return .decoded(list.filter { !$0.id.isEmpty })
+    }
+
     /// User-defined custom providers (name + endpoint; keys in Keychain).
+    ///
+    /// An unreadable list reads as empty *here* because there is nothing valid
+    /// to hand back. Callers that are about to DELETE something must ask
+    /// `readCustomProviders(from:)` instead and treat `.unreadable` as
+    /// "do not touch storage".
     var customProviders: [CustomProviderDef] {
         get {
-            guard let data = customProvidersJSON.data(using: .utf8),
-                  let list = try? JSONDecoder().decode([CustomProviderDef].self, from: data) else {
-                return []
+            if case let .decoded(list) = Self.readCustomProviders(from: customProvidersJSON) {
+                return list
             }
-            return list
+            return []
         }
         set {
             if let data = try? JSONEncoder().encode(newValue),

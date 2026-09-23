@@ -2903,6 +2903,10 @@ struct SettingsView: View {
         telegramBotToken = config.getApiKey(chainKey: ConfigManager.KeychainKey.telegramBotToken)
         geminiOAuthClientId = UserDefaults.standard.string(forKey: GeminiOAuthManager.clientIdDefaultsKey) ?? ""
         loadAppRoutesFromConfig()
+        // The user is present and looking at provider keys, so this is the right
+        // moment for macOS to ask for access to the ones an older build left in
+        // the previous Keychain service. A no-op once they are all resolved.
+        config.rescueStrandedProviderKeysInteractively()
     }
 
     /// Reload only the API-key fields from the Keychain (shell-config imports
@@ -3019,9 +3023,32 @@ struct SettingsView: View {
         for def in customProviders {
             config.upsertCustomProvider(def, apiKey: customProviderKeys[def.id] ?? "")
         }
-        let keptIds = Set(customProviders.map { $0.id })
-        for def in config.customProviders where !keptIds.contains(def.id) {
-            config.removeCustomProvider(id: def.id)
+        // Prune providers the user removed. Two conditions must hold first,
+        // because this loop DELETES: it drops the provider from storage and its
+        // key from the Keychain.
+        //
+        //  1. The on-screen list must be authoritative. Before `loadFromConfig()`
+        //     runs it is not — `customProviders` is [] until then — and this
+        //     method is also reached from `onDisappear` and the terminate
+        //     notification, which can fire on a view that never loaded. Pruning
+        //     there would delete every provider the user has.
+        //  2. Storage must have been readable. If the stored JSON failed to
+        //     parse, the list is empty for a reason that has nothing to do with
+        //     what the user wants, and deleting on that basis destroys
+        //     everything.
+        //
+        // Deleting the last provider by hand still works: the panel is open, so
+        // `hasLoaded` is true, and storage is readable right up to that point.
+        var storageIsReadable = true
+        if case .unreadable = ConfigManager.readCustomProviders(from: config.customProvidersJSON) {
+            storageIsReadable = false
+            print("[Settings] Stored custom providers did not parse — refusing to prune, so nothing is deleted")
+        }
+        if hasLoaded, storageIsReadable {
+            let keptIds = Set(customProviders.map { $0.id })
+            for def in config.customProviders where !keptIds.contains(def.id) {
+                config.removeCustomProvider(id: def.id)
+            }
         }
 
         // API keys are written ONLY when their value actually changed since the
