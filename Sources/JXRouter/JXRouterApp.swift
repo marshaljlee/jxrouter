@@ -148,6 +148,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Clean quit: the config changes stand, so drop the backups rather
         // than reverting them.
         RollbackSentinel.shared.disarm()
+
+        // _exit, NOT a plain return. Returning hands control back to AppKit,
+        // which completes terminate: by calling exit() — and exit() runs the
+        // C++ static destructors, where libjxllama's global Metal-device
+        // destructor aborts whenever a model is loaded:
+        //   NSApplication terminate: -> exit -> __cxa_finalize_ranges
+        //   -> ~vector<unique_ptr<ggml_metal_device>> -> ggml_metal_device_free
+        //   -> ggml_metal_rsets_free -> ggml_abort -> abort
+        // So every Quit from the status-item menu died by SIGABRT and wrote a
+        // crash report — which made a genuine crash indistinguishable from an
+        // ordinary quit. handleTerminationSignal() above uses _exit(0) for
+        // exactly this reason on the SIGTERM path; this is the same fix for the
+        // menu path. (867b2ad covered only the signal path.)
+        //
+        // All user-quit cleanup has already run synchronously above (signal
+        // sources cancelled, proxy stopped, rollback sentinel disarmed), and the
+        // app registers no atexit handlers of its own, so skipping the
+        // destructors costs nothing — the kernel reclaims the Metal device with
+        // the process. Flush first so buffered diagnostics still land.
+        fflush(stdout)
+        fflush(stderr)
+        _exit(0)
     }
 
     // MARK: - Termination Signal Handling
