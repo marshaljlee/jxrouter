@@ -282,6 +282,9 @@ final class LocalModelManager {
         task.arguments = ["-ti", "tcp:\(port)"]
         let pipe = Pipe()
         task.standardOutput = pipe
+        // Our own PID. The in-process engine binds this port INSIDE this
+        // process, so `lsof -ti` reports us — see the guard in the loop.
+        let selfPID = getpid()
         do {
             try task.run()
             task.waitUntilExit()
@@ -289,6 +292,16 @@ final class LocalModelManager {
             if let output = String(data: data, encoding: .utf8) {
                 let pids = output.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
                 for pid in pids {
+                    // The in-process engine binds this port INSIDE this very
+                    // process, so `lsof -ti` reports our own PID. Signalling
+                    // it SIGKILLs the app: no crash report, no log line, the
+                    // window just vanishes. That fired on every Load/Reload
+                    // Model and every Stop while the in-process engine held
+                    // the port. Never signal ourselves.
+                    guard pid != selfPID else {
+                        print("[LocalModel] Port \(port) held by this process (in-process engine) — not signalling ourselves")
+                        continue
+                    }
                     print("[LocalModel] Terminating process on port \(port) (PID \(pid))")
                     kill(pid: pid)
                 }
@@ -323,6 +336,9 @@ final class LocalModelManager {
                     }
                     let parts = str.split(separator: " ")
                     if let first = parts.first, let pid = Int32(first) {
+                        // Same bug family as killProcessOnPort: our own command
+                        // line can contain "llama", so never signal ourselves.
+                        guard pid != getpid() else { continue }
                         print("[LocalModel] Terminating conflicting llama worker (PID \(pid)) to reclaim GPU memory")
                         kill(pid: pid)
                     }
@@ -640,7 +656,12 @@ final class LocalModelManager {
         inferenceServer = server
         endLoadProgress()
 
-        guard await waitForHealth(timeout: 10) else {
+        // 180s, matching the llama-server path at `waitForHealth(timeout: 180)`.
+        // The weights are resident by now, but the process has just paged in
+        // several GB and is under real memory pressure; a 10s budget, with a
+        // 2s per-request timeout inside healthCheck(), allowed barely one
+        // attempt — so a healthy server was declared dead and torn down.
+        guard await waitForHealth(timeout: 180) else {
             server.stop()
             inferenceServer = nil
             status = .failed("In-process engine loaded the model but the server did not answer on port \(port).")
