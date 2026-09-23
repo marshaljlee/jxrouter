@@ -181,7 +181,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // exit(0), so it must be synchronous.
         RollbackSentinel.shared.fireSynchronously()
         ProxyManager.shared.emergencyCleanup()
-        exit(0)
+
+        // _exit, NOT exit. exit() runs the C++ static destructors, and
+        // libjxllama's global Metal-device destructor aborts when a model is
+        // still loaded (ggml_metal_device_free -> ggml_abort). That turned every
+        // SIGTERM into a SIGABRT — the crash-report backtrace reads
+        //   handleTerminationSignal -> exit -> __cxa_finalize_ranges
+        //   -> ~vector<unique_ptr<ggml_metal_device>> -> ggml_metal_device_free
+        //   -> ggml_abort -> abort
+        // so `killall JXRouter` wrote a crash report every time, and a real
+        // crash became indistinguishable from an ordinary quit.
+        //
+        // Everything this handler needs has already run synchronously above, and
+        // the app registers no atexit handlers of its own, so skipping the
+        // destructors costs nothing: the kernel reclaims the Metal device with
+        // the process. Flush first so the diagnostic prints above still land.
+        fflush(stdout)
+        fflush(stderr)
+        _exit(0)
     }
 }
 
