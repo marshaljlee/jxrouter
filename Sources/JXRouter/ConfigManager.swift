@@ -79,6 +79,7 @@ final class ConfigManager: @unchecked Sendable {
         static let ggufGpuLayers = "ggufGpuLayers"
         static let ggufContextSize = "ggufContextSize"
         static let ggufPort = "ggufPort"
+        static let ggufExposeOnLAN = "ggufExposeOnLAN"
         static let ggufSearchPaths = "ggufSearchPaths"
         static let ggufMmprojPath = "ggufMmprojPath"
         static let ggufChatTemplate = "ggufChatTemplate"
@@ -369,6 +370,20 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
     var ggufPort: Int {
         get { defaults.object(forKey: UDKey.ggufPort) as? Int ?? 8081 }
         set { defaults.set(newValue, forKey: UDKey.ggufPort); publish() }
+    }
+
+    /// Whether the in-process GGUF engine also listens on the network.
+    ///
+    /// The engine speaks an OpenAI-compatible API with **no authentication**, so a
+    /// listener on every interface hands the loaded model to anyone on the same
+    /// network. It is loopback-only unless this is deliberately turned on:
+    ///
+    ///     defaults write com.marshaljlee.jxrouter ggufExposeOnLAN -bool YES
+    ///
+    /// Only do that on a network you trust, and never alongside a port-forward.
+    var ggufExposeOnLAN: Bool {
+        get { defaults.object(forKey: UDKey.ggufExposeOnLAN) as? Bool ?? false }
+        set { defaults.set(newValue, forKey: UDKey.ggufExposeOnLAN); publish() }
     }
 
     /// Extra folders to scan for GGUF models, on top of the built-in roots

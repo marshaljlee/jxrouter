@@ -67,7 +67,27 @@ final class LocalInferenceServer: @unchecked Sendable {
             throw NSError(domain: "LocalInferenceServer", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "invalid port \(port)"])
         }
-        let listener = try NWListener(using: .tcp, on: nwPort)
+        // This endpoint is OpenAI-compatible and carries NO authentication, so it
+        // must not be reachable from the network by default. A bare
+        // `NWListener(using:on:)` listens on every interface — confirmed with lsof as
+        // `TCP *:8081 (LISTEN)` — which hands the loaded model to anyone on the same
+        // WiFi, all the more so with the macOS application firewall off. Pin it to
+        // loopback unless the user has deliberately opted in.
+        //
+        // There are two ways to pin the bind: carry the port in the local
+        // endpoint and drop `on:`, or leave the endpoint's port at 0 and keep
+        // `on:` (the idiom used by ProxyServer.start(port:)). Passing a
+        // *specific* port in the endpoint *and* `on:` is the only combination
+        // that throws EINVAL — which is what makes the two forms look mutually
+        // exclusive when they are not.
+        let params = NWParameters.tcp
+        let listener: NWListener
+        if ConfigManager.shared.ggufExposeOnLAN {
+            listener = try NWListener(using: params, on: nwPort)
+        } else {
+            params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: nwPort)
+            listener = try NWListener(using: params)
+        }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { connection.cancel(); return }
             // One queue per connection: a hung client cannot wedge the rest.
