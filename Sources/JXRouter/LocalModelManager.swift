@@ -221,6 +221,21 @@ final class LocalModelManager {
         }
     }
 
+    /// Arguments for the `pkill` that sweeps up an ollama server this app did
+    /// not start.
+    ///
+    /// `-x` — match the process NAME exactly — and never `-f`. `-f` matches the
+    /// whole command line as a substring, so `pkill -f ollama` also signals
+    /// anything that merely mentions it: an editor with `ollama.md` open, a
+    /// `grep`, a test script. Demonstrated with a decoy process named `sleep`
+    /// whose argv contained "ollama": `pgrep -f ollama` matched it, `pgrep -x
+    /// ollama` did not. The stored PID is already signalled above, so this is
+    /// only a fallback for a server started outside the app, and narrowing it
+    /// costs nothing.
+    nonisolated static func ollamaSweepArguments(serverName: String) -> [String] {
+        ["-x", serverName]
+    }
+
     /// Stop the local model server — quit the Llama app, kill ollama, or
     /// terminate the llama-server child process (GGUF).
     func stop() {
@@ -262,7 +277,7 @@ final class LocalModelManager {
         case .ollama:
             let pkill = Process()
             pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            pkill.arguments = ["-f", provider.serverName]
+            pkill.arguments = Self.ollamaSweepArguments(serverName: provider.serverName)
             do {
                 try pkill.run()
                 pkill.waitUntilExit()

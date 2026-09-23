@@ -62,4 +62,27 @@ final class PortOwnerTests: XCTestCase {
         let msg = PortOwner.conflictMessage(port: 5255, pids: "")
         XCTAssertTrue(msg.contains("5255"), msg)
     }
+
+    // MARK: - Signal targeting
+
+    /// `pkill` must match the process NAME, not the whole command line.
+    ///
+    /// `-f` matches the full argument list as a substring, so `pkill -f ollama`
+    /// also signals anything that merely mentions it — an editor with
+    /// `ollama.md` open, a `grep`, a test script. Verified with a decoy process
+    /// named `sleep` whose argv contained "ollama": `pgrep -f ollama` matched
+    /// it, `pgrep -x ollama` did not.
+    func testOllamaSweepMatchesTheProcessNameNotTheCommandLine() {
+        let args = LocalModelManager.ollamaSweepArguments(serverName: "ollama")
+        XCTAssertEqual(args.first, "-x")
+        XCTAssertFalse(args.contains("-f"),
+                       "`-f` would signal unrelated processes that merely mention the name in their arguments.")
+        XCTAssertEqual(args.last, "ollama")
+    }
+
+    func testOllamaSweepCarriesTheServerNameThrough() {
+        // The pattern must be the caller's server name, not a hardcoded one.
+        XCTAssertEqual(LocalModelManager.ollamaSweepArguments(serverName: "llama-server").last,
+                       "llama-server")
+    }
 }
