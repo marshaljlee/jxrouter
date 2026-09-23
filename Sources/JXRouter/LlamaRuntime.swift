@@ -476,16 +476,38 @@ extension LlamaRuntime {
         try harden(directory: staging)
         try fm.moveItem(atPath: staging, toPath: dest)
 
-        // Point `current` at the new build atomically.
+        // Point `current` at the new build.
+        //
+        // This used to call FileManager.replaceItemAt, which is the safe-save API
+        // for *documents* and resolves symbolic links. `current` is always a
+        // symlink, so it dereferenced to the target build directory and threw
+        //
+        //     The file "current" doesn't exist.
+        //
+        // before changing anything -- so every update failed at this last step
+        // while the freshly staged build sat unused on disk. Confirmed against
+        // build 11132: download and extraction succeeded, `.current-link` was
+        // created, and `current` still pointed at the previous build.
+        //
+        // rename(2) is the right primitive: it replaces the destination atomically
+        // and does not dereference symlinks. Note this also drops a latent second
+        // bug -- fileExists(atPath:) follows links, so a *dangling* `current`
+        // reports false and used to send us down the moveItem branch, which then
+        // failed because the link did in fact exist.
         let current = "\(root)/current"
         let link = "\(root)/.current-link"
         try? fm.removeItem(atPath: link)
         try fm.createSymbolicLink(atPath: link, withDestinationPath: "b\(build)")
-        if fm.fileExists(atPath: current) {
-            _ = try fm.replaceItemAt(URL(fileURLWithPath: current),
-                                     withItemAt: URL(fileURLWithPath: link))
-        } else {
-            try fm.moveItem(atPath: link, toPath: current)
+        if rename(link, current) != 0 {
+            // A real directory left by an older layout, or a dangling link, makes
+            // rename fail. Clear it and retry once. removeItem does not follow
+            // symlinks, so a dangling link is removed without touching its target.
+            let code = errno
+            try? fm.removeItem(atPath: current)
+            guard rename(link, current) == 0 else {
+                throw RuntimeError.installFailed(
+                    "Could not point current at b\(build): \(String(cString: strerror(code)))")
+            }
         }
 
         // Write a marker so the build is known even if the binary can't run.
