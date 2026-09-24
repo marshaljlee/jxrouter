@@ -795,6 +795,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             // Per-stream translation state: allocates Anthropic block indices so
             // reasoning can stream as a thinking block ahead of text.
             var streamState = MessageTranslator.OpenAIStreamState()
+            // Arm text-channel tool-call recovery with the names the client
+            // actually offered — a local model that ignores the native `tools`
+            // array writes the call into its text instead, and only a call to
+            // a tool that really exists may be recovered.
+            streamState.knownToolNames = MessageTranslator.toolNames(in: request)
             // FIX #3: Label the outer for-await loop so we can break out of it on [DONE].
             streamLoop: for await chunk in inputStream {
                 pingFlag.noteActivity()

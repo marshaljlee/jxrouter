@@ -564,6 +564,70 @@ final class MessageTranslatorTests {
         assertTrue(events3.contains { $0.contains("\"stop_reason\":\"tool_use\"") }, "Finish reason must be tool_use because tool was emitted")
     }
 
+    // MARK: - Text-channel tool-call recovery
+
+    /// A local model trained on the Claude tool dialect writes
+    /// `<invoke name="X"><parameter …>…</parameter></invoke>` — wrapped or
+    /// bare — instead of the `<tool_call>` JSON the injected protocol asks
+    /// for. Both parameter dialects must parse.
+    static func testInvokeStyleTextToolExtraction() {
+        print("▶️ Running testInvokeStyleTextToolExtraction...")
+
+        let wrapped = """
+        <function_calls>
+        <invoke name="Bash">
+        <parameter name="command">ls -la</parameter>
+        </invoke>
+        </function_calls>
+        """
+        let r1 = LocalChatTemplateEngine.extractToolCalls(from: wrapped)
+        assertEqual(r1.toolCalls.count, 1, "Wrapped <invoke> must yield exactly one call")
+        assertEqual(r1.toolCalls.first?["name"] as? String, "Bash", "Name must come from the invoke attribute")
+        assertEqual((r1.toolCalls.first?["input"] as? [String: Any])?["command"] as? String, "ls -la", "Quoted <parameter name=…> must parse")
+        assertTrue(!r1.cleanText.contains("function_calls"), "Wrapper must not leak into visible text")
+
+        // Bare invoke with Qwen's <parameter=KEY> — the exact shape the local
+        // Ternary-Bonsai model emits through jxrouter.
+        let bare = #"<invoke name="Skill"><parameter=command>find-skills</parameter></invoke>"#
+        let r2 = LocalChatTemplateEngine.extractToolCalls(from: bare)
+        assertEqual(r2.toolCalls.count, 1, "Bare <invoke> must yield exactly one call")
+        assertEqual(r2.toolCalls.first?["name"] as? String, "Skill", "Bare invoke name must parse")
+        assertEqual((r2.toolCalls.first?["input"] as? [String: Any])?["command"] as? String, "find-skills", "Bare <parameter=…> must parse")
+        assertTrue(r2.cleanText.isEmpty, "Fully-consumed invoke must leave no visible text")
+    }
+
+    /// The reported failure: the model narrates a tool call as TEXT, never
+    /// populating the structured `tool_calls` field, so the client shows prose
+    /// and nothing executes. The stream must end with a real tool_use block.
+    static func testStreamingTextChannelToolRecovery() {
+        print("▶️ Running testStreamingTextChannelToolRecovery...")
+        var state = MessageTranslator.OpenAIStreamState()
+        state.knownToolNames = ["Bash", "Read"]
+
+        let chunk1: [String: Any] = [
+            "choices": [["delta": ["content": "I will run the listing now. <function_calls><invoke name=\"Bash\"><parameter=command>ls -la</parameter></invoke></function_calls>"], "finish_reason": NSNull()]]
+        ]
+        let events1 = MessageTranslator.openAIToAnthropicSSE(chunk: chunk1, model: "local", state: &state, enableThinking: false)
+        assertTrue(events1.contains { $0.contains("text_delta") }, "Narration must still stream as text")
+
+        let chunk2: [String: Any] = [
+            "choices": [["delta": [:], "finish_reason": "stop"]]
+        ]
+        let events2 = MessageTranslator.openAIToAnthropicSSE(chunk: chunk2, model: "local", state: &state, enableThinking: false)
+        assertTrue(events2.contains { $0.contains("content_block_start") && $0.contains("\"tool_use\"") && $0.contains("Bash") }, "Text-channel call must be recovered as a tool_use block")
+        assertTrue(events2.contains { $0.contains("input_json_delta") && $0.contains("ls -la") }, "Recovered call must carry its arguments")
+        assertTrue(events2.contains { $0.contains("\"stop_reason\":\"tool_use\"") }, "Recovered call must force stop_reason tool_use")
+
+        // A call naming a tool the client never offered must NOT be executed —
+        // this is what keeps prose *about* tool syntax from running anything.
+        var guarded = MessageTranslator.OpenAIStreamState()
+        guarded.knownToolNames = ["Read"]
+        _ = MessageTranslator.openAIToAnthropicSSE(chunk: chunk1, model: "local", state: &guarded, enableThinking: false)
+        let guardedEvents = MessageTranslator.openAIToAnthropicSSE(chunk: chunk2, model: "local", state: &guarded, enableThinking: false)
+        assertTrue(!guardedEvents.contains { $0.contains("\"tool_use\"") }, "Un-offered tool names must not be recovered")
+        assertTrue(guardedEvents.contains { $0.contains("\"stop_reason\":\"end_turn\"") }, "Un-recovered turn must stay end_turn")
+    }
+
     // MARK: - Runner
 
     static func runAll() -> Bool {
@@ -580,9 +644,11 @@ final class MessageTranslatorTests {
         testLocalModelSystemPromptToolInjection()
         testLocalModelTextBasedToolExtraction()
         testStreamingLocalModelToolCallExtraction()
+        testInvokeStyleTextToolExtraction()
+        testStreamingTextChannelToolRecovery()
 
         if failedTests.isEmpty {
-            print("\n✅ ALL 13 TEST SUITES PASSED CLEANLY (0 failures)")
+            print("\n✅ ALL 15 TEST SUITES PASSED CLEANLY (0 failures)")
             return true
         } else {
             print("\n❌ \(failedTests.count) TESTS FAILED:")

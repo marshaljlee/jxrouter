@@ -621,6 +621,15 @@ enum MessageTranslator {
         /// the floor estimate for output_tokens when the upstream never sends
         /// a usage chunk (llama-server stream builds omit it).
         var streamedCharCount: Int = 0
+        /// Visible assistant text accumulated across the stream. Consulted
+        /// only at end-of-stream, and only when no structured tool call
+        /// arrived, to recover a call the model wrote into the TEXT channel —
+        /// the "announces a tool, never calls it" failure.
+        var textBuffer: String = ""
+        /// Names of the tools the client actually offered. Recovered
+        /// text-channel calls are filtered against this set so prose that
+        /// merely *documents* tool syntax is never executed as a real call.
+        var knownToolNames: Set<String> = []
 
         /// Preserves backward compatibility for unclosed block inspections.
         var openedBlocks: [Int] {
@@ -942,6 +951,42 @@ enum MessageTranslator {
             }
             state.toolCallsByIndex.removeAll()
 
+            // Text-channel tool-call recovery. A model that cannot drive the
+            // native `tool_calls` field writes the call into its text instead
+            // ("I will now run …", or a <tool_call> / <function=…> / <invoke>
+            // block). The client sees prose, no tool_use block arrives, and the
+            // turn ends having done nothing. Recover it here — gated on NO
+            // structured call having been seen, so every already-working path
+            // is byte-identical — and filtered to names the client offered, so
+            // prose that merely documents tool syntax is never executed.
+            if state.toolCallsByIndex.isEmpty && !state.hasEncounteredToolCall && !state.textBuffer.isEmpty {
+                let recovered = LocalChatTemplateEngine.extractToolCalls(from: state.textBuffer)
+                for tc in recovered.toolCalls {
+                    let name = (tc["name"] as? String)
+                        ?? ((tc["function"] as? [String: Any])?["name"] as? String)
+                        ?? ""
+                    guard !name.isEmpty else { continue }
+                    if !state.knownToolNames.isEmpty && !state.knownToolNames.contains(name) { continue }
+
+                    let blockIdx = state.nextBlockIndex
+                    state.nextBlockIndex += 1
+                    let tcId = (tc["id"] as? String) ?? "call_\(UUID().uuidString.prefix(8))"
+                    let inputObj = (tc["input"] as? [String: Any]) ?? [:]
+                    let argsStr = (try? JSONSerialization.data(withJSONObject: inputObj)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+                    events.append(SSEFormatter.format(
+                        event: "content_block_start",
+                        data: "{\"type\":\"content_block_start\",\"index\":\(blockIdx),\"content_block\":{\"type\":\"tool_use\",\"id\":\(jsonEscape(tcId)),\"name\":\(jsonEscape(name)),\"input\":{}}}"
+                    ))
+                    events.append(SSEFormatter.format(
+                        event: "content_block_delta",
+                        data: "{\"type\":\"content_block_delta\",\"index\":\(blockIdx),\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\(jsonEscape(argsStr))}}"
+                    ))
+                    events.append(SSEFormatter.blockStop(index: blockIdx))
+                    state.hasEncounteredToolCall = true
+                }
+            }
+
             // If nothing was emitted at all, emit a non-empty text block — an
             // EMPTY text block poisons Claude Code transcripts on replay
             // ("text content blocks must be non-empty", claude-code#88536).
@@ -1007,11 +1052,29 @@ enum MessageTranslator {
         let idx = state.activeBlockIndex ?? 0
         let textDelta = SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"text_delta\",\"text\":\(jsonEscape(text))}}")
         events.append(textDelta)
+        // Accumulate for end-of-stream text-channel tool-call recovery.
+        state.textBuffer += text
 
         return events
     }
 
     // MARK: - Helpers
+
+    /// Names of the tools a request offered, in either dialect (Anthropic's
+    /// top-level `name` or OpenAI's `function.name`). Used to filter
+    /// text-channel tool calls so prose that merely documents tool syntax is
+    /// never executed as a real call.
+    static func toolNames(in request: MessagesRequest) -> Set<String> {
+        var names: Set<String> = []
+        for item in (request.json["tools"] as? [Any]) ?? [] {
+            guard let dict = item as? [String: Any] else { continue }
+            if let name = dict["name"] as? String { names.insert(name) }
+            if let fn = dict["function"] as? [String: Any], let name = fn["name"] as? String {
+                names.insert(name)
+            }
+        }
+        return names
+    }
 
     /// JSON-encode a string for embedding in an SSE data payload.
     private static func jsonEscape(_ s: String) -> String {

@@ -578,6 +578,74 @@ enum LocalChatTemplateEngine {
             }
         }
 
+        // Pattern 4: Anthropic-style <invoke name="X"> … </invoke> blocks,
+        // optionally wrapped in <function_calls>. Local models that were
+        // trained on the Claude tool dialect emit this shape — with either
+        // <parameter name="K">V</parameter> or Qwen's <parameter=K>V</parameter>
+        // — instead of the <tool_call> JSON the injected protocol asks for.
+        // Without this the call stays in the transcript as prose and nothing
+        // ever executes: the "announces a tool, never calls it" failure.
+        let invokeRegex = try? NSRegularExpression(pattern: #"<invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)</invoke>"#, options: [])
+        if let matches = invokeRegex?.matches(in: cleanText, options: [], range: NSRange(location: 0, length: cleanText.utf16.count)), !matches.isEmpty {
+            for match in matches.reversed() {
+                defer {
+                    if let fullRange = Range(match.range(at: 0), in: cleanText) {
+                        cleanText.removeSubrange(fullRange)
+                    }
+                }
+                guard let nameRange = Range(match.range(at: 1), in: cleanText),
+                      let bodyRange = Range(match.range(at: 2), in: cleanText) else { continue }
+
+                let name = String(cleanText[nameRange])
+                let body = String(cleanText[bodyRange])
+                var input: [String: Any] = [:]
+
+                // Both parameter dialects, in one pass:
+                //   <parameter name="K">V</parameter>   (Claude dialect)
+                //   <parameter=K>V</parameter>          (Qwen dialect)
+                let paramRegex = try? NSRegularExpression(pattern: #"<parameter(?:\s+name\s*=\s*["']([^"']+)["']|\s*=\s*([^>\s]+))\s*>([\s\S]*?)</parameter>"#, options: [])
+                if let paramMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: body.utf16.count)) {
+                    for pm in paramMatches {
+                        let quotedKey = Range(pm.range(at: 1), in: body)
+                        let bareKey = Range(pm.range(at: 2), in: body)
+                        guard let keyRange = quotedKey ?? bareKey,
+                              let valRange = Range(pm.range(at: 3), in: body) else { continue }
+                        let key = String(body[keyRange])
+                        let valStr = String(body[valRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if let parsed = try? JSONSerialization.jsonObject(with: Data(valStr.utf8)), !(parsed is NSNull) {
+                            input[key] = parsed
+                        } else if valStr.lowercased() == "true" {
+                            input[key] = true
+                        } else if valStr.lowercased() == "false" {
+                            input[key] = false
+                        } else if let num = Double(valStr) {
+                            input[key] = num
+                        } else {
+                            input[key] = valStr
+                        }
+                    }
+                }
+
+                let id = "call_\(UUID().uuidString.prefix(8))"
+                let argsStr = (try? JSONSerialization.data(withJSONObject: input)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                toolCalls.insert([
+                    "id": id,
+                    "type": "function",
+                    "function": [
+                        "name": name,
+                        "arguments": argsStr
+                    ],
+                    "name": name,
+                    "input": input
+                ], at: 0)
+            }
+        }
+        // The <function_calls> wrapper is scaffolding, never content — drop the
+        // surviving tags so they cannot leak into the visible transcript.
+        if !toolCalls.isEmpty {
+            cleanText = cleanText.replacingOccurrences(of: #"</?function_calls>"#, with: "", options: .regularExpression)
+        }
+
         cleanText = cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
         return (cleanText, toolCalls)
     }
