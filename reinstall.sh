@@ -1,14 +1,48 @@
 #!/bin/zsh
 set -eu
 
+# =============================================================================
+# One-Password Design
+# =============================================================================
+# The ONLY password prompt in the normal lifecycle is the CA Certificate trust
+# dialog, which fires once on first launch (the cert persists in the login
+# keychain across reinstalls).  All subsequent reinstalls, fixes, edits,
+# rebuilds, and daily use are prompt-free because:
+#
+#   - DNS hijacking is permanently retired — no /etc/hosts or pf manipulation.
+#     STEP 9 only escalates when leftover hijack blocks actually exist in
+#     /etc/hosts (a no-op on any modern install).
+#   - CA certs in ~/Library/Application Support/JXProxy are PRESERVED across
+#     reinstalls by default, so the app reuses the already-trusted CA and never
+#     re-prompts.  Use --purge to wipe them (forces a re-trust on next launch).
+#   - Keychain entries under the current service (com.marshaljlee.jxrouter)
+#     are NOT deleted — only legacy service names are cleaned up.
+# =============================================================================
+
+PURGE=false
+if [[ "${1:-}" == "--purge" ]]; then
+    PURGE=true
+fi
+
 echo "==========================================="
 echo " 🔄 JXProxy Complete Reinstall"
 echo "==========================================="
 echo ""
+if $PURGE; then
+    echo "Mode: FULL PURGE (CA certs + keychain wiped — will re-prompt for CA trust)"
+else
+    echo "Mode: STANDARD (preserves CA certs + keychain — zero password prompts)"
+fi
+echo ""
 echo "This script will:"
-echo "  1. Completely remove ALL existing JXProxy files"
-echo "  2. Clone the latest version from GitHub"
-echo "  3. Build and install fresh"
+echo "  1. Remove app bundle, shortcuts, CLI launchers, shell config"
+if $PURGE; then
+    echo "  2. PURGE CA certs, host certs, and legacy keychain entries"
+else
+    echo "  2. Preserve CA certs (so CA trust dialog does not re-appear)"
+fi
+echo "  3. Clone the latest version from GitHub"
+echo "  4. Build and install fresh"
 echo ""
 
 # Ask for confirmation
@@ -110,14 +144,28 @@ rm -rf "$BUILD_DIR" 2>/dev/null || true
 echo "   Removed temp files and build artifacts"
 
 # =============================================================================
-# STEP 6: Remove Application Support files (CA certs, host certs)
+# STEP 6: Application Support files (CA certs, host certs)
 # =============================================================================
+# CA certs are PRESERVED in standard mode so the app reuses the already-trusted
+# CA on next launch — no re-trust dialog, no password prompt.
+# Use --purge to wipe them (forces CA regeneration + re-trust on next launch).
 echo ""
-echo "6. Removing Application Support files..."
 JXPROXY_SUPPORT="$HOME/Library/Application Support/JXProxy"
-if [ -d "$JXPROXY_SUPPORT" ]; then
-    rm -rf "$JXPROXY_SUPPORT"
-    echo "   Removed $JXPROXY_SUPPORT (CA certs, host certs)"
+if $PURGE; then
+    echo "6. PURGING Application Support files..."
+    if [ -d "$JXPROXY_SUPPORT" ]; then
+        rm -rf "$JXPROXY_SUPPORT"
+        echo "   Purged $JXPROXY_SUPPORT (CA certs, host certs)"
+    else
+        echo "   (nothing to purge)"
+    fi
+else
+    echo "6. Preserving Application Support (CA certs kept for trust continuity)..."
+    if [ -d "$JXPROXY_SUPPORT" ]; then
+        echo "   Kept $JXPROXY_SUPPORT"
+    else
+        echo "   (no existing CA certs — app will generate on first launch)"
+    fi
 fi
 
 # =============================================================================
@@ -163,33 +211,45 @@ rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
 echo "   Cleaned FIFO pipe, legacy config, and Claude routing settings"
 
 # =============================================================================
-# STEP 9: Remove DNS hijack + pf anchor (requires admin)
+# STEP 9: DNS hijack cleanup (only if leftover hijack blocks exist)
 # =============================================================================
+# DNS hijacking is permanently retired. This step only escalates to admin when
+# /etc/hosts actually contains leftover hijack blocks from old app versions.
+# On any modern install, this is a complete no-op — zero password prompts.
 echo ""
-echo "9. Removing DNS hijack entries (requires admin)..."
-echo "   You may be prompted for your password..."
-
-CLEANUP_SCRIPT=""
-# Strip hijack blocks written by any app version — the current JXProxy marker
-# and the legacy pre-rebrand ProxySwitch marker.
+echo "9. Checking for leftover DNS hijack entries..."
 if grep -qE "DNS Hijack" /etc/hosts 2>/dev/null; then
-    CLEANUP_SCRIPT="$CLEANUP_SCRIPT cp /etc/hosts /etc/hosts.jxproxy.backup; sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts; sed -i '' '/# ProxySwitch DNS Hijack/,/# End ProxySwitch DNS Hijack/d' /etc/hosts;"
-fi
-CLEANUP_SCRIPT="$CLEANUP_SCRIPT /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true;"
-CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/dscacheutil -flushcache 2>/dev/null || true;"
-CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true;"
+    echo "   Found leftover DNS hijack entries — cleaning (requires admin)..."
+    echo "   You may be prompted for your password..."
 
-if [ -n "$CLEANUP_SCRIPT" ]; then
+    # Build the full cleanup script: backup hosts, strip hijack blocks, flush
+    # pf anchor, flush DNS cache. All in ONE admin escalation.
+    CLEANUP_SCRIPT="cp /etc/hosts /etc/hosts.jxproxy.backup;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT sed -i '' '/# ProxySwitch DNS Hijack/,/# End ProxySwitch DNS Hijack/d' /etc/hosts;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/dscacheutil -flushcache 2>/dev/null || true;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true;"
+
     osascript -e "do shell script \"$CLEANUP_SCRIPT\" with administrator privileges" 2>/dev/null && \
         echo "   Removed DNS hijack and pf anchor" || \
         echo "   ⚠️  DNS cleanup skipped (admin not granted)"
+else
+    echo "   No DNS hijack entries found — no admin needed"
+    # Best-effort pf anchor flush without admin (silently fails if not root — harmless)
+    /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true
+    /usr/bin/dscacheutil -flushcache 2>/dev/null || true
 fi
 
 # =============================================================================
-# STEP 10: Remove Keychain entries
+# STEP 10: Clean legacy Keychain entries (does NOT touch current keys)
 # =============================================================================
+# Current API keys live under service "com.marshaljlee.jxrouter" and are
+# PRESERVED. This only removes orphaned entries from old service names
+# (com.jxproxy, com.jxrouter) so they don't linger. These deletes are
+# normally silent (no password dialog).
 echo ""
-echo "10. Removing Keychain entries..."
+echo "10. Cleaning legacy Keychain entries (current keys preserved)..."
 security delete-generic-password -s "com.jxproxy" -a "OPENAI_API_KEY" 2>/dev/null || true
 security delete-generic-password -s "com.jxproxy" -a "OPENROUTER_API_KEY" 2>/dev/null || true
 security delete-generic-password -s "com.jxproxy" -a "OPENCODE_API_KEY" 2>/dev/null || true
@@ -423,6 +483,16 @@ echo ""
 echo "==========================================="
 echo " ✅ JXProxy Reinstall Complete!"
 echo "==========================================="
+echo ""
+if $PURGE; then
+    echo "   ⚠️  PURGE mode: CA was wiped — you will be prompted"
+    echo "   ONE TIME on next launch to trust the new CA certificate."
+    echo "   After that, all future reinstalls are prompt-free."
+else
+    echo "   ✅ Standard mode: CA trust preserved — zero password prompts."
+    echo "   If this is your first install, you'll get ONE prompt to trust"
+    echo "   the CA certificate on first launch. After that: never again."
+fi
 echo ""
 echo "   Launch:      jxserver"
 echo "   Claude Code: jxclaude"

@@ -98,16 +98,26 @@ echo "6. Cleaning up build artifacts..."
 rm -rf /tmp/JXRouterBuild 2>/dev/null || true
 
 echo ""
-echo "7. DNS hijack cleanup (requires admin)..."
-echo "   Removing any leftover DNS hijack entries (current + legacy ProxySwitch)..."
-# The app no longer installs these, but old versions may have left blocks in
-# /etc/hosts (both the JXProxy marker and the pre-rebrand ProxySwitch marker)
-# plus a pf redirect anchor. Strip them all so the system is left untouched.
-sudo sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts 2>/dev/null || true
-sudo sed -i '' '/# ProxySwitch DNS Hijack/,/# End ProxySwitch DNS Hijack/d' /etc/hosts 2>/dev/null || true
-sudo /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true
-sudo dscacheutil -flushcache 2>/dev/null || true
-sudo killall -HUP mDNSResponder 2>/dev/null || true
+echo "7. DNS hijack cleanup..."
+# DNS hijacking is permanently retired. Only escalate when /etc/hosts
+# actually contains leftover hijack blocks from old app versions.
+# On a modern install this is a complete no-op — zero password prompts.
+if grep -qE "DNS Hijack" /etc/hosts 2>/dev/null; then
+    echo "   Found leftover DNS hijack entries — cleaning (requires admin)..."
+    echo "   You may be prompted for your password..."
+    CLEANUP_SCRIPT="cp /etc/hosts /etc/hosts.jxproxy.backup;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT sed -i '' '/# JXProxy DNS Hijack/,/# End JXProxy DNS Hijack/d' /etc/hosts;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT sed -i '' '/# ProxySwitch DNS Hijack/,/# End ProxySwitch DNS Hijack/d' /etc/hosts;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/dscacheutil -flushcache 2>/dev/null || true;"
+    CLEANUP_SCRIPT="$CLEANUP_SCRIPT /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true;"
+    osascript -e "do shell script \"$CLEANUP_SCRIPT\" with administrator privileges" 2>/dev/null && \
+        echo "   Removed DNS hijack and pf anchor" || \
+        echo "   ⚠️  DNS cleanup skipped (admin not granted)"
+else
+    echo "   No DNS hijack entries found — no admin needed"
+    /sbin/pfctl -a com.apple/250.jxproxy -F all 2>/dev/null || true
+fi
 
 echo ""
 echo "==========================================="
