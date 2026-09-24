@@ -620,6 +620,30 @@ else
 
     if [ "$PROXY_UP" -eq 1 ]; then
         echo "   proxy:     listening on http://127.0.0.1:${JXPROXY_PORT}"
+
+        # /v1/models answers as soon as the listener is bound, so it proves the
+        # proxy is up but NOT that it can serve: with no model loaded it still
+        # returns 200 while every real request comes back 503 "All providers
+        # failed". Ask for a single token to tell "reachable" from "running" --
+        # otherwise this script prints "Installation Complete" over a proxy that
+        # fails every call, and the failure only shows up at first use.
+        MODEL_CODE=$(curl -s -m 20 -o /dev/null -w '%{http_code}' \
+            -X POST "http://127.0.0.1:${JXPROXY_PORT}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${JXPROXY_AUTH_TOKEN}" \
+            -d '{"model":"local","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+            2>/dev/null || true)
+        MODEL_CODE="${MODEL_CODE:-000}"
+        case "$MODEL_CODE" in
+            2*)
+                echo "   model:     serving"
+                ;;
+            *)
+                echo "   WARN: the proxy is up but a test completion returned HTTP ${MODEL_CODE}." >&2
+                echo "         No model is loaded, so every request will fail until you open" >&2
+                echo "         the menu-bar icon and press Start." >&2
+                ;;
+        esac
     else
         echo "   WARN: the app launched but the proxy is not answering on port ${JXPROXY_PORT} yet." >&2
         echo "         Open the menu-bar icon and press Start." >&2
