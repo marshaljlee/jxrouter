@@ -612,10 +612,12 @@ enum MessageTranslator {
         var insideInlineThink: Bool = false
         var insideInlineToolCall: Bool = false
         var toolCallBuffer: String = ""
-        /// Trailing partial opening-marker bytes held back from text emission.
-        /// Opening tags split across delta chunks (one token per chunk) would
-        /// otherwise leak as visible text; this buffer holds the partial
-        /// prefix and prepends it to the next chunk.
+        /// Trailing partial marker bytes held back from emission. Tags split
+        /// across delta chunks (one token per chunk) would otherwise be
+        /// consumed as ordinary content and could never reassemble — an
+        /// opening tag would leak as visible text, and a closing `</think>`
+        /// would strand the stream inside the thinking block forever. This
+        /// buffer holds the partial bytes and prepends them to the next chunk.
         var pendingMarkerSuffix: String = ""
         /// Total characters streamed as visible text/thinking/tool-arg deltas —
         /// the floor estimate for output_tokens when the upstream never sends
@@ -742,9 +744,19 @@ enum MessageTranslator {
 
                         contentToProcess = parts.dropFirst().joined(separator: "</think>")
                     } else {
-                        // All content in this chunk is thinking
-                        if let idx = state.activeBlockIndex {
-                            events.append(SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\(jsonEscape(contentToProcess))}}"))
+                        // All content in this chunk is thinking — except a
+                        // trailing partial `</think>`, which must be held back.
+                        // Emitting it here consumes the fragment as thinking
+                        // text, so the closing tag can never reassemble: the
+                        // block then stays open for the rest of the stream and
+                        // swallows every later block — including a tool call
+                        // the model wrote as text — leaving the client with no
+                        // tool_use, no visible text, and stop_reason end_turn.
+                        let hold = Self.splitHoldLength(contentToProcess, marker: "</think>")
+                        let emitPart = hold > 0 ? String(contentToProcess.dropLast(hold)) : contentToProcess
+                        if hold > 0 { state.pendingMarkerSuffix = String(contentToProcess.suffix(hold)) }
+                        if !emitPart.isEmpty, let idx = state.activeBlockIndex {
+                            events.append(SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\(jsonEscape(emitPart))}}"))
                         }
                         contentToProcess = ""
                     }
@@ -769,6 +781,14 @@ enum MessageTranslator {
                         state.insideInlineThink = false
                         contentToProcess = parts.dropFirst().joined(separator: "</think>")
                     } else {
+                        // The thinking text is being stripped, but a trailing
+                        // partial `</think>` still has to be carried into the
+                        // next chunk. Dropping it means the closing tag can
+                        // never reassemble, `insideInlineThink` stays true for
+                        // the rest of the stream, and everything after it is
+                        // silently discarded — tool calls included.
+                        let hold = Self.splitHoldLength(contentToProcess, marker: "</think>")
+                        if hold > 0 { state.pendingMarkerSuffix = String(contentToProcess.suffix(hold)) }
                         contentToProcess = ""
                     }
                 }
@@ -839,21 +859,9 @@ enum MessageTranslator {
                 // reassembles it. Without this, per-token streaming leaks tag
                 // fragments into the transcript.
                 var holdLength = 0
-                let openMarkers = ["<tool_call>", "<think>"]
                 if !state.insideInlineToolCall && !state.insideInlineThink {
-                    for marker in openMarkers {
-                        let maxOverlap = min(marker.count - 1, contentToProcess.count)
-                        if maxOverlap > 0 {
-                            let tail = String(contentToProcess.suffix(maxOverlap))
-                            // Longest suffix of content that is a prefix of marker
-                            for len in stride(from: maxOverlap, through: 1, by: -1) {
-                                let tailPiece = String(contentToProcess.suffix(len))
-                                if marker.hasPrefix(tailPiece) {
-                                    holdLength = max(holdLength, len)
-                                    break
-                                }
-                            }
-                        }
+                    for marker in ["<tool_call>", "<think>"] {
+                        holdLength = max(holdLength, Self.splitHoldLength(contentToProcess, marker: marker))
                     }
                 }
                 if holdLength > 0 {
@@ -930,11 +938,17 @@ enum MessageTranslator {
 
         // 4. Stream Finish / Completion
         if let finishReason {
-            // Flush any held-back partial opening marker at end-of-stream —
-            // it never completed into a real tag, so it is ordinary text and
-            // must not be silently dropped.
+            // Flush any held-back partial marker at end-of-stream — it never
+            // completed into a real tag, so it is ordinary content and must not
+            // be silently dropped. If a thinking block is still open, that
+            // content belongs to the thinking channel rather than to a new
+            // text block.
             if !state.pendingMarkerSuffix.isEmpty, !state.insideInlineToolCall {
-                events.append(contentsOf: emitTextChunk(state.pendingMarkerSuffix, state: &state))
+                if state.activeBlockType == "thinking", let idx = state.activeBlockIndex {
+                    events.append(SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\(jsonEscape(state.pendingMarkerSuffix))}}"))
+                } else {
+                    events.append(contentsOf: emitTextChunk(state.pendingMarkerSuffix, state: &state))
+                }
                 state.pendingMarkerSuffix = ""
             }
 
@@ -1059,6 +1073,22 @@ enum MessageTranslator {
     }
 
     // MARK: - Helpers
+
+    /// Length of the longest trailing suffix of `text` that is a proper prefix
+    /// of `marker` — the bytes that must be held back because the marker is only
+    /// partially delivered and will complete in a later chunk.
+    ///
+    /// Every marker needs this, not just the opening ones: a tag split across
+    /// delta chunks is otherwise consumed as ordinary content, can never
+    /// reassemble, and the block it should have opened or closed is stranded.
+    private static func splitHoldLength(_ text: String, marker: String) -> Int {
+        let maxOverlap = min(marker.count - 1, text.count)
+        guard maxOverlap > 0 else { return 0 }
+        for len in stride(from: maxOverlap, through: 1, by: -1) {
+            if marker.hasPrefix(String(text.suffix(len))) { return len }
+        }
+        return 0
+    }
 
     /// Names of the tools a request offered, in either dialect (Anthropic's
     /// top-level `name` or OpenAI's `function.name`). Used to filter

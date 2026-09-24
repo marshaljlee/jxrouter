@@ -628,6 +628,71 @@ final class MessageTranslatorTests {
         assertTrue(guardedEvents.contains { $0.contains("\"stop_reason\":\"end_turn\"") }, "Un-recovered turn must stay end_turn")
     }
 
+    /// The follow-up report: "it just simply stopped again" — with the same
+    /// model output as above, but this time delivered as a real token stream.
+    ///
+    /// Streaming sends one token per delta, so `</think>` routinely straddles
+    /// two chunks. The leading fragment was emitted as thinking text, which
+    /// meant the closing tag could never reassemble: `insideInlineThink` stayed
+    /// true for the rest of the stream and every later block — including the
+    /// model's text-channel tool call — was swallowed into the thinking
+    /// channel. The client got no tool_use, no visible text, and
+    /// `stop_reason: end_turn`.
+    static func testSplitThinkTagDoesNotSwallowFollowingToolCall() {
+        print("▶️ Running testSplitThinkTagDoesNotSwallowFollowingToolCall...")
+
+        let modelText = """
+        <think>
+        Plan: call the Skill tool.
+        </think>
+
+        <tool_call>
+        <function=Skill>
+        <parameter=command>
+        find-skills
+        </parameter>
+        </function>
+        </tool_call>
+        """
+
+        /// Pull the JSON payload out of an "event: …\ndata: {…}\n\n" envelope.
+        func payload(_ event: String) -> [String: Any]? {
+            for line in event.split(separator: "\n") where line.hasPrefix("data: ") {
+                guard let data = String(line.dropFirst(6)).data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                return obj
+            }
+            return nil
+        }
+
+        var state = MessageTranslator.OpenAIStreamState()
+        state.knownToolNames = ["Skill", "Read"]
+
+        var toolUseBlocks = 0
+        var visibleText = ""
+        // One character per delta — the worst case for split-marker recovery,
+        // and a superset of real token-by-token streaming.
+        for character in modelText {
+            let chunk: [String: Any] = [
+                "choices": [["delta": ["content": String(character)], "finish_reason": NSNull()]]
+            ]
+            let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunk, model: "local", state: &state, enableThinking: true)
+            toolUseBlocks += events.filter { $0.contains("\"type\":\"tool_use\"") }.count
+            visibleText += events.compactMap { payload($0)?["delta"] as? [String: Any] }.compactMap { $0["text"] as? String }.joined()
+        }
+
+        assertTrue(!state.insideInlineThink, "Thinking block must close even when </think> is split across chunks")
+        assertTrue(!visibleText.contains("<think>"), "<think> must never leak into visible text")
+        assertTrue(!visibleText.contains("</think>"), "</think> must never leak into visible text")
+
+        let finish: [String: Any] = ["choices": [["delta": [:], "finish_reason": "stop"]]]
+        let endEvents = MessageTranslator.openAIToAnthropicSSE(chunk: finish, model: "local", state: &state, enableThinking: true)
+        toolUseBlocks += endEvents.filter { $0.contains("\"type\":\"tool_use\"") }.count
+
+        assertEqual(toolUseBlocks, 1, "Exactly one tool_use block must survive a split </think>")
+        assertTrue(endEvents.contains { $0.contains("\"stop_reason\":\"tool_use\"") }, "Split-</think> turn must end in tool_use")
+    }
+
     // MARK: - Runner
 
     static func runAll() -> Bool {
@@ -646,9 +711,10 @@ final class MessageTranslatorTests {
         testStreamingLocalModelToolCallExtraction()
         testInvokeStyleTextToolExtraction()
         testStreamingTextChannelToolRecovery()
+        testSplitThinkTagDoesNotSwallowFollowingToolCall()
 
         if failedTests.isEmpty {
-            print("\n✅ ALL 15 TEST SUITES PASSED CLEANLY (0 failures)")
+            print("\n✅ ALL 16 TEST SUITES PASSED CLEANLY (0 failures)")
             return true
         } else {
             print("\n❌ \(failedTests.count) TESTS FAILED:")
