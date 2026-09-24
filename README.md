@@ -15,11 +15,18 @@ A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, C
 ## Quick start
 
 ```bash
-./install.sh   # builds the app, installs to /Applications, creates jxclaude / jxcodex launchers in ~/.local/bin, configures shell PATH
-open /Applications/JXRouter.app
+./install.sh
 ```
 
-Click the **JXProxy** menu-bar icon → **Start**.
+That is the whole install — one command, nothing to click afterwards. It builds the app,
+installs to `/Applications`, creates the `jxclaude` / `jxcodex` / `jxpi` launchers in
+`~/.local/bin`, configures the shell PATH, arms auto-start, launches the app, and then
+waits until the proxy actually answers on port 5255. When the script exits, the proxy is
+live.
+
+Re-running it is how you deploy a rebuild: it stops any running instance first, so the
+binary that ends up running is always the one just built. Set `JX_NO_AUTOSTART=1` to
+install without launching (CI, or a deliberate manual start).
 
 ## Setup
 

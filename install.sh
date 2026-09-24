@@ -98,13 +98,38 @@ else
         EXTRA_FLAGS=("OTHER_SWIFT_FLAGS=${JX_SWIFT_FLAGS}")
     fi
 
-    if ! xcodebuild -project "$ROOT/JXRouter.xcodeproj" -scheme JXRouter \
-        -configuration Release \
-        ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
-        SYMROOT="$BUILD_ROOT" "${EXTRA_FLAGS[@]}" > "$BUILD_LOG" 2>&1; then
-        echo "Build failed! Last 40 lines of $BUILD_LOG:" >&2
-        tail -40 "$BUILD_LOG" >&2
-        exit 1
+    run_build() {
+        xcodebuild -project "$ROOT/JXRouter.xcodeproj" -scheme JXRouter \
+            -configuration Release \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            SYMROOT="$BUILD_ROOT" "$@" > "$BUILD_LOG" 2>&1
+    }
+
+    if ! run_build "${EXTRA_FLAGS[@]}"; then
+        # The Swift compiler spawns its macro plugin server through sandbox-exec.
+        # Under an agent or CI harness that refuses the nested sandbox_apply,
+        # EVERY @Observable type fails to expand with:
+        #   sandbox-exec: sandbox_apply: Operation not permitted
+        #   external macro implementation type 'ObservationMacros.ObservableMacro'
+        #   could not be found for macro 'Observable()'
+        # That is the environment, not the source, so retry once with the
+        # compiler's plugin sandbox disabled instead of making the user find
+        # JX_SWIFT_FLAGS themselves. A normal desktop build never gets here.
+        if [ -z "${JX_SWIFT_FLAGS:-}" ] \
+            && grep -qE "sandbox_apply|ObservableMacro" "$BUILD_LOG" 2>/dev/null; then
+            echo "   Build hit the Swift macro sandbox limit — retrying with -disable-sandbox..."
+            if run_build OTHER_SWIFT_FLAGS="-disable-sandbox"; then
+                echo "   Retry succeeded (build was sandbox-limited, not broken)."
+            else
+                echo "Build failed! Last 40 lines of $BUILD_LOG:" >&2
+                tail -40 "$BUILD_LOG" >&2
+                exit 1
+            fi
+        else
+            echo "Build failed! Last 40 lines of $BUILD_LOG:" >&2
+            tail -40 "$BUILD_LOG" >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -380,15 +405,25 @@ cat > "$LOCAL_BIN/jxserver" << 'LAUNCHER'
 
 if [ "$1" = "--headless" ]; then
     echo "🚀 JXProxy: Starting proxy server in background (headless)..."
+    # Arm auto-start first: `open` alone only brings the menu-bar app up, it
+    # does not start the listener, so this used to leave the proxy down until
+    # someone clicked the icon.
+    defaults write com.marshaljlee.jxrouter autoStartProxy -bool true 2>/dev/null || true
     nohup open "/Applications/JXRouter.app" > /dev/null 2>&1 &
     echo "   PID: $!"
 else
     echo "🚀 JXProxy: Starting proxy server..."
+    defaults write com.marshaljlee.jxrouter autoStartProxy -bool true 2>/dev/null || true
     open "/Applications/JXRouter.app"
 fi
-echo "   Use the menu bar icon to control JXProxy."
 echo "   Default proxy port: ${JXPROXY_PORT:-5255}"
 echo "   Auth token: ${JXPROXY_AUTH_TOKEN:-jxproxy}"
+echo ""
+if pgrep -x JXRouter >/dev/null 2>&1; then
+    echo "   JXRouter is running — control it from the menu bar icon."
+else
+    echo "   WARN: JXRouter is not running; check ~/.jxrouter/logs/engine.log" >&2
+fi
 echo ""
 echo "   To use Claude Code via JXProxy:"
 echo "     jxclaude"
@@ -526,12 +561,81 @@ if [ "$VERIFY_FAIL" -ne 0 ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 9. Start it. One command, end to end.
+#
+# A build that is installed but not running is not an install. This script
+# previously stopped at "you can launch it by running open ...", leaving the
+# user to launch the app AND then click the menu-bar icon -> Start. Three
+# steps -- and an easy way to believe a rebuild took effect while the OLD
+# binary was still the one running.
+#
+# Two things make the launch automatic:
+#   - killall first. `open` on an already-running app just activates the old
+#     process, so a rebuild silently keeps running the previous build.
+#   - autoStartProxy=true. The app reads this in applicationDidFinishLaunching
+#     and calls startProxy() itself, so no menu-bar click is needed.
+# Set JX_NO_AUTOSTART=1 to install without launching (CI, or a manual start).
+# ---------------------------------------------------------------------------
+echo ""
+if [ -n "${JX_NO_AUTOSTART:-}" ]; then
+    echo "9. Skipping auto-start (JX_NO_AUTOSTART is set)."
+    echo "   Start it later with: jxserver"
+else
+    echo "9. Starting JXProxy..."
+
+    # Replace any running instance so the binary that ends up running IS the
+    # one just installed.
+    if pgrep -x JXRouter >/dev/null 2>&1; then
+        killall JXRouter 2>/dev/null || true
+        # Wait for the process (and its port) to actually go away before
+        # relaunching, otherwise the new instance can lose the race for the
+        # port and come up with routing disabled.
+        for _ in $(seq 1 40); do
+            pgrep -x JXRouter >/dev/null 2>&1 || break
+            sleep 0.25
+        done
+        echo "   stopped the previous instance"
+    fi
+
+    # Arm auto-start BEFORE launching, so the very first launch already has it.
+    # Not sandboxed, so UserDefaults.standard is the plain bundle-id domain.
+    defaults write com.marshaljlee.jxrouter autoStartProxy -bool true 2>/dev/null || true
+
+    open "/Applications/JXRouter.app" 2>/dev/null || true
+
+    # Poll until the proxy actually answers. Launch is asynchronous and the
+    # in-process engine takes a moment to bind, so a bare `open` proves
+    # nothing -- this is the difference between "started" and "running".
+    PROXY_UP=0
+    for _ in $(seq 1 60); do
+        if curl -fsS -m 2 -o /dev/null \
+            -H "Authorization: Bearer ${JXPROXY_AUTH_TOKEN}" \
+            "http://127.0.0.1:${JXPROXY_PORT}/v1/models" 2>/dev/null; then
+            PROXY_UP=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$PROXY_UP" -eq 1 ]; then
+        echo "   proxy:     listening on http://127.0.0.1:${JXPROXY_PORT}"
+    else
+        echo "   WARN: the app launched but the proxy is not answering on port ${JXPROXY_PORT} yet." >&2
+        echo "         Open the menu-bar icon and press Start." >&2
+        echo "         If it keeps failing, check: ~/.jxrouter/logs/engine.log" >&2
+    fi
+fi
+
 echo ""
 echo "==========================================="
 echo " ✅ JXProxy Installation Complete!"
 echo "==========================================="
 echo ""
 echo " JXProxy is now installed in /Applications/JXRouter.app"
+if [ -z "${JX_NO_AUTOSTART:-}" ]; then
+    echo " and running on port ${JXPROXY_PORT}."
+fi
 echo ""
 echo " CLI Commands:"
 echo "   jxserver         Open JXProxy from terminal"
@@ -541,9 +645,6 @@ echo "   jxpi             Launch Pi Coding Agent through JXProxy"
 echo ""
 echo " Default port: ${JXPROXY_PORT}"
 echo " Auth token:   ${JXPROXY_AUTH_TOKEN}"
-echo ""
-echo " You can launch it by running: open /Applications/JXRouter.app"
-echo " Or click the desktop shortcut: JXProxy"
 echo ""
 echo " For VS Code Claude Code extension, add to settings.json:"
 echo '   "claudeCode.environmentVariables": ['
