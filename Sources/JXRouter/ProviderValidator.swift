@@ -30,23 +30,38 @@ struct ProviderValidator {
         if apiKey.isEmpty {
             let preset = ProviderPreset.preset(for: providerId)
             if let preset, !preset.requiresKey { return ProviderCheckResult(ok: true, message: "Connected") }
-            // Providers that require a key but have none entered would only
-            // fail with a raw 401 ("authorization was missing", "no tenant
-            // context", …). Say what's wrong instead of running the request.
-            // Local endpoints (custom providers pointing at 127.0.0.1 etc.) are
-            // exempt — a llama.app / Ollama server needs no auth at all.
             if (preset?.requiresKey ?? true), !isLocalEndpoint(baseUrl) {
                 return ProviderCheckResult(ok: false, message: "No API key entered — add it in Settings → Providers")
             }
         }
-        let urlStr = baseUrl.hasSuffix("/v1") ? baseUrl : baseUrl + "/v1"
-        guard let url = URL(string: urlStr + "/models") else {
+        
+        let urlStr: String
+        if providerId == "direct" || baseUrl.contains("api.anthropic.com") {
+            urlStr = baseUrl.hasSuffix("/v1") ? baseUrl + "/models" : baseUrl + "/v1/models"
+        } else if providerId == "gemini" && !baseUrl.contains("/openai") {
+            urlStr = baseUrl.hasSuffix("/") ? baseUrl + "models" : baseUrl + "/models"
+        } else {
+            urlStr = baseUrl.hasSuffix("/v1") ? baseUrl + "/models" : baseUrl + "/v1/models"
+        }
+
+        guard let url = URL(string: urlStr) else {
             return ProviderCheckResult(ok: false, message: "Invalid base URL")
         }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         if !apiKey.isEmpty {
-            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            if providerId == "direct" || baseUrl.contains("api.anthropic.com") {
+                req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else if providerId == "gemini" && !baseUrl.contains("/openai") {
+                req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            } else {
+                req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
+        }
+        if providerId == "openrouter" || baseUrl.contains("openrouter.ai") {
+            req.setValue("https://github.com/marshaljlee/jxproxy", forHTTPHeaderField: "HTTP-Referer")
+            req.setValue("JXProxy", forHTTPHeaderField: "X-Title")
         }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -69,39 +84,65 @@ struct ProviderValidator {
     /// or a model that doesn't exist on a custom endpoint).
     static func validateModel(providerId: String, model: String, apiKey: String, baseUrl: String) async -> ProviderCheckResult {
         guard !model.isEmpty else { return ProviderCheckResult(ok: false, message: "No model selected") }
-        // Same missing-key guard as validateKey: without an API key the request
-        // is guaranteed to 401, so surface the real problem (empty key) instead
-        // of the provider's raw "Header of type authorization was missing".
-        // Local endpoints are exempt — they serve without any auth.
         if apiKey.isEmpty {
             let preset = ProviderPreset.preset(for: providerId)
-            // Custom (named) providers always require a key — preset lookup
-            // returns nil for them, which is treated as "needs a key".
             if (preset?.requiresKey ?? true), !isLocalEndpoint(baseUrl) {
-                // Name the provider: on the General tab the tier may be routed
-                // to a provider the user never entered a key for, and a bare
-                // "no API key entered" reads as if the app lost their key.
                 let name = preset?.name ?? providerId
                 return ProviderCheckResult(ok: false, message: "No API key entered for \(name) — add it in Settings → Providers")
             }
         }
-        let urlStr = baseUrl.hasSuffix("/v1") ? baseUrl : baseUrl + "/v1"
-        guard let url = URL(string: urlStr + "/chat/completions") else {
+
+        let isAnthropic = providerId == "direct" || baseUrl.contains("api.anthropic.com")
+        let urlStr: String
+        if isAnthropic {
+            urlStr = baseUrl.hasSuffix("/v1") ? baseUrl + "/messages" : baseUrl + "/v1/messages"
+        } else if providerId == "gemini" && !baseUrl.contains("/openai") {
+            urlStr = baseUrl.hasSuffix("/v1") ? baseUrl + "/chat/completions" : baseUrl + "/v1/chat/completions"
+        } else {
+            urlStr = baseUrl.hasSuffix("/v1") ? baseUrl + "/chat/completions" : baseUrl + "/v1/chat/completions"
+        }
+
+        guard let url = URL(string: urlStr) else {
             return ProviderCheckResult(ok: false, message: "Invalid base URL")
         }
 
-        let body: [String: Any] = [
-            "model": model,
-            "messages": [["role": "user", "content": "ping"]],
-            "max_tokens": 1,
-        ]
+        let body: [String: Any]
+        if isAnthropic {
+            body = [
+                "model": model,
+                "max_tokens": 1,
+                "messages": [["role": "user", "content": "ping"]]
+            ]
+        } else {
+            body = [
+                "model": model,
+                "messages": [["role": "user", "content": "ping"]],
+                "max_tokens": 1,
+            ]
+        }
+
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 12
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
         if !apiKey.isEmpty {
-            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            if isAnthropic {
+                req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else if providerId == "gemini" && !baseUrl.contains("/openai") {
+                req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+                req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            } else {
+                req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
         }
+
+        if providerId == "openrouter" || baseUrl.contains("openrouter.ai") {
+            req.setValue("https://github.com/marshaljlee/jxproxy", forHTTPHeaderField: "HTTP-Referer")
+            req.setValue("JXProxy", forHTTPHeaderField: "X-Title")
+        }
+
         if providerId.hasPrefix("opencode") || baseUrl.contains("opencode.ai") {
             let sessionId = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
             let requestId = "req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)

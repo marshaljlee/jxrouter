@@ -4066,9 +4066,23 @@ struct SettingsView: View {
         tierFetchStates[tier.rawValue] = .fetching
         do {
             var req = URLRequest(url: url)
-            req.timeoutInterval = 4
+            req.timeoutInterval = 8
             let key = apiKeyForProvider(pid)
-            if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+            if !key.isEmpty {
+                if pid == "direct" || baseUrl.contains("api.anthropic.com") {
+                    req.setValue(key, forHTTPHeaderField: "x-api-key")
+                    req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                } else if pid == "gemini" && !baseUrl.contains("/openai") {
+                    req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+                    req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                } else {
+                    req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                }
+            }
+            if pid == "openrouter" || baseUrl.contains("openrouter.ai") {
+                req.setValue("https://github.com/marshaljlee/jxproxy", forHTTPHeaderField: "HTTP-Referer")
+                req.setValue("JXProxy", forHTTPHeaderField: "X-Title")
+            }
             let (data, _) = try await URLSession(configuration: .ephemeral).data(for: req)
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 await MainActor.run {
