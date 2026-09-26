@@ -9,6 +9,34 @@ sessions. Newest entries on top. `get_project_briefing` reads the sections below
 JXRouter (JXProxy) — a macOS menu-bar proxy app that routes AI API traffic (Claude Code, Codex, OpenAI SDK clients) through configured LLM providers. Native SwiftUI/AppKit, no web admin, no /etc/hosts edits.
 ## Recent Changes
 
+- 2026-09-26: Edge case resilience, proxy pipeline async unblocking, chat session persistence, and UI rendering upgrade:
+  1. **Proxy Pipeline Async Unblocking**: Replaced blocking `DispatchSemaphore.wait` in `ProxyServer.waitForBody` with cooperative async task continuation (`withCheckedThrowingContinuation` + `ReceiveContinuationState` actor) to prevent GCD thread pool starvation under concurrent request loads.
+  2. **Unclosed `<think>` & Tool Extraction Edge Cases**:
+     - Fixed trailing unclosed `<think>` tags when upstream models hit max completion tokens, properly capturing truncated reasoning into `thinking` blocks instead of leaking into visible text.
+     - Handled upstream pre-parsed `[String: Any]` dictionary tool arguments and `"parameters"` payload keys in `MessageTranslator.swift`.
+     - Added markdown code-fenced JSON tool call extraction (```` ```json {"name": "...", "arguments": ...} ``` ````) in `LocalChatTemplateEngine.swift`.
+  3. **Rich UI Renders & Persistence in `ClaudeChatView.swift`**:
+     - Markdown code fence parser with dedicated `CodeBlockView` featuring monospaced layout, language badge, and one-click copy button.
+     - Collapsible `ThinkingDisclosureView` with word count chips and accordion toggle.
+     - Expandable tool call chips with structured JSON parameter views.
+     - Full message persistence across sessions via `DataStore.saveMessages` and `DataStore.loadMessages`.
+  4. Test suite expanded: Verified clean execution across all test suites with 0 failures.
+
+- 2026-09-24: Stream parser resilience, local tool call extraction, and install automation:
+  1. **Split `</think>` streaming tag recovery**: Fixed streaming chunks where `</think>` straddled token deltas causing `insideInlineThink` to stay open and swallow subsequent stream output (including tool calls). Added `splitHoldLength` prefix hold-backs and trailing fragment flush routing in `MessageTranslator.swift`.
+  2. **Text-based tool call recovery**: Handled local model dialects outputting raw text tool invocations (e.g. `<invoke name="X"><parameter=K>v</parameter></invoke>`). Buffered visible text in `openAIToAnthropicSSE` to extract structured `tool_use` blocks and set `stop_reason = .toolUse`.
+  3. **Single-step, self-healing installation & reinstallation**:
+     - `install.sh`: Automatically terminates stale instances, arms `autoStartProxy`, launches the app, and confirms the model backend is actually answering tokens (not merely listening on port).
+     - `reinstall.sh`: Preserves CA certificates and Keychain entries across reinstalls; added `--purge` for clean wipes, with privilege escalation limited to genuine `/etc/hosts` changes.
+  4. Test suite expanded: 85 → 97 tests, 0 failures.
+
+- 2026-09-23: Keychain migration resilience, in-process engine safeguards, and runtime fixes:
+  1. **Custom provider Keychain recovery**: Replaced one-shot service-level migration latch with granular `(service, account)` tracking, preventing newly added custom providers from being orphaned in legacy Keychain namespaces. Distinguished `notFound` from authorization/timeout errors in `ServiceReadResult`. Protected provider configuration from accidental pruning on decode failure.
+  2. **In-process engine self-termination fix**: Guarded `killProcessOnPort` against sending `SIGKILL` to JXRouter's own PID when hosting the in-process llama engine. Raised engine health check budget to 180s.
+  3. **Clean status menu termination**: Addressed AppKit `terminate:` calling C++ static destructors that triggered `ggml_metal_device_free` abort crashes on Quit.
+  4. **Llama runtime updater fix**: Replaced `FileManager.replaceItemAt` symlink dereference with atomic `rename(2)` in `LlamaRuntime.swift`.
+  5. **Process sweep hygiene**: Changed broad `pkill -f ollama` to exact name match (`pgrep -x`) in `LocalModelManager.swift`.
+
 - 2026-09-22: Re-established the JXRouter bundle name and finalized the app for release:
   1. **Bundle identifier is now `com.marshaljlee.jxrouter`** (was `com.jxproxy`). The Keychain service follows it: `KeychainManager.service = "com.marshaljlee.jxrouter"`, with `legacyService = "com.jxproxy"` kept adjacent so the rename and its migration can't drift apart.
   2. **Migration is per-service, not a one-shot boolean.** `ConfigManager.migrateLegacyKeychainServices()` sweeps `[com.jxproxy, com.jxrouter-g, com.proxyswitch]` newest-first, recording each swept name in `migratedLegacyKeychainServices`. A boolean latch would have been wrong here: installs that already latched it would skip a newly added legacy service, so the old flag is adopted once (converted to the two pre-`com.jxproxy` names) and then removed. Copy is gaps-only, never overwrites, and leaves source items in place.

@@ -415,7 +415,7 @@ enum LocalChatTemplateEngine {
 
     /// Parses Qwen XML tool format: <function=NAME><parameter=KEY>VALUE</parameter></function>
     static func parseQwenXmlToolCall(from text: String) -> (name: String, input: [String: Any])? {
-        let fnRegex = try? NSRegularExpression(pattern: #"<function=([^>\s]+)>\s*([\s\S]*?)\s*</function>"#, options: [])
+        let fnRegex = try? NSRegularExpression(pattern: #"<function\s*=\s*["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</function>"#, options: [])
         guard let match = fnRegex?.firstMatch(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)),
               let nameRange = Range(match.range(at: 1), in: text),
               let bodyRange = Range(match.range(at: 2), in: text) else {
@@ -426,29 +426,49 @@ enum LocalChatTemplateEngine {
         let body = String(text[bodyRange])
         var input: [String: Any] = [:]
 
-        let paramRegex = try? NSRegularExpression(pattern: #"<parameter=([^>\s]+)>\s*([\s\S]*?)\s*</parameter>"#, options: [])
+        let paramRegex = try? NSRegularExpression(pattern: #"<parameter(?:\s+name\s*=\s*["']([^"']+)["']|\s*=\s*([^>\s]+))\s*>([\s\S]*?)</parameter>"#, options: [])
         if let paramMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: body.utf16.count)) {
             for pm in paramMatches {
-                if let keyRange = Range(pm.range(at: 1), in: body),
-                   let valRange = Range(pm.range(at: 2), in: body) {
-                    let key = String(body[keyRange])
-                    let valStr = String(body[valRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let parsed = try? JSONSerialization.jsonObject(with: Data(valStr.utf8)), !(parsed is NSNull) {
-                        input[key] = parsed
-                    } else if valStr.lowercased() == "true" {
-                        input[key] = true
-                    } else if valStr.lowercased() == "false" {
-                        input[key] = false
-                    } else if let num = Double(valStr) {
-                        input[key] = num
-                    } else {
-                        input[key] = valStr
-                    }
+                let quotedKey = Range(pm.range(at: 1), in: body)
+                let bareKey = Range(pm.range(at: 2), in: body)
+                guard let keyRange = quotedKey ?? bareKey,
+                      let valRange = Range(pm.range(at: 3), in: body) else { continue }
+                let key = String(body[keyRange])
+                let valStr = String(body[valRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if let parsed = try? JSONSerialization.jsonObject(with: Data(valStr.utf8)), !(parsed is NSNull) {
+                    input[key] = parsed
+                } else if valStr.lowercased() == "true" {
+                    input[key] = true
+                } else if valStr.lowercased() == "false" {
+                    input[key] = false
+                } else if let num = Double(valStr) {
+                    input[key] = num
+                } else {
+                    input[key] = valStr
                 }
             }
         }
 
         return (name, input)
+    }
+
+    /// Helper to resolve tool arguments whether presented as Dictionary, JSON string, or nested under parameters/input.
+    private static func extractDictArgs(_ dict: [String: Any]) -> [String: Any] {
+        if let dArgs = dict["arguments"] as? [String: Any] {
+            return dArgs
+        }
+        if let dParams = dict["parameters"] as? [String: Any] {
+            return dParams
+        }
+        if let dInput = dict["input"] as? [String: Any] {
+            return dInput
+        }
+        if let str = dict["arguments"] as? String ?? dict["parameters"] as? String,
+           let data = str.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            return parsed
+        }
+        return [:]
     }
 
     // MARK: - Text-Based Tool Call Extractor
@@ -470,7 +490,7 @@ enum LocalChatTemplateEngine {
                     if let dict = (try? JSONSerialization.jsonObject(with: Data(blockContent.utf8))) as? [String: Any],
                        let name = dict["name"] as? String {
                         let id = "call_\(UUID().uuidString.prefix(8))"
-                        let args = (dict["arguments"] as? [String: Any]) ?? [:]
+                        let args = extractDictArgs(dict)
                         let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
                         toolCalls.insert([
                             "id": id,
@@ -515,10 +535,8 @@ enum LocalChatTemplateEngine {
                         for dict in arr {
                             if let name = dict["name"] as? String {
                                 let id = "call_\(UUID().uuidString.prefix(8))"
-                                let args = (dict["arguments"] as? [String: Any]) ?? [:]
+                                let args = extractDictArgs(dict)
                                 let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                                // insert(at: 0): reversed() iteration + append would
-                                // emit multi-block calls in REVERSE document order.
                                 toolCalls.insert([
                                     "id": id,
                                     "type": "function",
@@ -534,13 +552,14 @@ enum LocalChatTemplateEngine {
                     } else if let dict = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
                               let name = dict["name"] as? String {
                         let id = "call_\(UUID().uuidString.prefix(8))"
-                        let args = (dict["arguments"] as? [String: Any]) ?? [:]
+                        let args = extractDictArgs(dict)
+                        let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
                         toolCalls.insert([
                             "id": id,
                             "type": "function",
                             "function": [
                                 "name": name,
-                                "arguments": jsonString
+                                "arguments": argsStr
                             ],
                             "name": name,
                             "input": args
@@ -554,7 +573,7 @@ enum LocalChatTemplateEngine {
         }
 
         // Pattern 3: Bare Qwen <function=...> ... </function> (without outer <tool_call>)
-        let bareFnRegex = try? NSRegularExpression(pattern: #"<function=([^>\s]+)>\s*([\s\S]*?)\s*</function>"#, options: [])
+        let bareFnRegex = try? NSRegularExpression(pattern: #"<function\s*=\s*["']?([^"'>\s]+)["']?>\s*([\s\S]*?)\s*</function>"#, options: [])
         if let matches = bareFnRegex?.matches(in: cleanText, options: [], range: NSRange(location: 0, length: cleanText.utf16.count)), !matches.isEmpty {
             for match in matches.reversed() {
                 if let fullRange = Range(match.range(at: 0), in: cleanText) {
@@ -640,6 +659,57 @@ enum LocalChatTemplateEngine {
                 ], at: 0)
             }
         }
+        // Pattern 5: Markdown fenced JSON tool call blocks (```json or ```tool_call)
+        let markdownJsonRegex = try? NSRegularExpression(pattern: #"```(?:json|tool_call)?\s*(\[\s*\{[\s\S]*?\}\s*\]|\{[\s\S]*?\})\s*```"#, options: [])
+        if let matches = markdownJsonRegex?.matches(in: cleanText, options: [], range: NSRange(location: 0, length: cleanText.utf16.count)), !matches.isEmpty {
+            for match in matches.reversed() {
+                if let jsonRange = Range(match.range(at: 1), in: cleanText) {
+                    let jsonString = String(cleanText[jsonRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    var matchedAny = false
+                    if let arr = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [[String: Any]] {
+                        for dict in arr {
+                            if let name = dict["name"] as? String, (dict["arguments"] != nil || dict["parameters"] != nil || dict["input"] != nil) {
+                                let id = "call_\(UUID().uuidString.prefix(8))"
+                                let args = extractDictArgs(dict)
+                                let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                                toolCalls.insert([
+                                    "id": id,
+                                    "type": "function",
+                                    "function": [
+                                        "name": name,
+                                        "arguments": argsStr
+                                    ],
+                                    "name": name,
+                                    "input": args
+                                ], at: 0)
+                                matchedAny = true
+                            }
+                        }
+                    } else if let dict = (try? JSONSerialization.jsonObject(with: Data(jsonString.utf8))) as? [String: Any],
+                              let name = dict["name"] as? String,
+                              (dict["arguments"] != nil || dict["parameters"] != nil || dict["input"] != nil || dict["type"] as? String == "function") {
+                        let id = "call_\(UUID().uuidString.prefix(8))"
+                        let args = extractDictArgs(dict)
+                        let argsStr = (try? JSONSerialization.data(withJSONObject: args)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                        toolCalls.insert([
+                            "id": id,
+                            "type": "function",
+                            "function": [
+                                "name": name,
+                                "arguments": argsStr
+                            ],
+                            "name": name,
+                            "input": args
+                        ], at: 0)
+                        matchedAny = true
+                    }
+                    if matchedAny, let fullRange = Range(match.range(at: 0), in: cleanText) {
+                        cleanText.removeSubrange(fullRange)
+                    }
+                }
+            }
+        }
+
         // The <function_calls> wrapper is scaffolding, never content — drop the
         // surviving tags so they cannot leak into the visible transcript.
         if !toolCalls.isEmpty {

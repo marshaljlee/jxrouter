@@ -70,6 +70,22 @@ struct PersistedSession: Identifiable, Codable {
     }
 }
 
+struct PersistedToolCall: Codable {
+    var name: String
+    var status: String
+    var filePath: String?
+}
+
+struct PersistedChatMessage: Identifiable, Codable {
+    var id: String
+    var role: String
+    var content: String
+    var thinking: String?
+    var toolCalls: [PersistedToolCall]?
+    var routeProvider: String?
+    var timestamp: Date
+}
+
 // MARK: - Data Store
 
 /// Central persistence store for vault, agent, timeline, and session data.
@@ -209,5 +225,27 @@ final class DataStore {
         var sessions = loadSessions()
         sessions.removeAll { $0.id == id }
         saveSessions(sessions)
+        let file = messagesFile(for: id)
+        try? fm.removeItem(at: file)
+    }
+
+    // MARK: - Chat Messages Persistence
+
+    private func messagesFile(for sessionId: String) -> URL {
+        let safeId = sessionId.replacingOccurrences(of: "/", with: "_")
+        return dataDir.appendingPathComponent("session_\(safeId)_messages.json")
+    }
+
+    func loadMessages(sessionId: String) -> [PersistedChatMessage] {
+        let file = messagesFile(for: sessionId)
+        guard let data = try? Data(contentsOf: file) else { return [] }
+        return (try? decoder.decode([PersistedChatMessage].self, from: data)) ?? []
+    }
+
+    func saveMessages(sessionId: String, messages: [PersistedChatMessage]) {
+        try? ensureDir()
+        let file = messagesFile(for: sessionId)
+        guard let data = try? encoder.encode(messages) else { return }
+        try? data.write(to: file, options: .atomic)
     }
 }

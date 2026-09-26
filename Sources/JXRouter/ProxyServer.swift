@@ -947,11 +947,10 @@ final class ProxyServer: @unchecked Sendable {
                 // by even 1 byte caused an indefinite block.
                 if remainingBytes > 0 {
                     var bytesLeft = remainingBytes
-                    let readDeadline = DispatchTime.now() + 30
                     while bytesLeft > 0 {
                         try Task.checkCancellation()
                         let chunkSize = min(bytesLeft, 65536)
-                        let chunkData = try waitForBody(connection: connection, maxLength: chunkSize, deadline: readDeadline)
+                        let chunkData = try await waitForBody(connection: connection, maxLength: chunkSize, timeoutSeconds: 30)
                         bodyData.append(chunkData)
                         bytesLeft -= chunkData.count
                         if chunkData.isEmpty { break }
@@ -1154,27 +1153,45 @@ final class ProxyServer: @unchecked Sendable {
         return true
     }
 
-    /// Synchronous blocking read of one body chunk. Kept as a non-async helper so the
-    /// semaphore wait stays legal under Swift 6 (DispatchSemaphore.wait is unavailable
-    /// in async contexts).
-    private func waitForBody(connection: NWConnection, maxLength: Int, deadline: DispatchTime) throws -> Data {
-        let semaphore = DispatchSemaphore(value: 0)
-        var chunkData = Data()
-        var chunkError: Error?
+    private final class ReceiveContinuationState: @unchecked Sendable {
+        private var resumed = false
+        private let lock = NSLock()
 
-        connection.receive(minimumIncompleteLength: 1, maximumLength: maxLength) { data, _, _, error in
-            if let d = data { chunkData = d }
-            if let e = error { chunkError = e }
-            semaphore.signal()
+        func resumeOnce(continuation: CheckedContinuation<Data, Error>, result: Result<Data, Error>) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !resumed else { return }
+            resumed = true
+            continuation.resume(with: result)
         }
+    }
 
-        if semaphore.wait(timeout: deadline) == .timedOut {
-            connection.cancel()
-            throw TimeoutError("Body read timed out after 30s")
+    /// Cooperative async read of one body chunk with a timeout, avoiding thread pool starvation.
+    private func waitForBody(connection: NWConnection, maxLength: Int, timeoutSeconds: TimeInterval) async throws -> Data {
+        let state = ReceiveContinuationState()
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    connection.receive(minimumIncompleteLength: 1, maximumLength: maxLength) { data, _, _, error in
+                        if let error = error {
+                            state.resumeOnce(continuation: continuation, result: .failure(error))
+                        } else {
+                            state.resumeOnce(continuation: continuation, result: .success(data ?? Data()))
+                        }
+                    }
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                throw TimeoutError("Body read timed out after \(Int(timeoutSeconds))s")
+            }
+
+            guard let firstResult = try await group.next() else {
+                throw TimeoutError("Body read failed")
+            }
+            group.cancelAll()
+            return firstResult
         }
-
-        if let err = chunkError { throw err }
-        return chunkData
     }
 
     // MARK: - CONNECT Tunnel Handler (Routes AI hosts through DirectTLS)

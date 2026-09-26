@@ -3,23 +3,78 @@ import SwiftUI
 // MARK: - Chat Message Model
 
 struct ChatMessage: Identifiable {
-    let id = UUID()
+    let id: UUID
     let role: Role
     var content: String
     var thinking: String?
     var toolCalls: [ToolCallInfo]?
     var routeProvider: String?
-    var timestamp: Date = .init()
-    
+    var timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        content: String,
+        thinking: String? = nil,
+        toolCalls: [ToolCallInfo]? = nil,
+        routeProvider: String? = nil,
+        timestamp: Date = .init()
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.thinking = thinking
+        self.toolCalls = toolCalls
+        self.routeProvider = routeProvider
+        self.timestamp = timestamp
+    }
+
+    init(persisted: PersistedChatMessage) {
+        self.id = UUID(uuidString: persisted.id) ?? UUID()
+        self.role = persisted.role == "user" ? .user : .assistant
+        self.content = persisted.content
+        self.thinking = persisted.thinking
+        self.toolCalls = persisted.toolCalls?.map {
+            let status: ToolCallInfo.Status = $0.status == "running" ? .running : ($0.status == "denied" ? .denied : .completed)
+            return ToolCallInfo(name: $0.name, status: status, filePath: $0.filePath)
+        }
+        self.routeProvider = persisted.routeProvider
+        self.timestamp = persisted.timestamp
+    }
+
+    func toPersisted() -> PersistedChatMessage {
+        PersistedChatMessage(
+            id: id.uuidString,
+            role: role == .user ? "user" : "assistant",
+            content: content,
+            thinking: thinking,
+            toolCalls: toolCalls?.map {
+                let st = $0.status == .running ? "running" : ($0.status == .denied ? "denied" : "completed")
+                return PersistedToolCall(name: $0.name, status: st, filePath: $0.filePath)
+            },
+            routeProvider: routeProvider,
+            timestamp: timestamp
+        )
+    }
+
     enum Role { case user, assistant }
 }
 
 struct ToolCallInfo: Identifiable {
-    let id = UUID()
+    let id: UUID
     let name: String
     let status: Status
     var filePath: String?
-    
+    var arguments: String?
+
+    init(id: UUID = UUID(), name: String, status: Status, filePath: String? = nil, arguments: String? = nil) {
+        self.id = id
+        self.name = name
+        self.status = status
+        self.filePath = filePath
+        self.arguments = arguments
+    }
+
     enum Status { case running, completed, denied }
 }
 
@@ -29,7 +84,7 @@ struct ClaudeChatView: View {
     @Bindable var manager: ProxyManager
     var agentSystemPrompt: String? = nil
     @State private var messages: [ChatMessage] = []
-    
+
     private var welcomeMessage: ChatMessage {
         let content = agentSystemPrompt != nil
             ? "Agent session started. System prompt loaded. How can I help?"
@@ -44,7 +99,30 @@ struct ClaudeChatView: View {
     @State private var isStreaming = false
     @State private var selectedSession: String? = nil
     @State private var showSessions = false
-    
+
+    private func currentSessionId() -> String {
+        selectedSession ?? "default"
+    }
+
+    private func loadSessionMessages() {
+        let sid = currentSessionId()
+        let persisted = DataStore.shared.loadMessages(sessionId: sid)
+        if !persisted.isEmpty {
+            messages = persisted.map { ChatMessage(persisted: $0) }
+        } else {
+            messages = [welcomeMessage]
+        }
+    }
+
+    private func saveSessionMessages() {
+        let sid = currentSessionId()
+        let toSave = messages.map { $0.toPersisted() }
+        DataStore.shared.saveMessages(sessionId: sid, messages: toSave)
+        if let sId = selectedSession {
+            DataStore.shared.updateSession(id: sId, messageCount: toSave.count)
+        }
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             // Session sidebar (collapsible)
@@ -53,7 +131,7 @@ struct ClaudeChatView: View {
                     .frame(width: 220)
                 Divider().overlay(Color.dsBorder)
             }
-            
+
             // Main chat area
             VStack(spacing: 0) {
                 // Top bar
@@ -62,9 +140,9 @@ struct ClaudeChatView: View {
                     sessionTitle: selectedSession ?? "New Session",
                     model: manager.currentModel.isEmpty ? "claude-sonnet-4" : manager.currentModel
                 )
-                
+
                 Divider().overlay(Color.dsBorder)
-                
+
                 // Messages
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -73,7 +151,7 @@ struct ClaudeChatView: View {
                                 ChatBubble(message: message)
                                     .id(message.id)
                             }
-                            
+
                             if isStreaming {
                                 StreamingIndicator()
                                     .id("streaming")
@@ -85,9 +163,9 @@ struct ClaudeChatView: View {
                         withAnimation { proxy.scrollTo(messages.last?.id, anchor: .bottom) }
                     }
                 }
-                
+
                 Divider().overlay(Color.dsBorder)
-                
+
                 // Route badge + input
                 VStack(spacing: 0) {
                     RouteBadge(provider: manager.activeProviderName)
@@ -100,16 +178,23 @@ struct ClaudeChatView: View {
             }
         }
         .background(Color.dsBackground)
+        .onAppear {
+            loadSessionMessages()
+        }
+        .onChange(of: selectedSession) { _, _ in
+            loadSessionMessages()
+        }
     }
-    
+
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        
+
         messages.append(ChatMessage(role: .user, content: text))
+        saveSessionMessages()
         inputText = ""
         isStreaming = true
-        
+
         // Route through the real ProviderRouter
         Task {
             let startTime = CFAbsoluteTimeGetCurrent()
@@ -137,28 +222,68 @@ struct ClaudeChatView: View {
                     body: bodyData
                 )
                 let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-                
-                let content: String
+
+                var finalContent = ""
+                var extractedThinking: String? = nil
+                var extractedTools: [ToolCallInfo] = []
+
                 if let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
                    let choices = json["choices"] as? [[String: Any]],
                    let first = choices.first,
-                   let delta = first["message"] as? [String: Any],
-                   let text = delta["content"] as? String {
-                    content = text
+                   let delta = first["message"] as? [String: Any] {
+
+                    if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
+                        extractedThinking = reasoning
+                    }
+
+                    if var rawContent = delta["content"] as? String {
+                        if rawContent.contains("<think>") {
+                            let thinkRegex = try? NSRegularExpression(pattern: #"<think>\s*([\s\S]*?)\s*</think>"#, options: [])
+                            while let match = thinkRegex?.firstMatch(in: rawContent, options: [], range: NSRange(location: 0, length: rawContent.utf16.count)),
+                                  let thinkRange = Range(match.range(at: 1), in: rawContent),
+                                  let fullRange = Range(match.range(at: 0), in: rawContent) {
+                                let inline = String(rawContent[thinkRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                                if extractedThinking == nil && !inline.isEmpty {
+                                    extractedThinking = inline
+                                }
+                                rawContent.removeSubrange(fullRange)
+                            }
+                            if let startRange = rawContent.range(of: "<think>") {
+                                let unclosed = String(rawContent[startRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                                if extractedThinking == nil && !unclosed.isEmpty {
+                                    extractedThinking = unclosed
+                                }
+                                rawContent.removeSubrange(startRange.lowerBound..<rawContent.endIndex)
+                            }
+                        }
+                        finalContent = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+
+                    if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                        for tc in toolCalls {
+                            let fn = tc["function"] as? [String: Any]
+                            let name = (tc["name"] as? String) ?? (fn?["name"] as? String) ?? "tool"
+                            let args = fn?["arguments"] as? String
+                            extractedTools.append(ToolCallInfo(name: name, status: .completed, arguments: args))
+                        }
+                    }
                 } else if response.statusCode >= 400 {
                     let errorBody = String(data: response.body, encoding: .utf8) ?? "(empty)"
-                    content = "**Error \(response.statusCode)**: \(errorBody)"
+                    finalContent = "**Error \(response.statusCode)**: \(errorBody)"
                 } else {
-                    content = String(data: response.body, encoding: .utf8) ?? "(empty response)"
+                    finalContent = String(data: response.body, encoding: .utf8) ?? "(empty response)"
                 }
-                
+
                 isStreaming = false
                 messages.append(ChatMessage(
                     role: .assistant,
-                    content: content,
+                    content: finalContent.isEmpty ? "(empty response)" : finalContent,
+                    thinking: extractedThinking,
+                    toolCalls: extractedTools.isEmpty ? nil : extractedTools,
                     routeProvider: manager.activeProviderName
                 ))
-                _ = elapsed // latency available for future UI display
+                saveSessionMessages()
+                _ = elapsed
             } catch {
                 let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                 isStreaming = false
@@ -167,6 +292,7 @@ struct ClaudeChatView: View {
                     content: "**Error**: \(error.localizedDescription)\n\nRoute: \(manager.activeProviderName)\nTime: \(Int(elapsed))ms",
                     routeProvider: manager.activeProviderName
                 ))
+                saveSessionMessages()
                 _ = elapsed
             }
         }
@@ -227,11 +353,179 @@ struct ChatTopBar: View {
     }
 }
 
+// MARK: - Markdown & Code Block Parsing
+
+enum MessageContentPart: Identifiable {
+    case text(id: String, content: String)
+    case code(id: String, language: String, code: String)
+
+    var id: String {
+        switch self {
+        case .text(let id, _): return id
+        case .code(let id, _, _): return id
+        }
+    }
+}
+
+func parseMessageContent(_ raw: String) -> [MessageContentPart] {
+    var parts: [MessageContentPart] = []
+    let fence = "```"
+    var remaining = raw
+    var partIndex = 0
+
+    while let startRange = remaining.range(of: fence) {
+        let prefix = String(remaining[..<startRange.lowerBound])
+        if !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(.text(id: "part_\(partIndex)", content: prefix))
+            partIndex += 1
+        }
+
+        let afterStart = remaining[startRange.upperBound...]
+        if let newlineRange = afterStart.range(of: "\n") {
+            let language = String(afterStart[..<newlineRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let afterHeader = afterStart[newlineRange.upperBound...]
+
+            if let endRange = afterHeader.range(of: fence) {
+                let code = String(afterHeader[..<endRange.lowerBound])
+                parts.append(.code(id: "part_\(partIndex)", language: language.isEmpty ? "code" : language, code: code))
+                partIndex += 1
+                remaining = String(afterHeader[endRange.upperBound...])
+            } else {
+                parts.append(.code(id: "part_\(partIndex)", language: language.isEmpty ? "code" : language, code: String(afterHeader)))
+                partIndex += 1
+                remaining = ""
+                break
+            }
+        } else {
+            remaining = String(afterStart)
+        }
+    }
+
+    if !remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        parts.append(.text(id: "part_\(partIndex)", content: remaining))
+    }
+
+    return parts.isEmpty ? [.text(id: "part_0", content: raw)] : parts
+}
+
+// MARK: - Code Block View
+
+struct CodeBlockView: View {
+    let language: String
+    let code: String
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header bar
+            HStack {
+                Text(language.lowercased())
+                    .font(.vaultMono(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.dsTextTertiary)
+                Spacer()
+                Button(action: copyToClipboard) {
+                    HStack(spacing: 4) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 10))
+                        Text(copied ? "Copied" : "Copy")
+                            .font(.vaultUI(size: 10))
+                    }
+                    .foregroundStyle(copied ? Color.dsGreen : Color.dsTextSecondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.15))
+
+            Divider().overlay(Color.dsBorder)
+
+            // Code container with horizontal scroll
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(code.trimmingCharacters(in: .newlines))
+                    .font(.vaultMono(size: 11))
+                    .foregroundStyle(Color.dsTextPrimary)
+                    .lineSpacing(3)
+                    .padding(10)
+                    .textSelection(.enabled)
+            }
+        }
+        .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.dsBorder, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 4)
+    }
+
+    private func copyToClipboard() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        withAnimation { copied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation { copied = false }
+        }
+    }
+}
+
+// MARK: - Thinking Disclosure View
+
+struct ThinkingDisclosureView: View {
+    let thinking: String
+    @State private var isExpanded = false
+
+    var wordCount: Int {
+        thinking.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.vaultAccent)
+                    Text(isExpanded ? "Thinking process" : "Thinking process (\(wordCount) words)")
+                        .font(.vaultUI(size: 11, weight: .medium))
+                        .foregroundStyle(Color.dsTextSecondary)
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Color.dsTextTertiary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.vaultAccent.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.vaultAccent.opacity(0.2), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                ScrollView {
+                    Text(thinking)
+                        .font(.vaultMono(size: 10))
+                        .foregroundStyle(Color.dsTextSecondary)
+                        .lineSpacing(2)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 180)
+                .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dsBorder, lineWidth: 1))
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 // MARK: - Chat Bubble
 
 struct ChatBubble: View {
     let message: ChatMessage
-    
+
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 10) {
@@ -245,36 +539,53 @@ struct ChatBubble: View {
                                 .foregroundStyle(.white)
                         )
                 }
-                
-                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                    Text(LocalizedStringKey(message.content))
-                        .font(.vaultUI(size: 13))
-                        .foregroundStyle(Color.dsTextPrimary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            message.role == .user
-                                ? Color.vaultAccent.opacity(0.15)
-                                : Color.dsSurface,
-                            in: RoundedRectangle(cornerRadius: 12)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(
-                                    message.role == .user
-                                        ? Color.vaultAccent.opacity(0.3)
-                                        : Color.dsBorder,
-                                    lineWidth: 1
-                                )
-                        )
-                    
+
+                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
+                    // Thinking Block if present
+                    if let thinking = message.thinking, !thinking.isEmpty {
+                        ThinkingDisclosureView(thinking: thinking)
+                            .frame(maxWidth: 520)
+                    }
+
+                    // Content with code block support
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(parseMessageContent(message.content)) { part in
+                            switch part {
+                            case .text(_, let text):
+                                Text(LocalizedStringKey(text))
+                                    .font(.vaultUI(size: 13))
+                                    .foregroundStyle(Color.dsTextPrimary)
+                                    .textSelection(.enabled)
+                            case .code(_, let language, let code):
+                                CodeBlockView(language: language, code: code)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        message.role == .user
+                            ? Color.vaultAccent.opacity(0.15)
+                            : Color.dsSurface,
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(
+                                message.role == .user
+                                    ? Color.vaultAccent.opacity(0.3)
+                                    : Color.dsBorder,
+                                lineWidth: 1
+                            )
+                    )
+
                     // Tool calls
                     if let tools = message.toolCalls {
                         ForEach(tools) { tool in
                             ToolCallChip(tool: tool)
                         }
                     }
-                    
+
                     // Route info
                     if let provider = message.routeProvider {
                         Text("via \(provider)")
@@ -282,7 +593,7 @@ struct ChatBubble: View {
                             .foregroundStyle(Color.dsTextTertiary)
                     }
                 }
-                
+
                 if message.role == .user {
                     Circle()
                         .fill(Color.dsAccent)
@@ -304,28 +615,55 @@ struct ChatBubble: View {
 
 struct ToolCallChip: View {
     let tool: ToolCallInfo
-    
+    @State private var isExpanded = false
+
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(toolStatusColor)
-                .frame(width: 6, height: 6)
-            Text(tool.name)
-                .font(.vaultMono(size: 10))
-                .foregroundStyle(Color.dsTextSecondary)
-            if let path = tool.filePath {
-                Text(path)
+        VStack(alignment: .leading, spacing: 4) {
+            Button(action: {
+                if tool.arguments != nil {
+                    withAnimation { isExpanded.toggle() }
+                }
+            }) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(toolStatusColor)
+                        .frame(width: 6, height: 6)
+                    Image(systemName: "hammer.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.dsTextTertiary)
+                    Text(tool.name)
+                        .font(.vaultMono(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.dsTextSecondary)
+                    if let path = tool.filePath {
+                        Text(path)
+                            .font(.vaultMono(size: 9))
+                            .foregroundStyle(Color.dsTextTertiary)
+                            .lineLimit(1)
+                    }
+                    if tool.arguments != nil {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Color.dsTextTertiary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.dsBorder, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded, let args = tool.arguments {
+                Text(args)
                     .font(.vaultMono(size: 9))
-                    .foregroundStyle(Color.dsTextTertiary)
-                    .lineLimit(1)
+                    .foregroundStyle(Color.dsTextSecondary)
+                    .padding(8)
+                    .background(Color.black.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                    .textSelection(.enabled)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.dsBorder, lineWidth: 1))
     }
-    
+
     private var toolStatusColor: Color {
         switch tool.status {
         case .running: return Color.vaultAccent

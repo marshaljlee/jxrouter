@@ -693,6 +693,90 @@ final class MessageTranslatorTests {
         assertTrue(endEvents.contains { $0.contains("\"stop_reason\":\"tool_use\"") }, "Split-</think> turn must end in tool_use")
     }
 
+    static func testUnclosedThinkTagExtraction() {
+        print("[TEST] Unclosed / Truncated <think> Tag Extraction")
+        let truncatedResponse: [String: Any] = [
+            "choices": [[
+                "message": [
+                    "role": "assistant",
+                    "content": "<think>Planning the next step carefully but cut off"
+                ],
+                "finish_reason": "length"
+            ]],
+            "usage": ["prompt_tokens": 10, "completion_tokens": 20]
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: truncatedResponse)
+        let converted = MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: "test-model", enableThinking: true)
+        let json = (try? JSONSerialization.jsonObject(with: converted)) as? [String: Any]
+        let content = json?["content"] as? [[String: Any]] ?? []
+
+        let thinkingBlock = content.first(where: { $0["type"] as? String == "thinking" })
+        assertTrue(thinkingBlock != nil, "Truncated <think> must be extracted into thinking block")
+        assertEqual(thinkingBlock?["thinking"] as? String, "Planning the next step carefully but cut off")
+
+        let textBlock = content.first(where: { $0["type"] as? String == "text" })
+        let text = textBlock?["text"] as? String ?? ""
+        assertTrue(!text.contains("<think>"), "Visible text must not leak unclosed <think>")
+    }
+
+    static func testPreParsedDictionaryToolCallArguments() {
+        print("[TEST] Pre-parsed Dictionary Tool Call Arguments")
+        let openAIResponse: [String: Any] = [
+            "choices": [[
+                "message": [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [[
+                        "id": "call_12345",
+                        "type": "function",
+                        "function": [
+                            "name": "lookup_user",
+                            "arguments": ["user_id": 42, "include_profile": true]
+                        ]
+                    ]]
+                ],
+                "finish_reason": "tool_calls"
+            ]],
+            "usage": ["prompt_tokens": 10, "completion_tokens": 15]
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: openAIResponse)
+        let converted = MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: "test-model", enableThinking: false)
+        let json = (try? JSONSerialization.jsonObject(with: converted)) as? [String: Any]
+        let content = json?["content"] as? [[String: Any]] ?? []
+
+        let toolUse = content.first(where: { $0["type"] as? String == "tool_use" })
+        assertTrue(toolUse != nil, "Must extract tool_use block from dictionary arguments")
+        assertEqual(toolUse?["name"] as? String, "lookup_user")
+        let input = toolUse?["input"] as? [String: Any]
+        assertEqual(input?["user_id"] as? Int, 42)
+        assertEqual(input?["include_profile"] as? Bool, true)
+    }
+
+    static func testMarkdownJsonBlockToolCallExtraction() {
+        print("[TEST] Markdown Fenced JSON Tool Call Extraction")
+        let text = """
+        I will run this tool for you:
+        ```json
+        {
+            "name": "fetch_weather",
+            "arguments": {
+                "city": "Tokyo",
+                "days": 3
+            }
+        }
+        ```
+        Let's see what happens.
+        """
+        let extracted = LocalChatTemplateEngine.extractToolCalls(from: text)
+        assertEqual(extracted.toolCalls.count, 1, "Must extract 1 tool call from markdown json code block")
+        let first = extracted.toolCalls.first
+        assertEqual(first?["name"] as? String, "fetch_weather")
+        let input = first?["input"] as? [String: Any]
+        assertEqual(input?["city"] as? String, "Tokyo")
+        assertEqual(input?["days"] as? Double, 3.0)
+        assertTrue(!extracted.cleanText.contains("```json"), "Fenced json tool call block must be stripped from cleanText")
+    }
+
     // MARK: - Runner
 
     static func runAll() -> Bool {
@@ -712,9 +796,12 @@ final class MessageTranslatorTests {
         testInvokeStyleTextToolExtraction()
         testStreamingTextChannelToolRecovery()
         testSplitThinkTagDoesNotSwallowFollowingToolCall()
+        testUnclosedThinkTagExtraction()
+        testPreParsedDictionaryToolCallArguments()
+        testMarkdownJsonBlockToolCallExtraction()
 
         if failedTests.isEmpty {
-            print("\n✅ ALL 16 TEST SUITES PASSED CLEANLY (0 failures)")
+            print("\n✅ ALL 19 TEST SUITES PASSED CLEANLY (0 failures)")
             return true
         } else {
             print("\n❌ \(failedTests.count) TESTS FAILED:")

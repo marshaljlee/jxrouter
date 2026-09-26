@@ -475,17 +475,27 @@ enum MessageTranslator {
             // Text block and structured or extracted tool calls
             var rawText = (message["content"] as? String) ?? ""
 
-            // Handle inline <think> tags in non-streaming text
+            // Handle inline <think> tags in non-streaming text (closed and unclosed/truncated)
             if rawText.contains("<think>") {
                 let thinkRegex = try? NSRegularExpression(pattern: #"<think>\s*([\s\S]*?)\s*</think>"#, options: [])
-                if let match = thinkRegex?.firstMatch(in: rawText, options: [], range: NSRange(location: 0, length: rawText.utf16.count)),
-                   let thinkRange = Range(match.range(at: 1), in: rawText),
-                   let fullRange = Range(match.range(at: 0), in: rawText) {
+                while let match = thinkRegex?.firstMatch(in: rawText, options: [], range: NSRange(location: 0, length: rawText.utf16.count)),
+                      let thinkRange = Range(match.range(at: 1), in: rawText),
+                      let fullRange = Range(match.range(at: 0), in: rawText) {
                     let inlineThink = String(rawText[thinkRange]).trimmingCharacters(in: .whitespacesAndNewlines)
                     if enableThinking && !inlineThink.isEmpty && !content.contains(where: { $0["type"] as? String == "thinking" }) {
                         content.insert(["type": "thinking", "thinking": inlineThink], at: 0)
                     }
                     rawText.removeSubrange(fullRange)
+                    rawText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+
+                // If response truncated before </think>, extract remaining unclosed think content
+                if let startRange = rawText.range(of: "<think>") {
+                    let unclosedThink = String(rawText[startRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if enableThinking && !unclosedThink.isEmpty && !content.contains(where: { $0["type"] as? String == "thinking" }) {
+                        content.insert(["type": "thinking", "thinking": unclosedThink], at: 0)
+                    }
+                    rawText.removeSubrange(startRange.lowerBound..<rawText.endIndex)
                     rawText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
@@ -516,8 +526,12 @@ enum MessageTranslator {
                     let inputDict: [String: Any]
                     if let existingInput = tc["input"] as? [String: Any] {
                         inputDict = existingInput
+                    } else if let dictArgs = fn?["arguments"] as? [String: Any] {
+                        inputDict = dictArgs
+                    } else if let dictParams = fn?["parameters"] as? [String: Any] {
+                        inputDict = dictParams
                     } else {
-                        let argsStr = fn?["arguments"] as? String ?? "{}"
+                        let argsStr = fn?["arguments"] as? String ?? fn?["parameters"] as? String ?? "{}"
                         inputDict = (try? JSONSerialization.jsonObject(with: Data(argsStr.utf8))) as? [String: Any] ?? [:]
                     }
                     content.append([
