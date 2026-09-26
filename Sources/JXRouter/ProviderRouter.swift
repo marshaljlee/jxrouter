@@ -690,6 +690,14 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             headers["HTTP-Referer"] = "https://github.com/marshaljlee/jxproxy"
             headers["X-Title"] = "JXProxy"
         }
+        if providerId.hasPrefix("opencode") || baseUrl.contains("opencode.ai") {
+            let sessionId = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
+            let requestId = "req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
+            headers["x-opencode-session"] = sessionId
+            headers["x-opencode-request"] = requestId
+            headers["x-opencode-client"] = "cli"
+            headers["User-Agent"] = "opencode/1.18.21"
+        }
         
         let isLocal = isLocalProvider(providerId) || baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")
         let hasNativeTools = openaiBody["tools"] != nil

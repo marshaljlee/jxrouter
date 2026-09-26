@@ -1543,7 +1543,7 @@ static let qwen3CtxSize = "Qwen3.5CtxSize"
         case "direct": return "https://api.anthropic.com"
         case "openrouter": return "https://openrouter.ai/api/v1"
         case "opencode-zen": return "https://opencode.ai/zen/v1"
-        case "opencode-go": return "https://oai.opencode.ai/v1"
+        case "opencode-go": return "https://opencode.ai/zen/go/v1"
         case "openai": return openaiBaseUrl
         case "nvidia-nim": return "https://integrate.api.nvidia.com/v1"
         case "deepseek": return "https://api.deepseek.com/v1"

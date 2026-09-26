@@ -102,6 +102,14 @@ struct ProviderValidator {
         if !apiKey.isEmpty {
             req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+        if providerId.hasPrefix("opencode") || baseUrl.contains("opencode.ai") {
+            let sessionId = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
+            let requestId = "req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
+            req.setValue(sessionId, forHTTPHeaderField: "x-opencode-session")
+            req.setValue(requestId, forHTTPHeaderField: "x-opencode-request")
+            req.setValue("cli", forHTTPHeaderField: "x-opencode-client")
+            req.setValue("opencode/1.18.21", forHTTPHeaderField: "User-Agent")
+        }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {

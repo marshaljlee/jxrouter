@@ -11,7 +11,7 @@ struct ProviderPreset: Identifiable, Hashable {
 
     static let all: [ProviderPreset] = [
         ProviderPreset(id: "opencode-zen", name: "OpenCode Zen", symbol: "sparkle.magnifyingglass", defaultUrl: "https://opencode.ai/zen/v1", models: ["big-pickle", "nemotron-3-super-free", "mimo-v2.5-free", "mimo-v2-pro-free", "minimax-m2.5-free", "gpt-5-nano", "laguna-s-2.1-free", "ling-3.0-flash-free", "north-mini-code-free"], requiresKey: false),
-        ProviderPreset(id: "opencode-go", name: "OpenCode Go", symbol: "sparkle.magnifyingglass", defaultUrl: "https://oai.opencode.ai/v1", models: ["opencode/big-pickle", "opencode/big-pickle-reasoning"], requiresKey: false),
+        ProviderPreset(id: "opencode-go", name: "OpenCode Go", symbol: "sparkle.magnifyingglass", defaultUrl: "https://opencode.ai/zen/go/v1", models: ["opencode/big-pickle", "opencode/big-pickle-reasoning"], requiresKey: false),
         ProviderPreset(id: "direct", name: "Anthropic Direct", symbol: "person.fill", defaultUrl: "https://api.anthropic.com/v1", models: ["claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-3-5"], requiresKey: true),
         ProviderPreset(id: "nvidia-nim", name: "NVIDIA NIM", symbol: "cube.fill", defaultUrl: "https://integrate.api.nvidia.com/v1", models: [
             "nvidia/riva-translate-4b-instruct-v2",
