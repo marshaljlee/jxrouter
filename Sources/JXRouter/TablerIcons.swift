@@ -140,20 +140,25 @@ public struct TablerIcon: View {
     public let fallbackSymbol: String
     public var isResizable: Bool = true
     public var contentMode: ContentMode = .fit
+    public var pointSize: CGFloat? = nil
 
-    public init(_ name: String, fallback: String? = nil) {
+    public init(_ name: String, size: CGFloat? = nil, fallback: String? = nil) {
         self.name = name
         self.fallbackSymbol = fallback ?? name
+        self.pointSize = size
     }
 
     public var body: some View {
+        let dim = pointSize ?? 15.0
         if let nsImage = TablerIcons.image(named: name) {
             Image(nsImage: nsImage)
                 .renderingMode(.template)
                 .resizable()
                 .aspectRatio(contentMode: contentMode)
+                .frame(width: dim, height: dim)
         } else {
             Image(systemName: fallbackSymbol)
+                .font(.system(size: dim))
         }
     }
 
@@ -167,5 +172,25 @@ public struct TablerIcon: View {
         var copy = self
         copy.contentMode = contentMode
         return copy
+    }
+
+    public func font(_ font: Font?) -> TablerIcon {
+        var copy = self
+        if let font = font, let extracted = Self.extractFontSize(from: font) {
+            copy.pointSize = extracted
+        }
+        return copy
+    }
+
+    private static func extractFontSize(from font: Font) -> CGFloat? {
+        let mirror = Mirror(reflecting: font)
+        guard let provider = mirror.children.first?.value else { return nil }
+        let pMirror = Mirror(reflecting: provider)
+        guard let base = pMirror.children.first(where: { $0.label == "base" })?.value else { return nil }
+        let bMirror = Mirror(reflecting: base)
+        if let size = bMirror.children.first(where: { $0.label == "size" })?.value as? CGFloat {
+            return size
+        }
+        return nil
     }
 }
