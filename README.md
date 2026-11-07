@@ -1,103 +1,77 @@
-# JXProxy (JXRouter)
+# JXRouter (JXProxy)
 
-A lightweight macOS menu-bar proxy that routes AI API traffic — Claude Code, Codex, OpenAI SDK clients — through **your** choice of LLM providers: remote (InferX, NVIDIA NIM, DeepSeek, OpenRouter, Groq, …) or local (Ollama, `llama.app`). Native SwiftUI/AppKit app, no web admin, no `/etc/hosts` edits, no pf rules.
+A high-performance macOS menu-bar proxy and multi-agent AI gateway that transparently routes LLM traffic — Claude Code, Codex, OpenCode, and OpenAI SDK clients — through configured remote cloud providers or local inference engines (`llama.app`, Ollama, local GGUF runtimes, and bundled PrismML ternary models). Native SwiftUI/AppKit app, no web admin, no `/etc/hosts` edits, and zero pf packet-filter rules.
 
-> **Opt-in and additive.** Nothing on your system is modified until you press **Start** or enable system-wide routing, and everything the app writes is removed by `./uninstall.sh`.
+## Core Capabilities
 
-## How routing works
+- **Zero-Config Agent Routing**:
+  - **Claude Code**: Configured automatically via `~/.claude/settings.json` (loopback proxy, token-authenticated).
+  - **OpenCode & Codex**: Automated configuration via safe JSON updates to `~/.opencode/config.json` and `~/.codex/config.json`.
+- **AMEEM v3.0 Request & Execution Engine**:
+  - **Dialect Auto-Detection & Recovery**: Extracts function and tool calls across diverse template dialects (`TAG_JSON`, `TAG_TAGGED_EQ`, Markdown blocks) without losing call arguments.
+  - **Response Hygiene**: Sanitizes leaked prompt control tokens (`<|im_start|>`, `<|eot_id|>`, etc.) and removes leading role headers (`system\n`, `assistant\n`) in both streaming and SSE streams.
+  - **Preflight Sampling & Guardrails**: Enforces optimal sampling defaults (`temp 0.6 / minP 0.02 / topP 0.95 / topK 20 / repeatPenalty 1.05`) and provides RAM preflight checks.
+- **OpenCode Zen Free-Tier Shim**:
+  - Live fingerprint spoofing and conformance headers (`x-opencode-session`, exact user agent thresholds, forced streaming aggregation, and synthetic tool call filtering) allowing non-OpenCode harnesses to utilize free tier endpoints safely.
+- **GGUF Chat Template In-Place Sanitizer**:
+  - Neutralizes fatal Jinja `raise_exception` statements in GGUF metadata directly in-place with exact byte preservation.
+- **Native Local Model Runtimes**:
+  - Auto-detection and auto-starting of local models with cold-start request buffering.
+  - Bundled **PrismML llama.cpp fork** with PQ2_0 ternary quantization support directly inside the app bundle.
+- **Authentic Design & Vector Geometry**:
+  - Menu-bar and dock icon aligned with the JX product family lightning mark on dark continuous-corner squircles in signature electric violet (`#8B5CF6` / `#A78BFA`).
+  - Native vector rendering powered by [Tabler Icons](https://github.com/tabler/tabler-icons) with bounded frame metrics across all UI views.
+  - Fluid ProMotion spring slide-out settings drawer (`0.16, 1.0, 0.3, 1.0`).
 
-- **Claude Code** is routed automatically via `~/.claude/settings.json` (loopback connection to the local proxy, token-authenticated) — no system changes required.
-- **System-wide routing** (optional): Settings → System → **Enable System-Wide Proxy** routes other apps' HTTP/HTTPS traffic through JXProxy. `api.anthropic.com` and `api.openai.com` requests are intercepted and sent to your configured providers; **every other connection passes through unmodified** (raw relay, no TLS termination).
-- HTTPS interception of those two AI hosts requires trusting the bundled CA certificate: menu-bar icon → **Security → Install CA Certificate**.
-- **Model-tier routing**: map Opus / Sonnet / Haiku (and OpenAI equivalents) to different models or providers, with automatic provider fallback chains.
-- **Local providers** are auto-detected — Ollama, and the Llama desktop app (`llama.app`), whose built-in OpenAI-compatible server serves on port 8080.
+## How Routing Works
 
-## Quick start
+1. **Claude Code & Agents**: Direct connection to loopback proxy on `127.0.0.1:5255` (configurable).
+2. **Model Tier Routing**: Map `Opus`, `Sonnet`, and `Haiku` tiers to distinct providers or local models with automatic fallback chains.
+3. **System-Wide Routing** (optional): Settings → System → **Enable System-Wide Proxy** intercepts `api.anthropic.com` and `api.openai.com` requests while letting all other traffic pass through untouched.
+4. **Per-App Routing Rules**: Selectively Route AI, Pass Through, or Block traffic on an application-by-application basis.
+
+## Quick Start
 
 ```bash
 ./install.sh
 ```
 
-That is the whole install — one command, nothing to click afterwards. It builds the app,
-installs to `/Applications`, creates the `jxclaude` / `jxcodex` / `jxpi` launchers in
-`~/.local/bin`, configures the shell PATH, arms auto-start, launches the app, and then
-waits until the proxy actually answers on port 5255. When the script exits, the proxy is
-live.
+The script builds the universal release bundle, stages dependencies, installs to `/Applications` (or custom app destination), sets up CLI launchers (`jxclaude`, `jxcodex`, `jxpi`), and verifies health on port `5255`.
 
-Re-running it is how you deploy a rebuild: it stops any running instance first, so the
-binary that ends up running is always the one just built. Set `JX_NO_AUTOSTART=1` to
-install without launching (CI, or a deliberate manual start).
-
-## Setup
-
-1. **Settings → Providers** — pick your provider(s), paste API keys, hit **Verify** (green tick). Keys are stored in the macOS Keychain, never in plaintext files.
-   - On launch the app also imports keys it finds in `~/.zshrc`, `~/.zshenv`, `~/.bash_profile`, `~/.bashrc`, and legacy `~/.jxproxy/config.env` — **only into empty slots**, never overwriting keys you entered yourself.
-2. **Settings → General** — choose the active provider and routing mode. The model tiers auto-populate from each provider's live model list; **Test All Models** validates the whole chain and surfaces full server error messages.
-3. **Settings → Routing** — per-app routing rules (route or block AI traffic per application).
-4. **Settings → System** — system-wide proxy toggle, CA install, and uninstall options.
-
-### Shell CLI tools (curl, Codex CLI, Python)
-
-CLI tools launched from a terminal don't always honor the macOS system proxy — they read env vars instead:
+To compile a universal release package without deploying:
 
 ```bash
+./build-all.sh macos
+```
+
+## CLI Usage
+
+For command-line tools that read proxy environment variables:
+
+```bash
+# Standard HTTPS proxy
 export HTTPS_PROXY=http://127.0.0.1:5255
-# or for OpenAI-compatible clients:
+
+# OpenAI SDK clients
 export OPENAI_BASE_URL=http://127.0.0.1:5255/v1
 ```
 
 Default proxy port: **5255** (configurable).
 
-## What the app writes (and cleans up)
+## Testing & Quality Assurance
 
-| Path | Purpose | Removed on uninstall |
-|---|---|---|
-| `~/.claude/settings.json` | Claude Code routing config | restored to original |
-| `~/.local/bin/jxclaude`, `~/.local/bin/jxcodex` | CLI launchers | deleted |
-| `~/.claude/CLAUDE.md` | managed "constitution" block | block removed |
-| `~/.zshrc` / `~/.zshenv` | launcher PATH lines | lines removed |
-| macOS Keychain | your provider API keys | entries removed |
-
-`./uninstall.sh` removes all of the above **and** strips any legacy DNS-hijack entries (old pre-2026 app versions wrote `JXProxy` / `ProxySwitch` marker blocks into `/etc/hosts`) plus any leftover pf anchor — so it can fully clean a machine that previously ran an old build.
-
-## Remote Web Control (iOS / Android web-wrapper apps)
-
-The app ships a small remote-control web panel — a JSON API + single-page app
-served on your LAN — so you can monitor and control JXProxy from your phone.
-
-1. **Settings → System → Remote Web Control** → enable it (off by default; the
-   port is reachable on your network, so only enable on trusted Wi-Fi).
-2. Note the port (default **5355**) and the proxy auth token (Settings → General).
-3. Open the web panel in any browser on the LAN, or use the bundled wrapper apps:
-   - **iOS** — open `ios/JXProxyMobile.xcodeproj` in Xcode, set your signing
-     team, run. In the Simulator the default URL `http://127.0.0.1:5355` reaches
-     the Mac directly; on a device enter the Mac's LAN IP.
-   - **Android** — open `android/` in Android Studio (or `gradle assembleDebug`)
-     and point it at `http://<mac-ip>:5355`.
-
-The panel shows live status, lets you start/stop the proxy, switch providers,
-and browse recent traffic with the serving provider + fallback badges.
-
-## Development
+JXRouter maintains a comprehensive test suite covering translation matrices, AMEEM firewall gates, template sanitization, response hygiene, and streaming aggregation:
 
 ```bash
-xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release build
+xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -destination "platform=macOS" OTHER_SWIFT_FLAGS="-disable-sandbox" test
 ```
 
-### macOS Intel / universal build
+## Uninstallation
 
-The app is a universal binary (arm64 + x86_64) — one build runs on Apple
-Silicon and Intel Macs:
+To cleanly revert all configuration changes and remove launchers:
 
 ```bash
-xcodebuild -project JXRouter.xcodeproj -scheme JXRouter -configuration Release \
-  -derivedDataPath build build ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO
-# signed universal .app: build/Build/Products/Release/JXRouter.app
+./uninstall.sh
 ```
 
-Pure SwiftUI/AppKit, no third-party dependencies. Source lives in `Sources/JXRouter/`.
-
-## Notes
-
-- DNS/pf hijacking is **permanently removed** — the current app never writes `/etc/hosts` or pf rules. Any re-introduction is a bug.
-- Auth token: the local proxy authenticates Claude Code via an auto-generated token; an optional token can also gate external clients.
+All credentials remain securely stored in the macOS Keychain and are never written to plaintext disk logs.
