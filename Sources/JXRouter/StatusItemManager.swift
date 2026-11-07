@@ -343,14 +343,13 @@ final class StatusItemManager: NSObject {
 
         let finalX: CGFloat
         let startX: CGFloat
+        let tuckDistance: CGFloat = 80 // Crisp, responsive reveal distance
         if slideToRight {
             finalX = min(anchorFrame.maxX, screenFrame.maxX - swWidth)
-            // Start directly tucked behind the dashboard window
-            startX = anchorFrame.minX
+            startX = finalX - tuckDistance
         } else {
             finalX = max(anchorFrame.minX - swWidth, screenFrame.minX)
-            // Start directly tucked behind the dashboard window
-            startX = anchorFrame.maxX - swWidth
+            startX = finalX + tuckDistance
         }
 
         // Align exactly with the anchor window vertically (flush top and bottom borders)
@@ -390,17 +389,20 @@ final class StatusItemManager: NSObject {
             return
         }
 
-        // Window starts tucked behind the dashboard with 0.05 alpha so the emerging slide is smooth
+        // Window starts partially tucked with 0.1 alpha for a crisp, immediate start
         isAnimatingSettings = true
         sw.setFrame(startFrame, display: true)
-        sw.alphaValue = 0.05
+        sw.alphaValue = 0.1
 
         // Order Settings below the dashboard so it visually emerges from beneath it
         sw.order(.below, relativeTo: window.windowNumber)
 
+        // Apple Pro-motion fluid spring curve (cubic-bezier 0.16, 1.0, 0.3, 1.0)
+        let springCurve = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
+
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.32
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.duration = 0.22
+            ctx.timingFunction = springCurve
             sw.animator().setFrame(finalFrame, display: true)
             sw.animator().alphaValue = 1.0
         }, completionHandler: { [weak self, weak sw] in
@@ -434,17 +436,20 @@ final class StatusItemManager: NSObject {
         let currentFrame = sw.frame
         let isRightOfAnchor = currentFrame.minX >= anchorFrame.minX
 
+        let tuckDistance: CGFloat = 80
         let targetX: CGFloat = isRightOfAnchor
-            ? anchorFrame.minX
-            : (anchorFrame.maxX - currentFrame.width)
+            ? (currentFrame.minX - tuckDistance)
+            : (currentFrame.minX + tuckDistance)
 
         let returnFrame = NSRect(x: targetX, y: currentFrame.origin.y, width: currentFrame.width, height: currentFrame.height)
 
         isAnimatingSettings = true
         sw.order(.below, relativeTo: window.windowNumber)
+
+        let dismissCurve = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.25
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            ctx.duration = 0.18
+            ctx.timingFunction = dismissCurve
             sw.animator().setFrame(returnFrame, display: true)
             sw.animator().alphaValue = 0.0
         }, completionHandler: { [weak self, weak sw] in
