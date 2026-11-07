@@ -24,7 +24,7 @@ struct VaultIsolationView: View {
                 Spacer()
                 Button(action: { showCreate = true }) {
                     HStack(spacing: 6) {
-                        Image(systemName: "plus")
+                        TablerIcon("plus")
                             .font(.system(size: 11, weight: .bold))
                         Text("New Vault")
                             .font(.vaultUI(size: 12, weight: .semibold))
@@ -76,7 +76,7 @@ struct VaultCard: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color.vaultAccentDim)
                     .frame(width: 40, height: 40)
-                Image(systemName: "lock.shield.fill")
+                TablerIcon("lock.shield.fill")
                     .font(.system(size: 16))
                     .foregroundStyle(Color.vaultAccent)
             }
@@ -132,7 +132,7 @@ struct VaultActionButton: View {
     
     var body: some View {
         Button(action: {}) {
-            Image(systemName: icon)
+            TablerIcon(icon)
                 .font(.system(size: 11))
                 .foregroundStyle(isHovering ? color : Color.dsTextSecondary)
                 .frame(width: 28, height: 28)
@@ -169,7 +169,7 @@ struct AgentLibraryView: View {
                 Spacer()
                 Button(action: { showEditor = true }) {
                     HStack(spacing: 6) {
-                        Image(systemName: "plus")
+                        TablerIcon("plus")
                             .font(.system(size: 11, weight: .bold))
                         Text("New Agent")
                             .font(.vaultUI(size: 12, weight: .semibold))
@@ -218,7 +218,7 @@ struct AgentCard: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(agent.color.opacity(0.15))
                     .frame(width: 40, height: 40)
-                Image(systemName: agent.icon)
+                TablerIcon(agent.icon)
                     .font(.system(size: 16))
                     .foregroundStyle(agent.color)
             }
@@ -245,7 +245,7 @@ struct AgentCard: View {
                     .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.dsBorder, lineWidth: 1))
                 
                 Button(action: {}) {
-                    Image(systemName: "play.fill")
+                    TablerIcon("play.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(.white)
                         .frame(width: 26, height: 26)
@@ -397,7 +397,7 @@ struct StatCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Image(systemName: icon)
+                TablerIcon(icon)
                     .font(.system(size: 10))
                     .foregroundStyle(color)
                 Text(title)
@@ -522,13 +522,13 @@ struct FileExplorerView: View {
                 
                 HStack(spacing: 6) {
                     Button(action: {}) {
-                        Image(systemName: "magnifyingglass")
+                        TablerIcon("magnifyingglass")
                             .font(.system(size: 12))
                             .foregroundStyle(Color.dsTextSecondary)
                     }
                     .buttonStyle(.plain)
                     Button(action: {}) {
-                        Image(systemName: "eye.slash")
+                        TablerIcon("eye.slash")
                             .font(.system(size: 12))
                             .foregroundStyle(Color.dsTextSecondary)
                     }
@@ -574,7 +574,7 @@ struct FileRow: View {
             ForEach(0..<indent, id: \.self) { _ in
                 Color.clear.frame(width: 16)
             }
-            Image(systemName: isFolder ? "folder.fill" : "doc.fill")
+            TablerIcon(isFolder ? "folder.fill" : "doc.fill")
                 .font(.system(size: 10))
                 .foregroundStyle(isFolder ? .dsOrange : Color(white: 0.6))
             Text(name)

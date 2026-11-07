@@ -56,7 +56,7 @@ struct AppRuleRow: View {
             .frame(width: 120)
 
             Button(role: .destructive) { onDelete() } label: {
-                Image(systemName: "trash")
+                TablerIcon("trash")
                     .font(.system(size: 11))
             }
             .buttonStyle(.plain)

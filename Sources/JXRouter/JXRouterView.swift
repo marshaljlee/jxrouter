@@ -45,7 +45,7 @@ struct JXRouterView: View {
                             .stroke(Color.dsBorder, lineWidth: 2)
                             .frame(width: 64, height: 64)
 
-                        Image(systemName: "bolt.shield.fill")
+                        TablerIcon("bolt.shield.fill")
                             .font(.system(size: 28))
                             .foregroundStyle(manager.isRunning ? Color.dsGreen : Color.dsTextSecondary)
                     }
@@ -63,7 +63,7 @@ struct JXRouterView: View {
             HStack(spacing: 12) {
                 Button(action: { Task { await manager.isRunning ? manager.stopProxy() : manager.startProxy() } }) {
                     HStack {
-                        Image(systemName: manager.isRunning ? "stop.fill" : "play.fill")
+                        TablerIcon(manager.isRunning ? "stop.fill" : "play.fill")
                         Text(manager.isRunning ? "Stop" : "Start")
                             .fontWeight(.medium)
                     }
@@ -82,7 +82,7 @@ struct JXRouterView: View {
                 
                 Button(action: { Task { await manager.restartProxy() } }) {
                     HStack {
-                        Image(systemName: "arrow.triangle.2.circlepath")
+                        TablerIcon("arrow.triangle.2.circlepath")
                         Text("Restart")
                             .fontWeight(.medium)
                     }
@@ -101,7 +101,7 @@ struct JXRouterView: View {
                 
                 Button(action: performUninstall) {
                     HStack {
-                        Image(systemName: "trash.fill")
+                        TablerIcon("trash.fill")
                         Text("Uninstall")
                             .fontWeight(.medium)
                     }
@@ -126,7 +126,7 @@ struct JXRouterView: View {
             // (stops the local model server, sweeps stray workers, purges the
             // disk cache). Local-model loads run a preflight against this.
             HStack(spacing: 10) {
-                Image(systemName: "memorychip")
+                TablerIcon("memorychip")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Color.dsAccent)
                 VStack(alignment: .leading, spacing: 1) {
@@ -164,7 +164,7 @@ struct JXRouterView: View {
 
             if let result = freeRAMResult {
                 HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
+                    TablerIcon("checkmark.circle.fill")
                         .foregroundStyle(Color.dsGreen)
                     Text(result)
                         .font(.system(size: 10))
@@ -174,7 +174,7 @@ struct JXRouterView: View {
                     Button {
                         freeRAMResult = nil
                     } label: {
-                        Image(systemName: "xmark")
+                        TablerIcon("xmark")
                             .font(.system(size: 9, weight: .bold))
                     }
                     .buttonStyle(.plain)
@@ -187,7 +187,7 @@ struct JXRouterView: View {
 
             if !manager.errorAcknowledged, let errorText = manager.errorMessage {
                 HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
+                    TablerIcon("exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                     Text(errorText)
                         .font(.system(size: 11))
@@ -196,7 +196,7 @@ struct JXRouterView: View {
                     Button {
                         manager.errorAcknowledged = true
                     } label: {
-                        Image(systemName: "xmark")
+                        TablerIcon("xmark")
                             .font(.system(size: 10, weight: .bold))
                     }
                     .buttonStyle(.plain)
@@ -216,7 +216,7 @@ struct JXRouterView: View {
             // Plain-language status summary (replaces the old stats grid)
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Image(systemName: "info.circle")
+                    TablerIcon("info.circle")
                         .font(.system(size: 10, weight: .semibold))
                     Text("YOUR SETUP")
                         .font(.system(size: 11, weight: .semibold))
@@ -256,7 +256,7 @@ struct JXRouterView: View {
             // Connection Details
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Image(systemName: "network")
+                    TablerIcon("network")
                         .font(.system(size: 10, weight: .semibold))
                     Text("CONNECTION")
                         .font(.system(size: 11, weight: .semibold))
@@ -294,9 +294,9 @@ struct JXRouterView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Button(action: toggleDetectedApps) {
                     HStack(spacing: 6) {
-                        Image(systemName: isDetectedAppsCollapsed ? "chevron.right" : "chevron.down")
+                        TablerIcon(isDetectedAppsCollapsed ? "chevron.right" : "chevron.down")
                             .font(.system(size: 9, weight: .semibold))
-                        Image(systemName: "antenna.radiowaves.left.and.right")
+                        TablerIcon("antenna.radiowaves.left.and.right")
                             .font(.system(size: 10, weight: .semibold))
                         Text("DETECTED APPS (\(manager.appDetector.detectedApps.count))")
                             .font(.system(size: 11, weight: .semibold))
@@ -326,7 +326,7 @@ struct JXRouterView: View {
                     } else if manager.appDetector.detectedApps.isEmpty {
                         // Empty state
                         VStack(spacing: 8) {
-                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                            TablerIcon("point.3.connected.trianglepath.dotted")
                                 .font(.system(size: 20))
                                 .foregroundStyle(Color.dsTextSecondary)
                             Text("Listening on port \(manager.currentPort)...")
@@ -345,14 +345,14 @@ struct JXRouterView: View {
                             VStack(spacing: 0) {
                                 ForEach(manager.appDetector.detectedApps, id: \.self) { appName in
                                     HStack(spacing: 8) {
-                                        Image(systemName: "app.fill")
+                                        TablerIcon("app.fill")
                                             .font(.system(size: 10))
                                             .foregroundStyle(Color.dsAccent)
                                         Text(appName)
                                             .font(.system(size: 12, weight: .medium))
                                             .foregroundStyle(Color.dsTextPrimary)
                                         Spacer()
-                                        Image(systemName: "circle.fill")
+                                        TablerIcon("circle.fill")
                                             .font(.system(size: 6))
                                             .foregroundStyle(Color.dsGreen)
                                     }
@@ -388,7 +388,7 @@ struct JXRouterView: View {
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 14) {
                     Button(action: { showOnboarding = true }) {
-                        Image(systemName: "questionmark.circle")
+                        TablerIcon("questionmark.circle")
                             .font(.system(size: 13))
                     }
                     .buttonStyle(.plain)
@@ -397,7 +397,7 @@ struct JXRouterView: View {
                     .help("Reopen the onboarding tutorial")
 
                     Button(action: { openSettings() }) {
-                        Image(systemName: "gearshape.fill")
+                        TablerIcon("gearshape.fill")
                             .font(.system(size: 13))
                     }
                     .buttonStyle(.plain)
@@ -408,7 +408,7 @@ struct JXRouterView: View {
                     // Dark / light toggle — sits right next to the settings
                     // gear and follows the app's persisted appearance mode.
                     Button(action: toggleAppearance) {
-                        Image(systemName: appearanceMode.symbolName)
+                        TablerIcon(appearanceMode.symbolName)
                             .font(.system(size: 13))
                     }
                     .buttonStyle(.plain)
@@ -563,7 +563,7 @@ private struct DetailRow: View {
                 .truncationMode(.middle)
             if copyable {
                 Button(action: { copyToPasteboard(value) }) {
-                    Image(systemName: "doc.on.doc")
+                    TablerIcon("doc.on.doc")
                         .font(.system(size: 9))
                         .foregroundStyle(Color.dsTextSecondary)
                 }
@@ -591,7 +591,7 @@ private struct StatusSummaryRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: icon)
+            TablerIcon(icon)
                 .font(.system(size: 10))
                 .foregroundStyle(Color.dsTextSecondary)
                 .frame(width: 16)
@@ -626,7 +626,7 @@ private struct OnboardingView: View {
                     RoundedRectangle(cornerRadius: 16)
                         .fill(Color.dsAccentDim)
                         .frame(width: 56, height: 56)
-                    Image(systemName: "bolt.shield.fill")
+                    TablerIcon("bolt.shield.fill")
                         .font(.system(size: 28))
                         .foregroundStyle(Color.dsAccent)
                 }

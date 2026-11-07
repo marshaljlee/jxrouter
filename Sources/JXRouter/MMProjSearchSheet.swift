@@ -24,7 +24,7 @@ struct MMProjSearchSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing12) {
             HStack {
-                Image(systemName: "arrow.down.circle")
+                TablerIcon("arrow.down.circle")
                     .foregroundStyle(Color.dsAccent)
                 Text("Find a Multimodal Projector")
                     .font(.system(size: DesignToken.subheadSize, weight: .semibold))

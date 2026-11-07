@@ -309,7 +309,7 @@ struct ChatTopBar: View {
     var body: some View {
         HStack(spacing: 12) {
             Button(action: { showSessions.toggle() }) {
-                Image(systemName: "sidebar.left")
+                TablerIcon("sidebar.left")
                     .font(.system(size: 13))
                     .foregroundStyle(Color.dsTextSecondary)
             }
@@ -336,7 +336,7 @@ struct ChatTopBar: View {
                 HStack(spacing: 4) {
                     Text(model)
                         .font(.vaultMono(size: 10))
-                    Image(systemName: "chevron.down")
+                    TablerIcon("chevron.down")
                         .font(.system(size: 8))
                 }
                 .foregroundStyle(Color.dsTextSecondary)
@@ -425,7 +425,7 @@ struct CodeBlockView: View {
                 Spacer()
                 Button(action: copyToClipboard) {
                     HStack(spacing: 4) {
-                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        TablerIcon(copied ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 10))
                         Text(copied ? "Copied" : "Copy")
                             .font(.vaultUI(size: 10))
@@ -490,14 +490,14 @@ struct ThinkingDisclosureView: View {
                 }
             }) {
                 HStack(spacing: 6) {
-                    Image(systemName: "brain.head.profile")
+                    TablerIcon("brain.head.profile")
                         .font(.system(size: 11))
                         .foregroundStyle(Color.vaultAccent)
                     Text(isExpanded ? "Thinking process" : "Thinking process (\(wordCount) words)")
                         .font(.vaultUI(size: 11, weight: .medium))
                         .foregroundStyle(Color.dsTextSecondary)
                     Spacer()
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    TablerIcon(isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(Color.dsTextTertiary)
                 }
@@ -541,7 +541,7 @@ struct ChatBubble: View {
                         .fill(Color.vaultAccent)
                         .frame(width: 24, height: 24)
                         .overlay(
-                            Image(systemName: "sparkles")
+                            TablerIcon("sparkles")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.white)
                         )
@@ -606,7 +606,7 @@ struct ChatBubble: View {
                         .fill(Color.dsAccent)
                         .frame(width: 24, height: 24)
                         .overlay(
-                            Image(systemName: "person.fill")
+                            TablerIcon("person.fill")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.white)
                         )
@@ -635,7 +635,7 @@ struct ToolCallChip: View {
                     Circle()
                         .fill(toolStatusColor)
                         .frame(width: 6, height: 6)
-                    Image(systemName: "hammer.fill")
+                    TablerIcon("hammer.fill")
                         .font(.system(size: 9))
                         .foregroundStyle(Color.dsTextTertiary)
                     Text(tool.name)
@@ -648,7 +648,7 @@ struct ToolCallChip: View {
                             .lineLimit(1)
                     }
                     if tool.arguments != nil {
-                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        TablerIcon(isExpanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8))
                             .foregroundStyle(Color.dsTextTertiary)
                     }
@@ -718,7 +718,7 @@ struct ChatInput: View {
         HStack(spacing: 10) {
             // Attach
             Button(action: {}) {
-                Image(systemName: "paperclip")
+                TablerIcon("paperclip")
                     .font(.system(size: 14))
                     .foregroundStyle(Color.dsTextSecondary)
             }
@@ -735,7 +735,7 @@ struct ChatInput: View {
             // Stop or Send
             if isStreaming {
                 Button(action: { isStreaming = false }) {
-                    Image(systemName: "stop.fill")
+                    TablerIcon("stop.fill")
                         .font(.system(size: 12))
                         .foregroundStyle(.white)
                         .frame(width: 28, height: 28)
@@ -744,7 +744,7 @@ struct ChatInput: View {
                 .buttonStyle(.plain)
             } else {
                 Button(action: onSend) {
-                    Image(systemName: "arrow.up")
+                    TablerIcon("arrow.up")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(text.isEmpty ? Color.dsTextSecondary : .white)
                         .frame(width: 28, height: 28)
@@ -781,7 +781,7 @@ struct StreamingIndicator: View {
                 .fill(Color.vaultAccent)
                 .frame(width: 24, height: 24)
                 .overlay(
-                    Image(systemName: "sparkles")
+                    TablerIcon("sparkles")
                         .font(.system(size: 11))
                         .foregroundStyle(.white)
                 )
@@ -825,7 +825,7 @@ struct SessionSidebar: View {
                     sessions = DataStore.shared.loadSessions()
                     selectedSession = session.id
                 }) {
-                    Image(systemName: "plus")
+                    TablerIcon("plus")
                         .font(.system(size: 11))
                         .foregroundStyle(Color.dsTextSecondary)
                 }

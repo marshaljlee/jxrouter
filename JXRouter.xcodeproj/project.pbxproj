@@ -31,6 +31,7 @@
 		74AC9D59AD58EFF4A4B44DEE /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E9C2B90A5DCA5D29F2BEC039 /* Assets.xcassets */; };
 		787F19D30B1129115B86CBFB8FC3E234 /* LocalProviderDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB4E666D46E00C60F4D4EAE747C24444 /* LocalProviderDetector.swift */; };
 		7C7F6D3D97AABBE0AE0C5D96 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 576276471E20C6D631E44F82 /* DesignTokens.swift */; };
+		9A8B7C6D5E4F3A2B1C0D9E8F /* TablerIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B7C6D5E4F3A2B1C0D9E8F7A /* TablerIcons.swift */; };
 		86CD8560AA5A99FF00DF0F00 /* LocalModelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 653E08473BE316F12894F44A /* LocalModelManager.swift */; };
 		A4146DC857234A2599FB33D6A4B6F02B /* LlamaRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28D6079544354ED2A791079B712C3999 /* LlamaRuntime.swift */; };
 		756B9E787CF046D2B58152BA35E61417 /* LocalModelAutoConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3A98C68F04C42AF8F30F8DD53B16523 /* LocalModelAutoConfig.swift */; };
@@ -175,6 +176,7 @@
 		4BE4B9C28F58255BA6CC8E4E /* TrafficLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrafficLog.swift; sourceTree = "<group>"; };
 		4D2994B2AE0A24424042042C19E12B8B /* ClaudeSettingsWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeSettingsWriter.swift; sourceTree = "<group>"; };
 		576276471E20C6D631E44F82 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		8B7C6D5E4F3A2B1C0D9E8F7A /* TablerIcons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TablerIcons.swift; sourceTree = "<group>"; };
 		5CADC5FCE00C916BB2185C44 /* StatusItemManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusItemManager.swift; sourceTree = "<group>"; };
 		5DF2D9AF320214520D4C1574 /* DNSRedirectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DNSRedirectionManager.swift; sourceTree = "<group>"; };
 		5F6B6C8ABF1D3118CAC40AD3 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -346,6 +348,7 @@
 				9CFE43496DD733D595F057A1 /* CertificateAuthority.swift */,
 				2669665B900523D61FAA1426 /* ConfigManager.swift */,
 				576276471E20C6D631E44F82 /* DesignTokens.swift */,
+				8B7C6D5E4F3A2B1C0D9E8F7A /* TablerIcons.swift */,
 				E831B4E61CED1376147E4AC4 /* DirectTLSHandler.swift */,
 				5DF2D9AF320214520D4C1574 /* DNSRedirectionManager.swift */,
 				2DF6DB3EE7687110DA182C79 /* Info.plist */,
@@ -571,6 +574,7 @@
 				CED5CFA3839FC6FE4396FE47 /* ConfigManager.swift in Sources */,
 				B573BA34270AF5400393C730 /* DNSRedirectionManager.swift in Sources */,
 				7C7F6D3D97AABBE0AE0C5D96 /* DesignTokens.swift in Sources */,
+				9A8B7C6D5E4F3A2B1C0D9E8F /* TablerIcons.swift in Sources */,
 				3C7DB2EAB822696E016793B6 /* DirectTLSHandler.swift in Sources */,
 				A383401CCCC59E755C0F0E5C /* JXRouterApp.swift in Sources */,
 				644A6E29016D7CD42F0D0330 /* JXRouterView.swift in Sources */,

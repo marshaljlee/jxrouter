@@ -84,7 +84,7 @@ struct VaultSidebar: View {
         VStack(spacing: 0) {
             // App Logo
             HStack(spacing: 8) {
-                Image(systemName: "lock.shield.fill")
+                TablerIcon("lock.shield.fill")
                     .font(.vaultUI(size: 18, weight: .bold))
                     .foregroundStyle(Color.vaultAccent)
                 Text("Vault")
@@ -159,7 +159,7 @@ struct SidebarRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                Image(systemName: item.icon)
+                TablerIcon(item.icon)
                     .font(.system(size: 13))
                     .foregroundStyle(isSelected ? item.color : Color.dsTextSecondary)
                     .frame(width: 18)
@@ -202,7 +202,7 @@ struct BridgeModeToggle: View {
     var body: some View {
         Button(action: { isBridged.toggle() }) {
             HStack(spacing: 8) {
-                Image(systemName: isBridged ? "exclamationmark.triangle.fill" : "lock.shield.fill")
+                TablerIcon(isBridged ? "exclamationmark.triangle.fill" : "lock.shield.fill")
                     .font(.system(size: 12))
                     .foregroundStyle(isBridged ? Color.vaultBridge : Color.vaultSandbox)
                 

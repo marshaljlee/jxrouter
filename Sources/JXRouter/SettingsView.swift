@@ -347,7 +347,7 @@ struct SettingsView: View {
             ProgressView().controlSize(.small)
         case .valid:
             HStack(spacing: 4) {
-                Image(systemName: "checkmark.circle.fill")
+                TablerIcon("checkmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.dsGreen)
                 Text("Connected")
@@ -356,7 +356,7 @@ struct SettingsView: View {
             }
         case .invalid(let reason):
             HStack(spacing: 4) {
-                Image(systemName: "xmark.circle.fill")
+                TablerIcon("xmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.dsRed)
                 Text(reason)
@@ -378,7 +378,7 @@ struct SettingsView: View {
             ProgressView().controlSize(.small)
         case .valid:
             HStack(spacing: 4) {
-                Image(systemName: "checkmark.circle.fill")
+                TablerIcon("checkmark.circle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsGreen)
                 Text("Connected")
@@ -387,7 +387,7 @@ struct SettingsView: View {
             }
         case .invalid(let reason):
             HStack(spacing: 4) {
-                Image(systemName: "xmark.circle.fill")
+                TablerIcon("xmark.circle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsRed)
                 Text(reason)
@@ -677,7 +677,7 @@ struct SettingsView: View {
                 }) {
                     VStack(spacing: 8) {
                         HStack(spacing: 6) {
-                            Image(systemName: tab.icon)
+                            TablerIcon(tab.icon)
                                 .font(.system(size: 13))
                             Text(tab.rawValue)
                                 .font(.system(size: 13, weight: selectedTab == tab ? .medium : .regular))
@@ -831,7 +831,7 @@ struct SettingsView: View {
                                 HStack {
                                     Text("\(activeAlias) (Active in llama-server)")
                                     if ggufModelAlias == activeAlias || ggufModelPath == activePath {
-                                        Image(systemName: "checkmark")
+                                        TablerIcon("checkmark")
                                     }
                                 }
                             }
@@ -863,7 +863,7 @@ struct SettingsView: View {
                                     }
                                     Spacer()
                                     if ggufModelPath == model.path || ggufModelAlias == model.suggestedAlias {
-                                        Image(systemName: "checkmark")
+                                        TablerIcon("checkmark")
                                             .foregroundStyle(Color.dsAccent)
                                     }
                                 }
@@ -871,7 +871,7 @@ struct SettingsView: View {
                         }
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: "cpu")
+                            TablerIcon("cpu")
                                 .font(.system(size: 11))
                                 .foregroundStyle(Color.dsAccent)
                             Text(selectedGGUFDisplayName)
@@ -879,7 +879,7 @@ struct SettingsView: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
-                            Image(systemName: "chevron.up.chevron.down")
+                            TablerIcon("chevron.up.chevron.down")
                                 .font(.system(size: 9))
                                 .foregroundStyle(Color.dsTextSecondary)
                         }
@@ -900,7 +900,7 @@ struct SettingsView: View {
                         if ggufScanState == "Scanning…" {
                             ProgressView().controlSize(.small)
                         } else {
-                            Image(systemName: "arrow.triangle.2.circlepath")
+                            TablerIcon("arrow.triangle.2.circlepath")
                         }
                     }
                     .buttonStyle(.bordered)
@@ -924,7 +924,7 @@ struct SettingsView: View {
                         Button {
                             addModelFolder()
                         } label: {
-                            Image(systemName: "plus")
+                            TablerIcon("plus")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -938,7 +938,7 @@ struct SettingsView: View {
                     } else {
                         ForEach(ggufSearchPaths, id: \.self) { folder in
                             HStack(spacing: 6) {
-                                Image(systemName: "folder")
+                                TablerIcon("folder")
                                     .font(.system(size: 10))
                                     .foregroundStyle(Color.dsTextTertiary)
                                 Text(folder)
@@ -951,7 +951,7 @@ struct SettingsView: View {
                                     saveConfigImmediately()
                                     Task { await scanGGUFModels() }
                                 } label: {
-                                    Image(systemName: "minus.circle")
+                                    TablerIcon("minus.circle")
                                 }
                                 .buttonStyle(.borderless)
                                 .controlSize(.small)
@@ -967,23 +967,23 @@ struct SettingsView: View {
                         Label {
                             Text(selected.quantization.isEmpty ? "GGUF" : selected.quantization)
                         } icon: {
-                            Image(systemName: "shippingbox")
+                            TablerIcon("shippingbox")
                         }
                         Label {
                             Text("\(selected.contextLength) ctx")
                         } icon: {
-                            Image(systemName: "text.alignleft")
+                            TablerIcon("text.alignleft")
                         }
                         Label {
                             Text(selected.architecture)
                         } icon: {
-                            Image(systemName: "cpu")
+                            TablerIcon("cpu")
                         }
                         if selected.isMultimodal || !ggufMmprojPath.isEmpty {
                             Label {
                                 Text("Multimodal / Vision")
                             } icon: {
-                                Image(systemName: "eye.fill")
+                                TablerIcon("eye.fill")
                             }
                             .foregroundStyle(Color.dsAccent)
                         }
@@ -991,7 +991,7 @@ struct SettingsView: View {
                             Label {
                                 Text("Large model")
                             } icon: {
-                                Image(systemName: "exclamationmark.triangle")
+                                TablerIcon("exclamationmark.triangle")
                             }
                             .foregroundStyle(Color.orange)
                         }
@@ -1010,7 +1010,7 @@ struct SettingsView: View {
                         Spacer()
                         if !ggufMmprojPath.isEmpty {
                             HStack(spacing: 4) {
-                                Image(systemName: "eye.fill")
+                                TablerIcon("eye.fill")
                                 Text("Vision Active")
                             }
                             .font(.system(size: 9, weight: .bold))
@@ -1033,7 +1033,7 @@ struct SettingsView: View {
                                 HStack {
                                     Text("Auto-detect Companion")
                                     if ggufMmprojPath.isEmpty || ggufMmprojPath == (ggufModels.first(where: { $0.path == ggufModelPath })?.mmprojPath) {
-                                        Image(systemName: "checkmark")
+                                        TablerIcon("checkmark")
                                     }
                                 }
                             }
@@ -1050,7 +1050,7 @@ struct SettingsView: View {
                                         HStack {
                                             Text((path as NSString).lastPathComponent)
                                             if ggufMmprojPath == path {
-                                                Image(systemName: "checkmark")
+                                                TablerIcon("checkmark")
                                             }
                                         }
                                     }
@@ -1074,7 +1074,7 @@ struct SettingsView: View {
                             }
                         } label: {
                             HStack(spacing: 6) {
-                                Image(systemName: "eye")
+                                TablerIcon("eye")
                                     .font(.system(size: 11))
                                     .foregroundStyle(ggufMmprojPath.isEmpty ? Color.dsTextTertiary : Color.dsAccent)
                                 Text(selectedMmprojDisplayName)
@@ -1082,7 +1082,7 @@ struct SettingsView: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer()
-                                Image(systemName: "chevron.up.chevron.down")
+                                TablerIcon("chevron.up.chevron.down")
                                     .font(.system(size: 9))
                                     .foregroundStyle(Color.dsTextSecondary)
                             }
@@ -1100,7 +1100,7 @@ struct SettingsView: View {
                         Button {
                             chooseMmprojFile()
                         } label: {
-                            Image(systemName: "folder")
+                            TablerIcon("folder")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -1129,7 +1129,7 @@ struct SettingsView: View {
 
                 if !ramPreflightWarning.isEmpty {
                     HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: "memorychip")
+                        TablerIcon("memorychip")
                             .foregroundStyle(Color.orange)
                         Text(ramPreflightWarning)
                             .font(.system(size: DesignToken.caption2Size))
@@ -1292,7 +1292,7 @@ struct SettingsView: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer()
-                                Image(systemName: "chevron.up.chevron.down")
+                                TablerIcon("chevron.up.chevron.down")
                                     .font(.system(size: DesignToken.caption2Size))
                                     .foregroundStyle(Color.dsTextTertiary)
                             }
@@ -1538,7 +1538,7 @@ struct SettingsView: View {
     private var llamaRuntimeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: "gearshape.2.fill")
+                TablerIcon("gearshape.2.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.dsAccent)
                 Text("llama.cpp Runtime")
@@ -1595,7 +1595,7 @@ struct SettingsView: View {
     private var prismRuntimeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: "triangle.lequalspath.fill")
+                TablerIcon("triangle.lequalspath.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.dsAccent)
                 Text("PrismML Runtime (ternary models)")
@@ -1901,7 +1901,7 @@ struct SettingsView: View {
                 @ObservedObject var oauth = geminiOAuth
                 HStack(spacing: 8) {
                     if geminiOAuth.isAuthorized {
-                        Image(systemName: "checkmark.circle.fill")
+                        TablerIcon("checkmark.circle.fill")
                             .font(.system(size: 11))
                             .foregroundStyle(Color.dsGreen)
                         Text("Authorized")
@@ -2001,7 +2001,7 @@ struct SettingsView: View {
                         Task { await fetchLocalEndpointModels() }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "cpu.fill")
+                            TablerIcon("cpu.fill")
                             Text("Built-in GGUF (:\(ggufP))")
                         }
                         .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":\(ggufP)") ? .bold : .regular))
@@ -2016,7 +2016,7 @@ struct SettingsView: View {
                         Task { await fetchLocalEndpointModels() }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "desktopcomputer")
+                            TablerIcon("desktopcomputer")
                             Text("Llama.app (:\(livePort))")
                         }
                         .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":\(livePort)") ? .bold : .regular))
@@ -2031,7 +2031,7 @@ struct SettingsView: View {
                         Task { await fetchLocalEndpointModels() }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "cpu")
+                            TablerIcon("cpu")
                             Text("LM Studio (:1234)")
                         }
                         .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":1234") ? .bold : .regular))
@@ -2046,7 +2046,7 @@ struct SettingsView: View {
                         Task { await fetchLocalEndpointModels() }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "shippingbox")
+                            TablerIcon("shippingbox")
                             Text("Ollama (:11434)")
                         }
                         .font(.system(size: DesignToken.caption2Size, weight: localBaseUrl.contains(":11434") ? .bold : .regular))
@@ -2395,15 +2395,15 @@ struct SettingsView: View {
             case .checking:
                 ProgressView().controlSize(.mini)
             case .healthy:
-                Image(systemName: "checkmark.circle.fill")
+                TablerIcon("checkmark.circle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsGreen)
             case .unhealthy:
-                Image(systemName: "xmark.circle.fill")
+                TablerIcon("xmark.circle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsRed)
             case .rateLimited:
-                Image(systemName: "exclamationmark.triangle.fill")
+                TablerIcon("exclamationmark.triangle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsOrange)
             }
@@ -2555,7 +2555,7 @@ struct SettingsView: View {
                         .font(.system(size: DesignToken.caption2Size, weight: .medium))
                         .foregroundStyle(Color.dsTextPrimary)
                     if isActive {
-                        Image(systemName: "checkmark.circle.fill")
+                        TablerIcon("checkmark.circle.fill")
                             .font(.system(size: 9))
                             .foregroundStyle(Color.dsAccent)
                     }
@@ -2870,7 +2870,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func savedFieldCheckmark(_ id: String) -> some View {
         if savedFieldFlash.contains(id) {
-            Image(systemName: "checkmark.circle.fill")
+            TablerIcon("checkmark.circle.fill")
                 .font(.system(size: 10))
                 .foregroundStyle(Color.dsGreen)
                 .symbolEffect(.bounce, value: savedFieldFlash)
@@ -3678,12 +3678,12 @@ struct SettingsView: View {
                         toggleFallback(preset.id)
                     } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: preset.symbol)
+                            TablerIcon(preset.symbol)
                                 .frame(width: 14, height: 14)
                             Text(preset.name)
                             Spacer()
                             if current.contains(preset.id) {
-                                Image(systemName: "checkmark")
+                                TablerIcon("checkmark")
                                     .foregroundStyle(Color.dsAccent)
                             }
                         }
@@ -3699,7 +3699,7 @@ struct SettingsView: View {
                         : current.map { providerPreset($0)?.name ?? $0 }.joined(separator: " → "))
                         .lineLimit(1)
                     Spacer()
-                    Image(systemName: "chevron.up.chevron.down")
+                    TablerIcon("chevron.up.chevron.down")
                         .font(.system(size: 9))
                         .foregroundStyle(Color.dsTextSecondary)
                 }
@@ -3783,7 +3783,7 @@ struct SettingsView: View {
         return VStack(alignment: .leading, spacing: DesignToken.spacing6) {
             // Tier label
             HStack(spacing: 6) {
-                Image(systemName: tierSymbol(tier))
+                TablerIcon(tierSymbol(tier))
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsAccent)
                 Text(tier.displayName)
@@ -3806,27 +3806,27 @@ struct SettingsView: View {
                         setTierProvider(tier, preset.id)
                     } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: preset.symbol)
+                            TablerIcon(preset.symbol)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
                                 .frame(width: 14, height: 14)
                             Text(preset.name)
                             Spacer()
                             if pid == preset.id {
-                                Image(systemName: "checkmark")
+                                TablerIcon("checkmark")
                                     .foregroundStyle(Color.dsAccent)
                             }
                         }
                     }
                 }
             } label: {
-                HStack(spacing: 6) {                    Image(systemName: providerPreset(pid)?.symbol ?? "network")
+                HStack(spacing: 6) {                    TablerIcon(providerPreset(pid)?.symbol ?? "network")
                         .foregroundStyle(Color.dsAccent)
                         .frame(width: 14)
                     Text(providerPreset(pid)?.name ?? pid)
                         .lineLimit(1)
                         Spacer()
-                        Image(systemName: "chevron.up.chevron.down")
+                        TablerIcon("chevron.up.chevron.down")
                             .font(.system(size: 9))
                             .foregroundStyle(Color.dsTextSecondary)
                     }
@@ -3886,7 +3886,7 @@ struct SettingsView: View {
             }
         case .failed(let reason):
             HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
+                TablerIcon("exclamationmark.triangle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dsOrange)
                 Text(reason)
@@ -3944,7 +3944,7 @@ struct SettingsView: View {
     private func savedCustomProviderRow(_ def: CustomProviderDef) -> some View {
         VStack(alignment: .leading, spacing: DesignToken.spacing6) {
             HStack(spacing: 6) {
-                Image(systemName: "puzzlepiece.extension")
+                TablerIcon("puzzlepiece.extension")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.dsAccent)
                 Text(def.name)
@@ -3969,7 +3969,7 @@ struct SettingsView: View {
                     }
                     saveConfigImmediately()
                 } label: {
-                    Image(systemName: "trash")
+                    TablerIcon("trash")
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.plain)
@@ -3984,7 +3984,7 @@ struct SettingsView: View {
             if (customProviderKeys[def.id] ?? "").isEmpty,
                let source = config.inheritedKeySource(for: def.baseUrl) {
                 HStack(spacing: 4) {
-                    Image(systemName: "link.circle.fill")
+                    TablerIcon("link.circle.fill")
                         .font(.system(size: 10))
                         .foregroundStyle(Color.dsAccent)
                     Text("Using \(providerPreset(source)?.name ?? source)'s API key — same endpoint")
@@ -4602,7 +4602,7 @@ private struct LogEntryRow: View {
                 if let servedBy = entry.servedBy {
                     HStack(spacing: 3) {
                         if entry.usedFallback {
-                            Image(systemName: "arrow.triangle.branch")
+                            TablerIcon("arrow.triangle.branch")
                                 .font(.system(size: 9))
                         }
                         Text(providerDisplayName(servedBy))
@@ -4674,7 +4674,7 @@ private struct LocalModelOnboardingView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
-                Image(systemName: provider == .llamaapp ? "desktopcomputer" : "server.rack")
+                TablerIcon(provider == .llamaapp ? "desktopcomputer" : "server.rack")
                     .font(.system(size: 22))
                     .foregroundStyle(Color.dsAccent)
                 VStack(alignment: .leading, spacing: 2) {
@@ -4785,7 +4785,7 @@ struct FreeApiKeyGuideView: View {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(Color.dsAccentDim)
                         .frame(width: 48, height: 48)
-                    Image(systemName: "sparkles")
+                    TablerIcon("sparkles")
                         .font(.system(size: 22))
                         .foregroundStyle(Color.dsAccent)
                 }

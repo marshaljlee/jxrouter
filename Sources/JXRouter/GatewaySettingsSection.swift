@@ -143,7 +143,7 @@ struct GatewaySettingsSection: View {
                     Label {
                         Text("\(snap.inlinedCount) files inlined")
                     } icon: {
-                        Image(systemName: "doc.text")
+                        TablerIcon("doc.text")
                     }
                     .font(.system(size: DesignToken.captionSize))
                     .foregroundStyle(Color.dsTextSecondary)
