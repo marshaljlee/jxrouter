@@ -50,13 +50,8 @@ final class StatusItemManager: NSObject {
 
         guard let button = statusItem.button else { return }
 
-        // Set initial icon
-        let iconName = proxyManager.isRunning ? "bolt.fill" : "bolt.slash"
-        button.image = NSImage(
-            systemSymbolName: iconName,
-            accessibilityDescription: "JXProxy"
-        )
-        button.image?.isTemplate = true
+        // Set initial icon matching the lightning bolt design
+        button.image = makeStatusIcon(isRunning: proxyManager.isRunning)
 
         // Custom view overlay to detect left vs. right click.
         // StatusItemButton does not natively differentiate them, so we
@@ -682,12 +677,71 @@ final class StatusItemManager: NSObject {
 
     private func updateIcon() {
         guard let button = statusItem.button else { return }
-        let iconName = proxyManager.isRunning ? "bolt.fill" : "bolt.slash"
-        button.image = NSImage(
-            systemSymbolName: iconName,
-            accessibilityDescription: "JXProxy"
-        )
-        button.image?.isTemplate = true
+        button.image = makeStatusIcon(isRunning: proxyManager.isRunning)
+    }
+
+    /// Renders an authentic template menubar icon matching the app's lightning bolt shape.
+    private func makeStatusIcon(isRunning: Bool) -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { bounds in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.setShouldAntialias(true)
+            ctx.interpolationQuality = .high
+
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: bounds.height)
+            ctx.scaleBy(x: 1, y: -1)
+
+            let pad: CGFloat = 1.5
+            let drawWidth = bounds.width - pad * 2
+            let scale = drawWidth / 24.0
+            ctx.translateBy(x: pad, y: pad)
+            ctx.scaleBy(x: scale, y: scale)
+
+            let boltPath = CGMutablePath()
+            boltPath.move(to: CGPoint(x: 5.66953, y: 9.91436))
+            boltPath.addLine(to: CGPoint(x: 8.73167, y: 5.77133))
+            boltPath.addCurve(to: CGPoint(x: 12.6241, y: 2.03721), control1: CGPoint(x: 10.711, y: 3.09327), control2: CGPoint(x: 11.7007, y: 1.75425))
+            boltPath.addCurve(to: CGPoint(x: 13.5474, y: 7.24712), control1: CGPoint(x: 13.5474, y: 2.32018), control2: CGPoint(x: 13.5474, y: 3.96249))
+            boltPath.addLine(to: CGPoint(x: 13.5474, y: 7.55682))
+            boltPath.addCurve(to: CGPoint(x: 13.926, y: 9.70541), control1: CGPoint(x: 13.5474, y: 8.74151), control2: CGPoint(x: 13.5474, y: 9.33386))
+            boltPath.addLine(to: CGPoint(x: 13.946, y: 9.72466))
+            boltPath.addCurve(to: CGPoint(x: 16.1822, y: 10.0884), control1: CGPoint(x: 14.3327, y: 10.0884), control2: CGPoint(x: 14.9492, y: 10.0884))
+            boltPath.addCurve(to: CGPoint(x: 19.8855, y: 10.7613), control1: CGPoint(x: 18.4011, y: 10.0884), control2: CGPoint(x: 19.5106, y: 10.0884))
+            boltPath.addLine(to: CGPoint(x: 19.9036, y: 10.795))
+            boltPath.addCurve(to: CGPoint(x: 18.3304, y: 14.0857), control1: CGPoint(x: 20.2576, y: 11.4784), control2: CGPoint(x: 19.6152, y: 12.3475))
+            boltPath.addLine(to: CGPoint(x: 15.2683, y: 18.2287))
+            boltPath.addCurve(to: CGPoint(x: 11.3758, y: 21.9628), control1: CGPoint(x: 13.2889, y: 20.9067), control2: CGPoint(x: 12.2992, y: 22.2458))
+            boltPath.addCurve(to: CGPoint(x: 10.4525, y: 16.7528), control1: CGPoint(x: 10.4525, y: 21.6798), control2: CGPoint(x: 10.4525, y: 20.0375))
+            boltPath.addLine(to: CGPoint(x: 10.4526, y: 16.4433))
+            boltPath.addCurve(to: CGPoint(x: 10.074, y: 14.2946), control1: CGPoint(x: 10.4526, y: 15.2585), control2: CGPoint(x: 10.4526, y: 14.6662))
+            boltPath.addLine(to: CGPoint(x: 10.054, y: 14.2754))
+            boltPath.addCurve(to: CGPoint(x: 7.81775, y: 13.9117), control1: CGPoint(x: 9.6673, y: 13.9117), control2: CGPoint(x: 9.05079, y: 13.9117))
+            boltPath.addCurve(to: CGPoint(x: 4.1145, y: 13.2387), control1: CGPoint(x: 5.59888, y: 13.9117), control2: CGPoint(x: 4.48945, y: 13.9117))
+            boltPath.addLine(to: CGPoint(x: 4.09639, y: 13.205))
+            boltPath.addCurve(to: CGPoint(x: 5.66953, y: 9.91436), control1: CGPoint(x: 3.74244, y: 12.5217), control2: CGPoint(x: 4.3848, y: 11.6526))
+            boltPath.closeSubpath()
+
+            ctx.addPath(boltPath)
+            if isRunning {
+                ctx.setFillColor(NSColor.black.cgColor)
+                ctx.fillPath()
+            } else {
+                ctx.setStrokeColor(NSColor.black.cgColor)
+                ctx.setLineWidth(1.6 / scale)
+                ctx.strokePath()
+
+                ctx.move(to: CGPoint(x: 2, y: 22))
+                ctx.addLine(to: CGPoint(x: 22, y: 2))
+                ctx.setLineWidth(1.8 / scale)
+                ctx.strokePath()
+            }
+
+            ctx.restoreGState()
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 
     deinit {
