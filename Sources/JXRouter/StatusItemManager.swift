@@ -363,12 +363,19 @@ final class StatusItemManager: NSObject {
         let finalFrame = NSRect(x: finalX, y: finalY, width: swWidth, height: swHeight)
         let startFrame = NSRect(x: startX, y: finalY, width: swWidth, height: swHeight)
 
-        // Close observer — closing Settings clears reference
-        NotificationCenter.default.addObserver(
+        // Close observer — closing Settings clears reference.
+        //
+        // The observer is bound to this one window (object: sw) and the window
+        // is rebuilt on every open, so the token is captured and removed from
+        // inside the handler. Without that, NotificationCenter keeps the block
+        // alive forever and each open/close cycle leaks one more.
+        let closeToken = NotificationObserverToken()
+        closeToken.value = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
             object: sw,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self, closeToken] _ in
+            closeToken.remove()
             NotificationCenter.default.post(name: .jxproxyFlushSettingsSave, object: nil)
             Task { @MainActor [weak self] in
                 if let sw = self?.settingsWindow {
@@ -658,12 +665,15 @@ final class StatusItemManager: NSObject {
         vaultWorkspaceWindow = vw
         vw.makeKeyAndOrderFront(nil)
 
-        // Close observer
-        NotificationCenter.default.addObserver(
+        // Close observer — same self-removing pattern as the Settings window
+        // above: this window is also rebuilt on every open.
+        let closeToken = NotificationObserverToken()
+        closeToken.value = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
             object: vw,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self, closeToken] _ in
+            closeToken.remove()
             Task { @MainActor [weak self] in
                 self?.vaultWorkspaceWindow = nil
             }

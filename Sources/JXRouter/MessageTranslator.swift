@@ -71,6 +71,33 @@ enum MessageTranslator {
         return clean
     }
 
+    /// Defensive request-JSON cleaner: drop anything JSONSerialization could
+    /// not serialize back (`NSNull`, nested non-collection values). A single
+    /// unserializable value poisons the WHOLE body (serialization throws →
+    /// 500 "Failed to serialize request body"), and NSNull inside a tool
+    /// schema is what Claude Code sends for `"properties": {"x": null}` on
+    /// some SDK versions.
+    static func dropUnserializableValues(_ value: Any) -> Any? {
+        switch value {
+        case is NSNull:
+            return nil
+        case let dict as [String: Any]:
+            var clean: [String: Any] = [:]
+            for (k, v) in dict {
+                if let cleaned = dropUnserializableValues(v) { clean[k] = cleaned }
+            }
+            return clean
+        case let list as [Any]:
+            return list.compactMap { dropUnserializableValues($0) }
+        case is String, is Bool, is Int, is Int64, is Double:
+            return value
+        default:
+            // NSNumber passes through as-is; unknown classes are dropped.
+            if value is NSNumber { return value }
+            return nil
+        }
+    }
+
     /// Converts Anthropic tool definitions (with name, description, input_schema)
     /// to standard OpenAI Chat Completions tool definitions with type: "function".
     static func convertToolsToOpenAI(anthropicTools: [Any]) -> [[String: Any]] {
@@ -136,6 +163,19 @@ enum MessageTranslator {
                 }
             default:
                 break
+            }
+            // Claude Code also sends {"type":"any"} and {"type":"none"} as
+            // bare objects (and some SDKs send {"type":"tool","name":…} with
+            // the name at the top level missing). A dict that survived the
+            // switch above would be forwarded VERBATIM — an Anthropic-shaped
+            // tool_choice object that OpenAI-compatible upstreams reject with
+            // 400 ("tool_choice must be a string or function object"), killing
+            // the request before generation starts. Fall back to string forms.
+            switch type {
+            case "auto": return "auto"
+            case "any", "required": return "required"
+            case "none": return "none"
+            default: break
             }
         }
         return toolChoice
@@ -1077,11 +1117,16 @@ enum MessageTranslator {
             events.append(textBlockStart)
         }
 
-        let idx = state.activeBlockIndex ?? 0
-        let textDelta = SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"text_delta\",\"text\":\(jsonEscape(text))}}")
-        events.append(textDelta)
-        // Accumulate for end-of-stream text-channel tool-call recovery.
-        state.textBuffer += text
+        if !text.isEmpty {
+            let clean = ResponseHygiene.stripControlTokens(text)
+            if !clean.isEmpty {
+                let idx = state.activeBlockIndex ?? 0
+                let textDelta = SSEFormatter.format(event: "content_block_delta", data: "{\"type\":\"content_block_delta\",\"index\":\(idx),\"delta\":{\"type\":\"text_delta\",\"text\":\(jsonEscape(clean))}}")
+                events.append(textDelta)
+                // Accumulate for end-of-stream text-channel tool-call recovery.
+                state.textBuffer += clean
+            }
+        }
 
         return events
     }

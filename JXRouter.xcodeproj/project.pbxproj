@@ -114,6 +114,41 @@
 		CF000000000000000000001D /* STE100Linguistics.swift in Sources */ = {isa = PBXBuildFile; fileRef = D44F60A81C3E725B590A1D3F /* STE100Linguistics.swift */; };
 		CF000000000000000000001E /* SourceOfTruthGateway.swift in Sources */ = {isa = PBXBuildFile; fileRef = F66B82CA3E50A947D7B2C3F5 /* SourceOfTruthGateway.swift */; };
 		CF000000000000000000001F /* TrafficLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BE4B9C28F58255BA6CC8E4E /* TrafficLog.swift */; };
+		C0DE00000000000000000064 /* ProviderValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99D143B7FA525428B8314F76B297E7CC /* ProviderValidator.swift */; };
+		C0DE00000000000000000066 /* RAMPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000065 /* RAMPreflight.swift */; };
+		C0DE00000000000000000067 /* RAMPreflight.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000065 /* RAMPreflight.swift */; };
+		C0DE00000000000000000069 /* NotificationObserverToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000068 /* NotificationObserverToken.swift */; };
+		C0DE0000000000000000006A /* NotificationObserverToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000068 /* NotificationObserverToken.swift */; };
+		C0DE0000000000000000006C /* OpenCodeZenShim.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000006B /* OpenCodeZenShim.swift */; };
+		C0DE0000000000000000006D /* OpenCodeZenShim.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000006B /* OpenCodeZenShim.swift */; };
+		C0DE0000000000000000006F /* AMEEMGuardrails.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000006E /* AMEEMGuardrails.swift */; };
+		C0DE00000000000000000070 /* AMEEMGuardrails.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000006E /* AMEEMGuardrails.swift */; };
+		C0DE00000000000000000072 /* AMEEMRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000071 /* AMEEMRecovery.swift */; };
+		C0DE00000000000000000073 /* AMEEMRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000071 /* AMEEMRecovery.swift */; };
+		C0DE00000000000000000075 /* AMEEMCompanions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000074 /* AMEEMCompanions.swift */; };
+		C0DE00000000000000000076 /* AMEEMCompanions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000074 /* AMEEMCompanions.swift */; };
+		C0DE00000000000000000078 /* AMEEMLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000077 /* AMEEMLedger.swift */; };
+		C0DE00000000000000000079 /* AMEEMLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000077 /* AMEEMLedger.swift */; };
+		C0DE0000000000000000007B /* AMEEMFirewall.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000007A /* AMEEMFirewall.swift */; };
+		C0DE0000000000000000007C /* AMEEMFirewall.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000007A /* AMEEMFirewall.swift */; };
+		C0DE0000000000000000007E /* AMEEMCapabilityProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000007D /* AMEEMCapabilityProbe.swift */; };
+		C0DE0000000000000000007F /* AMEEMCapabilityProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000007D /* AMEEMCapabilityProbe.swift */; };
+		C0DE00000000000000000081 /* AMEEMRequestGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000080 /* AMEEMRequestGate.swift */; };
+		C0DE00000000000000000082 /* AMEEMRequestGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000080 /* AMEEMRequestGate.swift */; };
+		C0DE00000000000000000084 /* AMEEMPresetReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000083 /* AMEEMPresetReconciler.swift */; };
+		C0DE00000000000000000085 /* AMEEMPresetReconciler.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000083 /* AMEEMPresetReconciler.swift */; };
+		C0DE00000000000000000087 /* AMEEMStreamBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000086 /* AMEEMStreamBridge.swift */; };
+		C0DE00000000000000000088 /* AMEEMStreamBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000086 /* AMEEMStreamBridge.swift */; };
+		C0DE0000000000000000008A /* ResponseHygiene.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000089 /* ResponseHygiene.swift */; };
+		C0DE0000000000000000008B /* ResponseHygiene.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000089 /* ResponseHygiene.swift */; };
+		C0DE0000000000000000008D /* GGUFTemplateSanitizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000008C /* GGUFTemplateSanitizer.swift */; };
+		C0DE0000000000000000008E /* GGUFTemplateSanitizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000008C /* GGUFTemplateSanitizer.swift */; };
+		C0DE00000000000000000090 /* AgentSettingsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000008F /* AgentSettingsManager.swift */; };
+		C0DE00000000000000000091 /* AgentSettingsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE0000000000000000008F /* AgentSettingsManager.swift */; };
+		C0DE00000000000000000093 /* NotificationObserverTokenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000092 /* NotificationObserverTokenTests.swift */; };
+		C0DE00000000000000000095 /* OpenCodeZenShimTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000094 /* OpenCodeZenShimTests.swift */; };
+		C0DE00000000000000000097 /* AMEEMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000096 /* AMEEMTests.swift */; };
+		C0DE00000000000000000099 /* RecommendedEnhancementsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000098 /* RecommendedEnhancementsTests.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -204,6 +239,25 @@
 		C0DE00000000000000000041 /* PortOwnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PortOwnerTests.swift"; sourceTree = "<group>"; };
 		C0DE00000000000000000042 /* PortOwner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PortOwner.swift"; sourceTree = "<group>"; };
 		C0DE00000000000000000021 /* JXRouterTests.xctest */ = {isa = PBXFileReference; explicitFileType = "wrapper.cfbundle"; includeInIndex = 0; path = JXRouterTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0DE00000000000000000065 /* RAMPreflight.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RAMPreflight.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000068 /* NotificationObserverToken.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationObserverToken.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000006B /* OpenCodeZenShim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCodeZenShim.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000006E /* AMEEMGuardrails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMGuardrails.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000071 /* AMEEMRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMRecovery.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000074 /* AMEEMCompanions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMCompanions.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000077 /* AMEEMLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMLedger.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000007A /* AMEEMFirewall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMFirewall.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000007D /* AMEEMCapabilityProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMCapabilityProbe.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000080 /* AMEEMRequestGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMRequestGate.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000083 /* AMEEMPresetReconciler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMPresetReconciler.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000086 /* AMEEMStreamBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMStreamBridge.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000089 /* ResponseHygiene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponseHygiene.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000008C /* GGUFTemplateSanitizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUFTemplateSanitizer.swift; sourceTree = "<group>"; };
+		C0DE0000000000000000008F /* AgentSettingsManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSettingsManager.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000092 /* NotificationObserverTokenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationObserverTokenTests.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000094 /* OpenCodeZenShimTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCodeZenShimTests.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000096 /* AMEEMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AMEEMTests.swift; sourceTree = "<group>"; };
+		C0DE00000000000000000098 /* RecommendedEnhancementsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecommendedEnhancementsTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 
@@ -269,6 +323,21 @@
 			isa = PBXGroup;
 			children = (
 				4D2994B2AE0A24424042042C19E12B8B /* ClaudeSettingsWriter.swift */,
+				C0DE00000000000000000065 /* RAMPreflight.swift */,
+				C0DE00000000000000000068 /* NotificationObserverToken.swift */,
+				C0DE0000000000000000006B /* OpenCodeZenShim.swift */,
+				C0DE0000000000000000006E /* AMEEMGuardrails.swift */,
+				C0DE00000000000000000071 /* AMEEMRecovery.swift */,
+				C0DE00000000000000000074 /* AMEEMCompanions.swift */,
+				C0DE00000000000000000077 /* AMEEMLedger.swift */,
+				C0DE0000000000000000007A /* AMEEMFirewall.swift */,
+				C0DE0000000000000000007D /* AMEEMCapabilityProbe.swift */,
+				C0DE00000000000000000080 /* AMEEMRequestGate.swift */,
+				C0DE00000000000000000083 /* AMEEMPresetReconciler.swift */,
+				C0DE00000000000000000086 /* AMEEMStreamBridge.swift */,
+				C0DE00000000000000000089 /* ResponseHygiene.swift */,
+				C0DE0000000000000000008C /* GGUFTemplateSanitizer.swift */,
+				C0DE0000000000000000008F /* AgentSettingsManager.swift */,
 				99D143B7FA525428B8314F76B297E7CC /* ProviderValidator.swift */,
 				BB4E666D46E00C60F4D4EAE747C24444 /* LocalProviderDetector.swift */,
 				B94B23D08EA44978FD41A4AE /* AppDetector.swift */,
@@ -347,6 +416,10 @@
 				C0DE00000000000000000040 /* KeychainServiceRenameTests.swift */,
 				C0DE00000000000000000041 /* PortOwnerTests.swift */,
 				C0DE0000000000000000003A /* MessageTranslatorTests.swift */,
+				C0DE00000000000000000092 /* NotificationObserverTokenTests.swift */,
+				C0DE00000000000000000094 /* OpenCodeZenShimTests.swift */,
+				C0DE00000000000000000096 /* AMEEMTests.swift */,
+				C0DE00000000000000000098 /* RecommendedEnhancementsTests.swift */,
 				C0DE0000000000000000003B /* ProviderChainErrorTests.swift */,
 				C0DE0000000000000000003C /* RequestClassifierTests.swift */,
 				C0DE0000000000000000003D /* ResponsesTranslatorTests.swift */,
@@ -474,6 +547,21 @@
 			files = (
 				8203F9A49ABF4435A8F9D1DF /* DataStore.swift in Sources */,
 				89504D0D0E8918A22A53F19B86771C65 /* ClaudeSettingsWriter.swift in Sources */,
+				C0DE00000000000000000066 /* RAMPreflight.swift in Sources */,
+				C0DE00000000000000000069 /* NotificationObserverToken.swift in Sources */,
+				C0DE0000000000000000006C /* OpenCodeZenShim.swift in Sources */,
+				C0DE0000000000000000006F /* AMEEMGuardrails.swift in Sources */,
+				C0DE00000000000000000072 /* AMEEMRecovery.swift in Sources */,
+				C0DE00000000000000000075 /* AMEEMCompanions.swift in Sources */,
+				C0DE00000000000000000078 /* AMEEMLedger.swift in Sources */,
+				C0DE0000000000000000007B /* AMEEMFirewall.swift in Sources */,
+				C0DE0000000000000000007E /* AMEEMCapabilityProbe.swift in Sources */,
+				C0DE00000000000000000081 /* AMEEMRequestGate.swift in Sources */,
+				C0DE00000000000000000084 /* AMEEMPresetReconciler.swift in Sources */,
+				C0DE00000000000000000087 /* AMEEMStreamBridge.swift in Sources */,
+				C0DE0000000000000000008A /* ResponseHygiene.swift in Sources */,
+				C0DE0000000000000000008D /* GGUFTemplateSanitizer.swift in Sources */,
+				C0DE00000000000000000090 /* AgentSettingsManager.swift in Sources */,
 				315B552649CAE9972AD4A8D80014A28D /* ProviderValidator.swift in Sources */,
 				787F19D30B1129115B86CBFB8FC3E234 /* LocalProviderDetector.swift in Sources */,
 				8F2761C25F7580026E40C342 /* AppDetector.swift in Sources */,
@@ -548,6 +636,26 @@
 				C0DE0000000000000000002C /* PortOwnerTests.swift in Sources */,
 				C0DE0000000000000000002E /* PortOwner.swift in Sources */,
 				C0DE00000000000000000032 /* MessageTranslatorTests.swift in Sources */,
+				C0DE00000000000000000064 /* ProviderValidator.swift in Sources */,
+				C0DE00000000000000000067 /* RAMPreflight.swift in Sources */,
+				C0DE0000000000000000006A /* NotificationObserverToken.swift in Sources */,
+				C0DE0000000000000000006D /* OpenCodeZenShim.swift in Sources */,
+				C0DE00000000000000000070 /* AMEEMGuardrails.swift in Sources */,
+				C0DE00000000000000000073 /* AMEEMRecovery.swift in Sources */,
+				C0DE00000000000000000076 /* AMEEMCompanions.swift in Sources */,
+				C0DE00000000000000000079 /* AMEEMLedger.swift in Sources */,
+				C0DE0000000000000000007C /* AMEEMFirewall.swift in Sources */,
+				C0DE0000000000000000007F /* AMEEMCapabilityProbe.swift in Sources */,
+				C0DE00000000000000000082 /* AMEEMRequestGate.swift in Sources */,
+				C0DE00000000000000000085 /* AMEEMPresetReconciler.swift in Sources */,
+				C0DE00000000000000000088 /* AMEEMStreamBridge.swift in Sources */,
+				C0DE0000000000000000008B /* ResponseHygiene.swift in Sources */,
+				C0DE0000000000000000008E /* GGUFTemplateSanitizer.swift in Sources */,
+				C0DE00000000000000000091 /* AgentSettingsManager.swift in Sources */,
+				C0DE00000000000000000093 /* NotificationObserverTokenTests.swift in Sources */,
+				C0DE00000000000000000095 /* OpenCodeZenShimTests.swift in Sources */,
+				C0DE00000000000000000097 /* AMEEMTests.swift in Sources */,
+				C0DE00000000000000000099 /* RecommendedEnhancementsTests.swift in Sources */,
 				C0DE00000000000000000033 /* ProviderChainErrorTests.swift in Sources */,
 				C0DE00000000000000000034 /* RequestClassifierTests.swift in Sources */,
 				C0DE00000000000000000035 /* ResponsesTranslatorTests.swift in Sources */,

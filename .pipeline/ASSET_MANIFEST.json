@@ -1,0 +1,20 @@
+{
+  "system_assets": [
+    {
+      "name": "SF Pro / SF Mono",
+      "type": "system_font",
+      "status": "verified"
+    },
+    {
+      "name": "SF Symbols 5.0",
+      "type": "system_vector_icons",
+      "status": "verified"
+    },
+    {
+      "name": "AppIcon.icns & Assets.car",
+      "type": "application_icon",
+      "status": "verified_universal_retina"
+    }
+  ]
+}
+

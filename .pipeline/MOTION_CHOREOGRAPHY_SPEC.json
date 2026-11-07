@@ -1,0 +1,31 @@
+{
+  "spec_version": "1.0",
+  "motion_engine": "SwiftUI Kinetic Spring Engine",
+  "curves": {
+    "standard_spring": {
+      "response": 0.25,
+      "damping_fraction": 0.82,
+      "blend_duration": 0.0
+    },
+    "expressive_spring": {
+      "response": 0.35,
+      "damping_fraction": 0.78,
+      "blend_duration": 0.0
+    },
+    "snappy": {
+      "response": 0.18,
+      "damping_fraction": 0.88,
+      "blend_duration": 0.0
+    }
+  },
+  "transitions": {
+    "card_expansion": "asymmetric(insertion: scale(0.98) + opacity, removal: opacity)",
+    "status_pill": "spring(0.2) + scaleEffect on state toggle",
+    "log_entry": "opacity + move(edge: top)"
+  },
+  "accessibility": {
+    "reduce_motion_override": true,
+    "fallback_transition": "Animation.linear(duration: 0.08)"
+  }
+}
+

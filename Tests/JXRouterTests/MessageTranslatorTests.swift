@@ -777,6 +777,299 @@ final class MessageTranslatorTests {
         assertTrue(!extracted.cleanText.contains("```json"), "Fenced json tool call block must be stripped from cleanText")
     }
 
+    // MARK: - Claude CLI protocol hardening (2026-09-26)
+
+    static func testToolChoiceObjectFallbacks() {
+        print("▶️ Running testToolChoiceObjectFallbacks...")
+        // Anthropic {"type":"any"} object form → OpenAI "required" string.
+        // Forwarding the dict verbatim made OpenAI-compatible upstreams 400.
+        let anyChoice = MessageTranslator.convertToolChoiceToOpenAI(["type": "any"])
+        assertTrue(anyChoice as? String == "required", "tool_choice {type:any} must map to \"required\", got \(anyChoice)")
+
+        let noneChoice = MessageTranslator.convertToolChoiceToOpenAI(["type": "none"])
+        assertTrue(noneChoice as? String == "none", "tool_choice {type:none} must map to \"none\"")
+
+        let autoChoice = MessageTranslator.convertToolChoiceToOpenAI(["type": "auto"])
+        assertTrue(autoChoice as? String == "auto", "tool_choice {type:auto} must map to \"auto\"")
+
+        // Named tool object form still maps to the function form.
+        let named = MessageTranslator.convertToolChoiceToOpenAI(["type": "tool", "name": "Bash"])
+        let namedDict = named as? [String: Any]
+        assertEqual(namedDict?["type"] as? String, "function", "named tool_choice must map to function form")
+        let fn = namedDict?["function"] as? [String: Any]
+        assertEqual(fn?["name"] as? String, "Bash", "named tool_choice must carry the tool name")
+    }
+
+    static func testHTTPStatusLineUsesReasonPhrase() {
+        print("▶️ Running testHTTPStatusLineUsesReasonPhrase...")
+        // The error reason phrase must be the real HTTP reason, not the
+        // multi-word error message — a corrupt status line is what Claude Code
+        // reports as InvalidHTTPResponse instead of a clean API error.
+        let message = "Invalid or missing auth token"
+        assertEqual(HTTPUtils.statusText(401), "Unauthorized", "401 must carry the real reason phrase")
+        assertEqual(HTTPUtils.statusText(429), "Too Many Requests", "429 must carry the real reason phrase")
+        assertEqual(HTTPUtils.statusText(404), "Not Found", "404 must carry the real reason phrase")
+        assertTrue(!message.contains("\r"), "error message must never inject CR into the status line")
+    }
+
+    static func testOutputLimitClampExtraction() {
+        print("▶️ Running testOutputLimitClampExtraction...")
+        // Claude Code sizes max_tokens for the model's full window (128000 for
+        // a [1m]-context model); strict gateways cap output (agnes: 65536) and
+        // answer with a deterministic 400. The clamp retry must read the cap
+        // the upstream just declared — from the REAL agnes error body.
+        let agnes = "{\"error\":{\"message\":\"max_tokens exceeds the limit of 65536 (request id: 20260926115040419740755mezP1z7O)\",\"type\":\"AgnesAI_error\",\"param\":\"\",\"code\":\"invalid_request\"}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(agnes.utf8)), 65536,
+                    "agnes error body must yield the declared 65536 cap")
+
+        // A body that echoes the REQUESTED value must still yield the DECLARED
+        // limit — clamping to 128000 would retry with the same poison.
+        let echo = "{\"error\":{\"message\":\"max_tokens 128000 exceeds the limit of 65536\"}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(echo.utf8)), 65536,
+                    "declared limit must beat the echoed request value")
+
+        // vLLM-style phrasing without "limit of":
+        let vllm = "{\"error\":{\"message\":\"max_tokens must be no greater than 8192\"}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(vllm.utf8)), 8192,
+                    "numeric fallback must find the 8192 cap")
+
+        // CONTEXT-SIZE overflows are NOT output caps. Clamping max_tokens to
+        // the context size poisoned every later request for the provider in
+        // the first cut — these real llama-server bodies must return nil.
+        let llamaCtx = "{\"error\":{\"code\":400,\"message\":\"request (49530 tokens) exceeds the available context size (32768 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":49530,\"n_ctx\":32768}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(llamaCtx.utf8)), nil,
+                    "context-size overflow must never be read as an output cap")
+
+        let openaiCtx = "{\"error\":{\"message\":\"This model's maximum context length is 32768 tokens, however messages resulted in 49530 tokens\"}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(openaiCtx.utf8)), nil,
+                    "'maximum context length' must never be read as an output cap")
+
+        // Unrelated errors carry no cap at all.
+        let auth = "{\"error\":{\"message\":\"Token not provided\"}}"
+        assertEqual(OutputLimitClamp.capFromErrorBody(Data(auth.utf8)), nil,
+                    "auth errors must not invent a cap")
+    }
+
+    static func testOutputLimitClampCache() {
+        print("▶️ Running testOutputLimitClampCache...")
+        // Learned caps are keyed per (provider, model) and pre-clamp later
+        // requests so the retry becomes a first-try success.
+        let provider = "test-provider-clamp"
+        let model = "test-model-clamp"
+        assertEqual(OutputLimitClamp.knownCap(provider: provider, model: model), nil,
+                    "unknown provider must start with no learned cap")
+        OutputLimitClamp.noteCap(provider: provider, model: model, cap: 65536)
+        assertEqual(OutputLimitClamp.knownCap(provider: provider, model: model), 65536,
+                    "noted cap must be readable")
+        // A cap below the floor is a parse accident, not a real limit — reject.
+        OutputLimitClamp.noteCap(provider: provider, model: model, cap: 512)
+        assertEqual(OutputLimitClamp.knownCap(provider: provider, model: model), 65536,
+                    "sub-1024 caps must be rejected")
+        // Different provider/model is isolated.
+        assertEqual(OutputLimitClamp.knownCap(provider: "other", model: model), nil,
+                    "caps must be keyed per provider")
+    }
+
+    static func testRAMPreflightVerdicts() {
+        print("▶️ Running testRAMPreflightVerdicts...")
+        // Estimate sanity: an 8 GB model + projector at 32k context on a hybrid
+        // (qwen35-like) geometry must land in a plausible band.
+        var meta = GGUFParser.Metadata()
+        meta.architecture = "qwen35"
+        meta.blockCount = 64
+        meta.embeddingLength = 5120
+        meta.attentionHeadCount = 24
+        meta.attentionHeadCountKV = 4
+        meta.fullAttentionInterval = 4
+        let est = RAMPreflight.estimateWorkingSet(modelBytes: 7_206_168_928,
+                                                  mmprojBytes: 931_145_760,
+                                                  meta: meta,
+                                                  contextTokens: 32_768)
+        // Weights+mmproj = ~7.6 GB; KV (17 cached layers × 4 kv-heads × 256 dim
+        // × 2 × 1.06 × 32768) ≈ 1.2 GB; overhead ≥ 1.5 GB → total 10–14 GB.
+        assertTrue(est.totalBytes > 9_000_000_000 && est.totalBytes < 15_000_000_000,
+                   "Ternary-Bonsai working-set estimate should be 9–15 GB, got \(est.totalBytes / 1_073_741_824) GB")
+        // KV layers must be the hybrid count (17), not all 64 blocks.
+        assertTrue(est.kvBytes < 5_000_000_000,
+                   "hybrid KV estimate must reflect only full-attention layers")
+
+        // Verdicts against synthetic availability:
+        let plenty = RAMPreflight.check(modelBytes: 1_000_000_000, mmprojBytes: 0,
+                                        meta: meta, contextTokens: 8_192,
+                                        availableBytes: 40_000_000_000)
+        assertEqual(plenty.verdict, .ok, "small model on 40 GB free must be .ok")
+
+        let tight = RAMPreflight.check(modelBytes: 7_206_168_928, mmprojBytes: 931_145_760,
+                                       meta: meta, contextTokens: 32_768,
+                                       availableBytes: 11_500_000_000)
+        assertEqual(tight.verdict, .warn, "10-11 GB working set vs 11.5 GB free must warn")
+
+        let blocked = RAMPreflight.check(modelBytes: 7_206_168_928, mmprojBytes: 931_145_760,
+                                         meta: meta, contextTokens: 32_768,
+                                         availableBytes: 5_800_000_000)
+        assertEqual(blocked.verdict, .blocked, "10-11 GB working set vs 5.8 GB free must block")
+        assertTrue(blocked.message.contains("Free memory"), "blocked message must tell the user what to do")
+
+        // Live free-memory probe returns a sane value on this Mac.
+        let live = RAMPreflight.availableMemoryBytes()
+        assertTrue(live > 0 && live < 64_000_000_000,
+                   "available-memory probe must return a plausible byte count")
+    }
+
+    static func testWarmUpGateAndPreflightOccupiedMemory() {
+        print("▶️ Running testWarmUpGateAndPreflightOccupiedMemory...")
+
+        // Gate policy: which provider ids are gated at all.
+        assertTrue(LocalModelManager.isRoutedLocalProvider("gguf"), "gguf must be a routed local provider")
+        assertTrue(LocalModelManager.isRoutedLocalProvider("llamaapp"), "llamaapp must be a routed local provider")
+        assertTrue(!LocalModelManager.isRoutedLocalProvider("opencode-zen"), "cloud providers must not be gated")
+        // The gate manages only runtimes JXRouter starts/adopts; user-run
+        // servers (LM Studio, Jan, Ollama) must fail over instantly as before.
+        assertTrue(LocalModelManager.isGateManagedProvider("gguf"), "our own GGUF runtime must be gate-managed")
+        assertTrue(LocalModelManager.isGateManagedProvider("llamaapp"), "llama.app must be gate-managed")
+        assertTrue(!LocalModelManager.isGateManagedProvider("lmstudio"), "third-party runtimes must not be gate-managed")
+        assertTrue(!LocalModelManager.isGateManagedProvider("jan"), "jan must not be gate-managed")
+
+        // On-demand start mapping: a request routed at gguf starts the GGUF
+        // runtime, llamaapp aliases start the Llama app, anything else starts
+        // nothing. (XCTest runs sync tests on the main thread, so the
+        // assumeIsolated hop is safe here.)
+        MainActor.assumeIsolated {
+            let mgr = LocalModelManager.shared
+            if case .gguf = LocalModelManager.gateStartProvider(for: "gguf", manager: mgr) {} else {
+                XCTAssertTrue(false, "gguf requests must map to the GGUF runtime")
+            }
+            if case .llamaapp = LocalModelManager.gateStartProvider(for: "llamaapp", manager: mgr) {} else {
+                XCTAssertTrue(false, "llamaapp requests must map to the Llama app")
+            }
+            if LocalModelManager.gateStartProvider(for: "lmstudio", manager: mgr) != nil {
+                XCTAssertTrue(false, "third-party providers must never be started by the gate")
+            }
+        }
+
+        // Warm-up budgets: the llama.app cold-start window must cover a real
+        // model load (app launch + weights paging + context alloc + prefill),
+        // and the router's wait budget must outlast it (a reload right before
+        // the first chat can chain two loads).
+        assertTrue(LocalModelManager.warmUpTimeout >= 480,
+                   "llama.app warm-up budget must be ≥8 minutes (was 30s — every cold start failed), got \(LocalModelManager.warmUpTimeout)s")
+        assertTrue(LocalModelManager.localWarmWaitBudget > LocalModelManager.warmUpTimeout,
+                   "router wait budget must outlast the warm-up budget")
+
+        // Preflight with an already-loaded server: its pages are not free.
+        var meta = GGUFParser.Metadata()
+        meta.architecture = "llama"
+        meta.blockCount = 32
+        meta.embeddingLength = 4096
+        meta.attentionHeadCount = 32
+        meta.attentionHeadCountKV = 8
+        let idle = RAMPreflight.runningServerWorkingSetBytes(modelBytes: 4_000_000_000)
+        assertTrue(idle > 4_000_000_000 && idle < 6_000_000_000,
+                   "running-server working set = weights + overhead ≈ 4.5–6 GB, got \(idle / 1_073_741_824) GB")
+
+        let fresh = RAMPreflight.check(modelBytes: 4_000_000_000, mmprojBytes: 0,
+                                       meta: meta, contextTokens: 8_192,
+                                       availableBytes: 8_000_000_000)
+        assertEqual(fresh.verdict, .ok, "4.5-5 GB working set on 8 GB free must be .ok with nothing running")
+
+        let occupied = RAMPreflight.check(modelBytes: 4_000_000_000, mmprojBytes: 0,
+                                          meta: meta, contextTokens: 8_192,
+                                          availableBytes: 8_000_000_000,
+                                          idleServerBytes: idle)
+        assertTrue(occupied.verdict.isBlocking || occupied.verdict.isWarning,
+                   "the same load with a 4.5-6 GB server already resident must warn or block, got \(occupied.verdict)")
+        assertTrue(occupied.availableBytes < fresh.availableBytes,
+                   "occupied availability must shrink by the resident server's size")
+        assertTrue(occupied.message.contains("already-loaded") || occupied.message.contains("already-loaded local model"),
+                   "occupied verdict must explain WHY availability dropped")
+
+        // Saturation: available ≤ idle → 0 available, must block, never crash.
+        let saturated = RAMPreflight.check(modelBytes: 1_000_000_000, mmprojBytes: 0,
+                                           meta: meta, contextTokens: 8_192,
+                                           availableBytes: 3_000_000_000,
+                                           idleServerBytes: 5_000_000_000)
+        assertEqual(saturated.verdict, .blocked, "available below the resident server's size must block")
+    }
+
+    static func testPrismRuntimeDetectionAndElection() {
+        print("▶️ Running testPrismRuntimeDetectionAndElection...")
+        // The real Ternary-Bonsai PQ2_0 file (PrismML ternary packing, GGML
+        // type 142 + prism.hadamard.* transforms). Stock llama.cpp refuses it:
+        // "invalid ggml type 142. should be in [0, 43)".
+        let ternary = "/Users/joshua/Models/Ternary-Bonsai-2-27B-Abliterated-GGUF/Ternary-Bonsai-2-27B-Abliterated-PQ2_0.gguf"
+        if FileManager.default.fileExists(atPath: ternary) {
+            let meta = GGUFParser.metadata(from: URL(fileURLWithPath: ternary))
+            assertTrue(meta.requiresPrismRuntime,
+                       "PQ2_0 ternary file must be flagged as Prism-runtime-only")
+            assertEqual(meta.architecture, "qwen35", "Ternary-Bonsai reports the qwen35 arch")
+            assertEqual(meta.embeddingLength, 5120, "Ternary-Bonsai n_embd is 5120")
+
+            // The sibling BF16 projector must dimension-match and be auto-paired.
+            let mmproj = "/Users/joshua/Models/Ternary-Bonsai-2-27B-Abliterated-GGUF/mmproj Ternary Bonsai 27B BF16.gguf"
+            if FileManager.default.fileExists(atPath: mmproj) {
+                assertTrue(GGUFModelScanner.projectorFits(modelPath: ternary, projectorPath: mmproj),
+                           "Ternary mmproj (5120) must fit the model (n_embd 5120)")
+                assertEqual(GGUFModelScanner.findMatchingMmproj(forModelPath: ternary, widen: false), mmproj,
+                            "scanner must auto-pair the sibling projector")
+            }
+        } else {
+            print("   (Ternary model not present — skipping live-file assertions)")
+        }
+
+        // Election: prism-flagged → prism binary when staged; normal → the
+        // general best. When no prism runtime is installed both collapse to
+        // the general best, which is the honest fallback.
+        let prism = LlamaRuntime.bestPrismRuntime()
+        if prism != nil {
+            assertEqual(LlamaRuntime.bestRuntime(forPrismModel: true)?.path, prism!.path,
+                        "prism model must elect the prism binary")
+            let general = LlamaRuntime.bestAvailableRuntime()
+            assertTrue(general == nil || LlamaRuntime.bestRuntime(forPrismModel: false)?.path == general!.path,
+                       "normal model must keep the general election")
+            // The fork (b10658+) is usually older than stock upstream — it must
+            // never win the GENERAL election just by being present.
+            if let general, general.build > prism!.build {
+                assertTrue(LlamaRuntime.bestAvailableRuntime()!.path != prism!.path,
+                           "prism fork must not win the general election on build number")
+            }
+            // The elected runtime must come from the prism family (bundled in
+            // the app or managed in llama-cpp/prism/) — never a stock source.
+            assertTrue(prism!.source == .prism || prism!.source == .bundledPrism,
+                       "prism election must report a prism-family source, got \(prism!.source.rawValue)")
+
+            // Bundled-vs-managed pool: the fork ships inside the app
+            // (Resources/llama-cpp-prism/) AND can be installed into
+            // llama-cpp/prism/. Newer build wins; equal builds prefer the
+            // in-app copy — mirroring the stock bundled-first tie-break.
+            let bundledPath = LlamaRuntime.bundledPrismBinaryPath()
+            let managedPath = LlamaRuntime.prismBinaryPath()
+            let managedExists = FileManager.default.isExecutableFile(atPath: managedPath)
+            if let bundledPath, managedExists {
+                let bundledBuild = LlamaRuntime.version(ofBinaryAt: bundledPath)?.build ?? 0
+                let managedBuild = LlamaRuntime.version(ofBinaryAt: managedPath)?.build ?? 0
+                if bundledBuild != managedBuild {
+                    let expected = bundledBuild > managedBuild ? bundledPath : managedPath
+                    assertEqual(prism!.path, expected,
+                                "the newer prism build must win (bundled \(bundledBuild) vs managed \(managedBuild))")
+                } else {
+                    assertEqual(prism!.path, bundledPath,
+                                "equal prism builds must prefer the copy built into the app")
+                }
+            } else if let bundledPath {
+                assertEqual(prism!.path, bundledPath,
+                            "bundled-only prism must resolve to the in-app binary")
+            } else if managedExists {
+                assertEqual(prism!.path, managedPath,
+                            "managed-only prism must resolve to the installed binary")
+            }
+        } else {
+            assertEqual(LlamaRuntime.bestRuntime(forPrismModel: true)?.path,
+                        LlamaRuntime.bestAvailableRuntime()?.path,
+                        "without a prism runtime the election falls back to general best")
+            print("   (prism runtime not staged — fallback path verified)")
+        }
+    }
+
     // MARK: - Runner
 
     static func runAll() -> Bool {
@@ -799,9 +1092,16 @@ final class MessageTranslatorTests {
         testUnclosedThinkTagExtraction()
         testPreParsedDictionaryToolCallArguments()
         testMarkdownJsonBlockToolCallExtraction()
+        testToolChoiceObjectFallbacks()
+        testHTTPStatusLineUsesReasonPhrase()
+        testOutputLimitClampExtraction()
+        testOutputLimitClampCache()
+        testPrismRuntimeDetectionAndElection()
+        testRAMPreflightVerdicts()
+        testWarmUpGateAndPreflightOccupiedMemory()
 
         if failedTests.isEmpty {
-            print("\n✅ ALL 19 TEST SUITES PASSED CLEANLY (0 failures)")
+            print("\n✅ ALL 26 TEST SUITES PASSED CLEANLY (0 failures)")
             return true
         } else {
             print("\n❌ \(failedTests.count) TESTS FAILED:")

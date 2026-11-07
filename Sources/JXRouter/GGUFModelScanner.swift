@@ -11,6 +11,9 @@ struct GGUFModelFile: Identifiable, Hashable {
     let quantization: String // e.g. "Q8_0", "Q4_K_M"
     let chatTemplate: String // Jinja2 chat template (from metadata)
     var mmprojPath: String?  // Path to matched multimodal projector if any
+    /// True when only the PrismML fork's llama-server can run this file
+    /// (PQ2_0/PTQ1_0 ternary packing). Stock runtimes refuse it at parse.
+    let requiresPrismRuntime: Bool
 
     /// Human-readable file size string.
     var fileSizeFormatted: String {
@@ -312,12 +315,9 @@ enum GGUFModelScanner {
         var chatTemplate = ""
 
         let meta = GGUFParser.metadata(from: URL(fileURLWithPath: path))
-        // Some conversions ship a placeholder in `general.name`. The Ternary
-        // Bonsai PQ2_0 file literally says "Hf", which made it unrecognisable
-        // in the picker -- the model was there, labelled with nothing. When the
-        // embedded name carries no information the filename is the only honest
-        // label, so fall back to it.
-        if !meta.name.isEmpty && !isPlaceholderName(meta.name) { name = meta.name }
+        // Always preserve the user's actual filename stem as the primary model name.
+        // Internal metadata in `general.name` often contains confusing converter/training artifacts
+        // (e.g. "Qwen_Build", "Heretic Out", "Hf", "Qi21_Te_V2B") that do not match the user's files.
         if !meta.architecture.isEmpty { architecture = meta.architecture }
         if meta.contextLength > 0 { contextLength = meta.contextLength }
         if !meta.chatTemplate.isEmpty { chatTemplate = meta.chatTemplate }
@@ -341,7 +341,8 @@ enum GGUFModelScanner {
             contextLength: contextLength,
             quantization: quantization,
             chatTemplate: chatTemplate,
-            mmprojPath: mmproj
+            mmprojPath: mmproj,
+            requiresPrismRuntime: meta.requiresPrismRuntime
         )
     }
 
@@ -456,6 +457,12 @@ enum GGUFParser {
         /// MTP (multi-token prediction) draft head, which llama-server can use
         /// for self-speculative decoding with no second model in memory.
         var nextnPredictLayers = 0
+        /// True when the file uses a PrismML packing (PQ2_0 / PTQ1_0 — GGML
+        /// types 142/143 — or carries `prism.hadamard.*` transform metadata).
+        /// Stock llama.cpp refuses these files ("invalid ggml type 142"); only
+        /// the PrismML fork's llama-server can load them, so the launcher must
+        /// pick that runtime for this model specifically.
+        var requiresPrismRuntime = false
 
         /// Layers that actually hold a KV cache.
         ///
@@ -735,7 +742,14 @@ enum GGUFParser {
             meta.hasVisionEncoder = (value == "true" || value == "1")
         case "clip.vision.projection_dim":
             meta.projectionDim = Int(value) ?? meta.projectionDim
+        case "general.file_type":
+            // 142 = PQ2_0, 143 = PTQ1_0 — PrismML ternary packings stock
+            // llama.cpp cannot decode (upstream issue #29058).
+            if value == "142" || value == "143" { meta.requiresPrismRuntime = true }
         default:
+            // Any prism-namespaced KV (prism.hadamard.transform, …) marks a
+            // PrismML-packed file even when file_type is absent.
+            if key.hasPrefix("prism.") { meta.requiresPrismRuntime = true }
             // Vision-side keys carry a `.vision.` segment; the text model's own
             // width must not be read from them.
             let isVisionKey = key.contains(".vision.")

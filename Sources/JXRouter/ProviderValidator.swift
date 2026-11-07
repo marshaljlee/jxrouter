@@ -143,15 +143,20 @@ struct ProviderValidator {
             req.setValue("JXProxy", forHTTPHeaderField: "X-Title")
         }
 
-        if providerId.hasPrefix("opencode") || baseUrl.contains("opencode.ai") {
-            let sessionId = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
-            let requestId = "req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
-            req.setValue(sessionId, forHTTPHeaderField: "x-opencode-session")
-            req.setValue(requestId, forHTTPHeaderField: "x-opencode-request")
-            req.setValue("cli", forHTTPHeaderField: "x-opencode-client")
-            req.setValue("opencode/1.18.21", forHTTPHeaderField: "User-Agent")
+        // OpenCode Zen's free tier refuses anything that is not the OpenCode
+        // client (403 FreeTierError), and it refuses on the *body* as well as
+        // the headers — a probe without lowercase `bash`/`read` in `tools` and
+        // without `stream: true` fails the same way a real request would. The
+        // shim supplies both, so a green tick here means the model actually
+        // serves rather than merely existing.
+        if OpenCodeZenShim.applies(providerId: providerId, baseUrl: baseUrl, apiKey: apiKey) {
+            OpenCodeZenShim.apply(to: &req, origin: baseUrl, hasKey: !apiKey.isEmpty)
+            var conformed = body
+            OpenCodeZenShim.conform(body: &conformed)
+            req.httpBody = try? JSONSerialization.data(withJSONObject: conformed)
+        } else {
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -183,7 +188,11 @@ struct ProviderValidator {
     /// (`{"error": {"message": …}}`, `{"message": …}`, `{"detail": …}`) or fall
     /// back to the raw body text (many gateways reply with plain text like
     /// "service failure: endpoint not found").
-    private static func serverMessage(_ data: Data) -> String {
+    ///
+    /// Internal (not private): the router also uses this to surface a
+    /// non-JSON upstream failure (HTML/nginx 404 page) inside its own
+    /// Anthropic-shaped error envelope instead of an opaque status code.
+    static func serverMessage(_ data: Data) -> String {
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let err = json["error"] as? [String: Any], let m = err["message"] as? String, !m.isEmpty {
                 return m

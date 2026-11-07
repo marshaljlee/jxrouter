@@ -474,6 +474,7 @@ struct CodeBlockView: View {
 struct ThinkingDisclosureView: View {
     let thinking: String
     @State private var isExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var wordCount: Int {
         thinking.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
@@ -481,7 +482,13 @@ struct ThinkingDisclosureView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() } }) {
+            Button(action: {
+                if reduceMotion {
+                    isExpanded.toggle()
+                } else {
+                    withAnimation(DesignToken.buttonSpring) { isExpanded.toggle() }
+                }
+            }) {
                 HStack(spacing: 6) {
                     Image(systemName: "brain.head.profile")
                         .font(.system(size: 11))
@@ -496,8 +503,8 @@ struct ThinkingDisclosureView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(Color.vaultAccent.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.vaultAccent.opacity(0.2), lineWidth: 1))
+                .background(Color.vaultAccent.opacity(0.08), in: RoundedRectangle(cornerRadius: DesignToken.radiusButton))
+                .overlay(RoundedRectangle(cornerRadius: DesignToken.radiusButton).stroke(Color.vaultAccent.opacity(0.2), lineWidth: 1))
             }
             .buttonStyle(.plain)
 
@@ -512,9 +519,9 @@ struct ThinkingDisclosureView: View {
                         .textSelection(.enabled)
                 }
                 .frame(maxHeight: 180)
-                .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dsBorder, lineWidth: 1))
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: DesignToken.radiusButton))
+                .overlay(RoundedRectangle(cornerRadius: DesignToken.radiusButton).stroke(Color.dsBorder, lineWidth: 1))
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
             }
         }
         .padding(.vertical, 2)
@@ -567,10 +574,10 @@ struct ChatBubble: View {
                         message.role == .user
                             ? Color.vaultAccent.opacity(0.15)
                             : Color.dsSurface,
-                        in: RoundedRectangle(cornerRadius: 12)
+                        in: RoundedRectangle(cornerRadius: DesignToken.radiusCard)
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 12)
+                        RoundedRectangle(cornerRadius: DesignToken.radiusCard)
                             .stroke(
                                 message.role == .user
                                     ? Color.vaultAccent.opacity(0.3)

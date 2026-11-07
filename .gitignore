@@ -76,4 +76,10 @@ LlamaEngine/*.o
 
 # Agent session state (per-tool scratch, never app source)
 .workbuddy-ai/
+.brud/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
 

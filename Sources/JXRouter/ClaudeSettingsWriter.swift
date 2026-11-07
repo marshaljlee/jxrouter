@@ -21,13 +21,24 @@ final class ClaudeSettingsWriter {
     static let shared = ClaudeSettingsWriter()
 
     /// Keys JXProxy manages inside the settings.json `env` block.
+    ///
+    /// MUST be a superset of every key `apply()` writes. A key written but not
+    /// listed here survives `remove()` as residue — the real incident: an
+    /// older build wrote ANTHROPIC_AUTH_TOKEN (and later API_TIMEOUT_MS), a
+    /// partial teardown stripped the managed keys but left AUTH_TOKEN behind,
+    /// and the orphaned proxy token made plain `claude` sends authenticate
+    /// with a proxy secret against whatever endpoint was left — failing at
+    /// the API level while raw curl tests pointed at the proxy passed. Keep
+    /// every written key here, always.
     static let managedEnvKeys: [String] = [
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "API_TIMEOUT_MS",
     ]
 
     private let fileManager = FileManager.default
@@ -62,6 +73,12 @@ final class ClaudeSettingsWriter {
         var env = json["env"] as? [String: String] ?? [:]
         env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:\(proxyPort)"
         env["ANTHROPIC_API_KEY"] = authToken
+        // The proxy's auth accepts x-api-key OR Authorization: Bearer, so this
+        // must never disagree with ANTHROPIC_API_KEY: a stale token with a
+        // different value means Claude Code authenticates with whichever env
+        // var wins in its merge order and 401s at the API level while curl
+        // pointed at the proxy works. Keep both under the same key.
+        env["ANTHROPIC_AUTH_TOKEN"] = authToken
         env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
         // Claude Code's own API client timeout. Local GGUF prefill of a real
         // Claude Code system prompt (80-120k tokens at ~300-450 tok/s) needs

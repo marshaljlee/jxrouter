@@ -69,13 +69,29 @@ enum LocalGPUMode: Sendable, Equatable {
     case layers(Int)
 }
 
+/// Sampling defaults baked into every local llama-server launch.
+///
+/// Aligned to the AMEEM v3.0 matrix (G-04 / C-17). The previous values were
+/// `temp 0.7, minP 0.05, topK 0` — and `topK 0` means "unset", so llama.cpp
+/// silently applied its own default of 40. A missing setting is not a neutral
+/// setting: every measured working configuration uses `top_k 20`.
 struct LocalSamplingDefaults: Sendable, Equatable {
-    var temp: Double? = 0.7
-    var minP: Double? = 0.05
+    var temp: Double? = 0.6
+    var minP: Double? = 0.02
     var topP: Double? = 0.95
-    var topK: Int? = 0
+    var topK: Int? = 20
     var repeatPenalty: Double? = 1.05
     var repeatLastN: Int? = 256
+
+    /// PrismML's documented sampling defaults for the Bonsai family — the
+    /// ternary models are unusually sensitive to sampling and produce broken
+    /// output with generic defaults. Kept as the vendor documents them
+    /// (`temp 0.5` sits exactly on the AMEEM floor; `minP 0` is the vendor's
+    /// requirement and overrides the 0.02 default deliberately).
+    static let bonsai = LocalSamplingDefaults(
+        temp: 0.5, minP: 0, topP: 0.85, topK: 20,
+        repeatPenalty: 1.05, repeatLastN: 256
+    )
 }
 
 /// A complete, ready-to-launch configuration derived from a local model's own
@@ -94,6 +110,10 @@ struct LocalModelPlan: Sendable {
     let isMixtureOfExperts: Bool
     let multimodalProjector: String?
     let isMultimodal: Bool
+    /// True for PrismML-packed files (PQ2_0/PTQ1_0): only the PrismML fork's
+    /// llama-server can load them, and bare `-fit` would fit its 262k native
+    /// window and exhaust RAM — context must be pinned explicitly.
+    let requiresPrismRuntime: Bool
 
     // Launch decisions.
     let contextMode: LocalContextMode
@@ -239,7 +259,7 @@ enum LocalModelAutoConfig {
         // ---- Vision --------------------------------------------------------
         // A projector is only accepted when its projection width matches the
         // text model's embedding length, otherwise llama.cpp aborts on load.
-        let projector: String? = {
+        var projector: String? = {
             if !overrides.mmprojPath.isEmpty {
                 if GGUFModelScanner.projectorFits(modelPath: path, projectorPath: overrides.mmprojPath) {
                     return overrides.mmprojPath
@@ -248,6 +268,16 @@ enum LocalModelAutoConfig {
             }
             return GGUFModelScanner.findMatchingMmproj(forModelPath: path)
         }()
+        // A stock llama.cpp aborts the whole server on an mmproj it cannot
+        // decode. A Prism-packed model must only ever pair with its matching
+        // Prism-packed projector, so an incompatible-dimension match is not
+        // merely wrong — it is fatal. Dropping the projector (rather than
+        // passing it) keeps a text-only load possible instead.
+        if meta.requiresPrismRuntime, let proj = projector,
+           !GGUFModelScanner.projectorFits(modelPath: path, projectorPath: proj) {
+            print("[AutoConfig] Prism model: discarding non-fitting projector \(proj)")
+            projector = nil
+        }
 
         // ---- Tool calling --------------------------------------------------
         let family = detectFamily(architecture: architecture, name: meta.name,
@@ -332,6 +362,7 @@ enum LocalModelAutoConfig {
             isMixtureOfExperts: meta.expertCount > 0,
             multimodalProjector: projector,
             isMultimodal: projector != nil || meta.hasVisionEncoder,
+            requiresPrismRuntime: meta.requiresPrismRuntime,
             contextMode: contextMode,
             gpuMode: gpuMode,
             cacheTypeK: overrides.cacheTypeK.isEmpty ? "q8_0" : overrides.cacheTypeK,
@@ -352,7 +383,7 @@ enum LocalModelAutoConfig {
             specDraftNMax: specDraftNMax,
             isHybrid: meta.isHybrid,
             attentionLayerCount: meta.attentionLayerCount,
-            sampling: LocalSamplingDefaults()
+            sampling: meta.requiresPrismRuntime ? .bonsai : LocalSamplingDefaults()
         )
     }
 
@@ -497,7 +528,7 @@ enum LocalModelAutoConfig {
             // the machine's real headroom, so in every other case the window is
             // pinned: otherwise a 262k-native model on a 32 GB Mac wins the
             // allocation and loses the machine to swapping.
-            if fits, recommended >= plan.nativeContext {
+            if fits, recommended >= plan.nativeContext, !plan.requiresPrismRuntime {
                 args.append(contentsOf: ["-fit", "on"])
                 if features.supports("fit-ctx") {
                     args.append(contentsOf: ["-fitc", "\(minimum)"])

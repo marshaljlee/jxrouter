@@ -12,6 +12,13 @@ struct JXRouterView: View {
     /// Free API key guide — auto-presented after first-launch onboarding when
     /// the user hasn't configured any provider key yet.
     @State private var showApiKeyGuide = false
+    /// Free-RAM button state: in-flight spinner, then a confirmation toast.
+    @State private var isFreeingRAM = false
+    @State private var freeRAMResult: String?
+    /// Live free-memory figure for the dashboard row.
+    @State private var freeRAMBytes: UInt64 = RAMPreflight.availableMemoryBytes()
+    /// One-shot timer refresh for the free-RAM figure while visible.
+    @State private var ramRefreshTask: Task<Void, Never>?
     /// Current light/dark appearance — tracks AppearanceController.shared.mode
     private var appearanceMode: AppearanceMode {
         AppearanceController.shared.mode
@@ -112,6 +119,71 @@ struct JXRouterView: View {
                 .accessibilityLabel("Uninstall JXProxy")
             }
             .padding(.horizontal, 16)
+
+            Spacer().frame(height: 10)
+
+            // Free RAM: shows the live free figure, one tap reclaims memory
+            // (stops the local model server, sweeps stray workers, purges the
+            // disk cache). Local-model loads run a preflight against this.
+            HStack(spacing: 10) {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.dsAccent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Free Memory")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.dsTextPrimary)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(freeRAMBytes), countStyle: .memory))
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.dsTextTertiary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                if isFreeingRAM {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button {
+                        freeRAM()
+                    } label: {
+                        Label("Free", systemImage: "wind")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Stop local model servers, sweep stray inference workers, and purge the disk cache to free memory")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.dsSurface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.dsBorder, lineWidth: 1)
+            )
+            .padding(.horizontal, 16)
+
+            if let result = freeRAMResult {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.dsGreen)
+                    Text(result)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.dsTextSecondary)
+                        .lineLimit(2)
+                    Spacer()
+                    Button {
+                        freeRAMResult = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(8)
+                .background(Color.dsGreen.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            }
 
             if !manager.errorAcknowledged, let errorText = manager.errorMessage {
                 HStack(spacing: 8) {
@@ -359,6 +431,11 @@ struct JXRouterView: View {
             if !UserDefaults.standard.bool(forKey: "hasSeenJXOnboarding") {
                 showOnboarding = true
             }
+            startRAMRefresh()
+        }
+        .onDisappear {
+            ramRefreshTask?.cancel()
+            ramRefreshTask = nil
         }
         .sheet(isPresented: $showOnboarding) {
             OnboardingView {
@@ -421,6 +498,32 @@ struct JXRouterView: View {
     }
 
     /// Uninstall flow: confirm, clean up everything JXProxy wrote, report.
+    // MARK: - Free RAM
+
+    /// Refresh the free-memory figure every 5 s while the dashboard shows.
+    private func startRAMRefresh() {
+        ramRefreshTask?.cancel()
+        ramRefreshTask = Task {
+            while !Task.isCancelled {
+                let bytes = RAMPreflight.availableMemoryBytes()
+                await MainActor.run { freeRAMBytes = bytes }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
+
+    /// Reclaim memory and surface what was freed.
+    private func freeRAM() {
+        isFreeingRAM = true
+        Task { @MainActor in
+            let report = RAMReclaimer.reclaim()
+            isFreeingRAM = false
+            freeRAMBytes = report.availableAfterBytes
+            freeRAMResult = report.summary
+            print("[Dashboard] Free RAM: \(report.summary)")
+        }
+    }
+
     private func performUninstall() {
         let alert = NSAlert()
         alert.messageText = "Uninstall JXProxy?"

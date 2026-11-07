@@ -701,6 +701,13 @@ final class ProxyServer: @unchecked Sendable {
                 handleHelloEndpoint(connection)
                 return
             }
+            if basePath == "/ameem/check" || basePath == "/ameem/reconcile" {
+                // AMEEM load-time trigger A — session preflight. A harness curls
+                // `/ameem/check` before starting work and refuses to proceed on
+                // fatal drift; `/ameem/reconcile` returns the full report.
+                handleAMEEMEndpoint(connection, check: basePath == "/ameem/check")
+                return
+            }
             if basePath == "/v1/models" {
                 handleModelListEndpoint(connection)
                 return
@@ -890,6 +897,59 @@ final class ProxyServer: @unchecked Sendable {
             return
         }
         connection.send(content: respData, completion: .contentProcessed({ _ in connection.cancel() }))
+    }
+
+    /// AMEEM v3.0 load-time preflight / reconciliation, served over the internal
+    /// endpoint surface so any harness can call it (trigger A).
+    ///
+    /// `GET /ameem/check` returns 409 when a fatal drift exists (a projector
+    /// served as a model, or a preset pointing at a missing file); `GET
+    /// /ameem/reconcile` returns the full report. The scan is bounded and runs
+    /// off the proxy queue so a slow drive cannot stall routing.
+    private func handleAMEEMEndpoint(_ connection: NWConnection, check: Bool) {
+        let dirs = GGUFModelScanner.defaultSearchPaths
+        let presets = AMEEMPresetReconciler.defaultPresetsPath
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var status = 200
+            var payload: [String: Any]
+            if check {
+                let result = AMEEMPresetReconciler.check(modelsDirs: dirs, presetsPath: presets)
+                payload = ["gate": "AMEEM", "mode": "check",
+                           "fatal": result.fatal, "warnings": result.warnings,
+                           "clean": result.isClean]
+                status = result.isClean ? 200 : 409
+            } else {
+                let report = AMEEMPresetReconciler.reconcile(modelsDirs: dirs, presetsPath: presets)
+                payload = [
+                    "gate": "AMEEM", "mode": "report",
+                    "scanned": report.scanned,
+                    "models": report.models.count,
+                    "companions": report.projectors.count,
+                    "duplicates": report.duplicates.count,
+                    "skipped": report.skipped.count,
+                    "unreadable": report.unreadable.count,
+                    "proposedSections": report.proposed.map {
+                        ["name": $0.name, "ctx": $0.fields["ctx-size"] ?? "",
+                         "temp": $0.fields["temp"] ?? "", "mmproj": $0.fields["mmproj"] ?? ""]
+                    },
+                    "skippedFiles": report.skipped.map { ["path": $0.path, "reason": $0.why] },
+                    "companionFiles": report.projectors.map {
+                        ["path": $0.path, "architecture": $0.architecture]
+                    },
+                    "orphanedCompanions": report.orphans.map { $0.path },
+                    "duplicatesCollapsed": report.duplicates.map { ["path": $0.path, "reason": $0.why] },
+                    "findings": report.findings,
+                ]
+            }
+            let data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+            let header = "HTTP/1.1 \(status) \(HTTPUtils.statusText(status))\r\n"
+                + "Content-Type: application/json\r\nContent-Length: \(data.count)\r\n"
+                + "Connection: close\r\nProxy-Agent: JXProxy\r\n\r\n"
+            var out = Data(header.utf8)
+            out.append(data)
+            connection.send(content: out, completion: .contentProcessed({ _ in connection.cancel() }))
+        }
     }
 
     private func handleAIRouted(_ connection: NWConnection, method: String, initialData: Data, connectedApp: String, path: String) {
@@ -1123,7 +1183,12 @@ final class ProxyServer: @unchecked Sendable {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         let body = "{\"type\":\"error\",\"error\":{\"type\":\"\(type)\",\"message\":\"\(escaped)\"}}"
-        let response = "HTTP/1.1 \(statusCode) \(message)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
+        // Reason phrase must be the real HTTP status reason ("Unauthorized",
+        // "Not Found", "Too Many Requests"…), not the error MESSAGE: the
+        // message can be multi-word JSON-bearing text, and multi-word reasons
+        // corrupt the status line the client parses (Request Line parse
+        // failure → "InvalidHTTPResponse" instead of a clean API error).
+        let response = "HTTP/1.1 \(statusCode) \(HTTPUtils.statusText(statusCode))\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\nProxy-Agent: JXProxy\r\n\r\n\(body)"
         guard let data = response.data(using: .utf8) else {
             connection.cancel()
             return

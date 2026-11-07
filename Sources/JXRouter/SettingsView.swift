@@ -120,6 +120,11 @@ struct SettingsView: View {
     @State private var scannedMmprojFiles: [String] = []
     @State private var showingMMProjSearch = false
     @State private var ggufScanState: String = ""
+    /// RAM preflight: block confirmation for the Load button, the verdict
+    /// text behind it, and a transient warning banner after a warn-verdict load.
+    @State private var showingRAMBlockAlert = false
+    @State private var ramVerdictMessage: String = ""
+    @State private var ramPreflightWarning: String = ""
     /// Extra folders the user asked to scan for GGUF models.
     @State private var ggufSearchPaths: [String] = []
     @State private var ggufScanTask: Task<Void, Never>?
@@ -802,6 +807,7 @@ struct SettingsView: View {
                     .foregroundStyle(Color.dsTextTertiary)
 
                 llamaRuntimeSection
+                prismRuntimeSection
 
                 // Model selection
                 HStack(spacing: 8) {
@@ -846,6 +852,14 @@ struct SettingsView: View {
                                         Text("\(model.fileSizeFormatted) · \(model.quantization) · \(model.contextLength) ctx")
                                             .font(.system(size: DesignToken.caption2Size))
                                             .foregroundStyle(Color.dsTextTertiary)
+                                        if model.requiresPrismRuntime {
+                                            Text("Prism runtime")
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Capsule().fill(Color.dsAccent.opacity(0.15)))
+                                                .foregroundStyle(Color.dsAccent)
+                                        }
                                     }
                                     Spacer()
                                     if ggufModelPath == model.path || ggufModelAlias == model.suggestedAlias {
@@ -1113,6 +1127,26 @@ struct SettingsView: View {
                     }
                 }
 
+                if !ramPreflightWarning.isEmpty {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "memorychip")
+                            .foregroundStyle(Color.orange)
+                        Text(ramPreflightWarning)
+                            .font(.system(size: DesignToken.caption2Size))
+                            .foregroundStyle(Color.dsTextSecondary)
+                        Spacer()
+                        Button("Free Memory") {
+                            Task { @MainActor in
+                                let report = RAMReclaimer.reclaim()
+                                ramPreflightWarning = "Freed: \(report.summary) \(ByteCountFormatter.string(fromByteCount: Int64(report.availableAfterBytes), countStyle: .file)) free now."
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                }
                 if !autoConfigSummary.isEmpty {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Auto-configured for this model")
@@ -1146,6 +1180,18 @@ struct SettingsView: View {
                     .controlSize(.small)
                     .disabled(ggufModelPath.isEmpty)
                     .help("Start llama-server with the selected model, replacing whatever is loaded")
+                    .confirmationDialog(
+                        "Not enough free memory",
+                        isPresented: $showingRAMBlockAlert,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Free Memory & Retry") {
+                            Task { await freeMemoryThenReload() }
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text(ramVerdictMessage)
+                    }
                     if ggufRunning {
                         Button("Stop") { stopGGUFModel() }
                             .buttonStyle(.bordered)
@@ -1544,6 +1590,68 @@ struct SettingsView: View {
         }
     }
 
+    /// PrismML fork runtime (loads PQ2_0/PTQ1_0 models stock llama.cpp
+    /// refuses). Mirrors the upstream llama.cpp section's update flow.
+    private var prismRuntimeSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "triangle.lequalspath.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.dsAccent)
+                Text("PrismML Runtime (ternary models)")
+                    .font(.system(size: DesignToken.captionSize, weight: .semibold))
+                    .foregroundStyle(Color.dsTextPrimary)
+                Spacer()
+                Text(LlamaRuntime.shared.prismStatusSummary)
+                    .font(.system(size: DesignToken.caption2Size))
+                    .foregroundStyle(Color.dsTextSecondary)
+            }
+
+            // The fork ships inside the app bundle (staged by install.sh /
+            // build-all.sh into Resources/llama-cpp-prism/), so ternary models
+            // work on a fresh install with no download. Updates only matter
+            // when a newer PrismML build is published.
+            Text("Ships built into JXRouter for ternary PQ2_0/PTQ1_0 models (e.g. Ternary-Bonsai). Check here only when a newer PrismML build is published.")
+                .font(.system(size: DesignToken.caption2Size))
+                .foregroundStyle(Color.dsTextTertiary)
+
+            if !LlamaRuntime.shared.prismPhase.message.isEmpty {
+                HStack(spacing: 6) {
+                    if LlamaRuntime.shared.prismPhase.isBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(LlamaRuntime.shared.prismPhase.message)
+                        .font(.system(size: DesignToken.caption2Size))
+                        .foregroundStyle(Color.dsTextTertiary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("Check for Update") {
+                    Task { await LlamaRuntime.shared.checkForPrismUpdate() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(LlamaRuntime.shared.prismPhase.isBusy)
+
+                if !LlamaRuntime.shared.isPrismInstalled || LlamaRuntime.shared.prismUpdateAvailable {
+                    Button(LlamaRuntime.shared.isPrismInstalled ? "Update" : "Install PrismML") {
+                        Task { await LlamaRuntime.shared.installPrism() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(LlamaRuntime.shared.prismPhase.isBusy)
+                }
+                Spacer()
+            }
+        }
+        .task {
+            await LlamaRuntime.shared.resolvePrism()
+        }
+    }
+
     /// Scan the default locations for GGUF models and mmproj companion files.
     private func scanGGUFModels() async {
         ggufScanTask?.cancel()
@@ -1612,6 +1720,23 @@ struct SettingsView: View {
     /// Load the selected GGUF model and make it the active routed provider so
     /// Claude Code reaches it immediately — select a model, load it, use it.
     private func runGGUFModel() {
+        // Free-RAM preflight BEFORE touching routing/config: a blocked load
+        // offers the Free-Memory path; a warn shows a banner but proceeds.
+        if LocalModelManager.shared.ramPreflightOverrides.contains(.skipPreflight) {
+            LocalModelManager.shared.ramPreflightOverrides.remove(.skipPreflight)
+        } else if let verdict = RAMPreflight.checkSelectedModel() {
+            ramPreflightWarning = verdict.verdict == .warn ? verdict.message : ""
+            if verdict.verdict == .blocked {
+                ramVerdictMessage = verdict.message
+                showingRAMBlockAlert = true
+                return
+            }
+        }
+        runGGUFModelAfterPreflight()
+    }
+
+    /// The pre-confirmed load path (also the Free-Memory retry target).
+    private func runGGUFModelAfterPreflight() {
         let mgr = LocalModelManager.shared
         mgr.provider = .gguf
         mgr.selectedGGUFPath = ggufModelPath
@@ -1682,6 +1807,22 @@ struct SettingsView: View {
         let mgr = LocalModelManager.shared
         if mgr.provider == .gguf {
             mgr.stop()
+        }
+    }
+
+    /// Free-Memory-and-Retry: reclaim what is reclaimable, then continue the
+    /// load the user already asked for (pre-flight verdict re-checked once;
+    /// a still-blocked load re-opens the dialog instead of proceeding).
+    private func freeMemoryThenReload() {
+        Task { @MainActor in
+            let report = RAMReclaimer.reclaim()
+            print("[Settings] Free memory: \(report.summary)")
+            if let verdict = RAMPreflight.checkSelectedModel(), verdict.verdict == .blocked {
+                ramVerdictMessage = verdict.message + " (After freeing: still not enough.)"
+                showingRAMBlockAlert = true
+                return
+            }
+            runGGUFModelAfterPreflight()
         }
     }
 

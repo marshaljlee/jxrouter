@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AppKit
 
 /// Manages the local model servers JXProxy can start on this Mac: the Llama
 /// desktop app (llama.app), Ollama, and direct GGUF models via `llama-server`
@@ -58,6 +59,29 @@ final class LocalModelManager {
     /// True while a GGUF model is being loaded — i.e. while the Settings
     /// progress bar should be on screen.
     var isLoadingModel: Bool = false
+
+    /// True while a server is starting but its model is not resident yet —
+    /// launching the Llama app and waiting for it to load its model, or a
+    /// llama-server spawn in its weight-reading phase. Requests routed to a
+    /// local provider during this window must WAIT for readiness instead of
+    /// failing over (a cold model load takes minutes; the fallback chain must
+    /// not burn through because of it).
+    var isWarmingUp: Bool = false
+    /// Human-readable warm-up phase ("Launching Llama app", "Loading model"…)
+    /// shown wherever the waiting state is surfaced.
+    var warmUpLabel: String = ""
+    /// When the current warm-up began, so the router gate can cap the wait.
+    private(set) var warmUpStartedAt: Date = .distantPast
+
+    /// Total budget for one local-server warm-up: covers app launch, model
+    /// weights paging in (tens of GB at disk speed), context allocation, and
+    /// first-request prefill. The llama.app path previously gave this whole
+    /// sequence 30 seconds, so EVERY cold start was declared dead mid-load.
+    nonisolated static let warmUpTimeout: TimeInterval = 600
+    /// Per-probe request timeout inside the warm-up poll. A resident-but-busy
+    /// server still answers /health between prefill chunks; 4s rides out
+    /// momentary event-loop stalls without stretching each poll cycle.
+    nonisolated static let warmUpProbeTimeout: TimeInterval = 4
     /// 0…1 fraction of the model mapped in so far.
     var loadFraction: Double = 0
     /// What llama-server is doing right now ("Loading weights", …).
@@ -112,6 +136,17 @@ final class LocalModelManager {
     /// Chat template override for Qwen3.5 (empty = auto-detect via LlamaPresetSettings).
     var qwen3ChatTemplate: String = ""
 
+    /// One-shot preflight skips (set by the Settings confirm dialog so an
+    /// acknowledged warning load proceeds without re-prompting).
+    struct PreflightOverrides: OptionSet {
+        let rawValue: Int
+        static let skipPreflight = PreflightOverrides(rawValue: 1 << 0)
+    }
+    var ramPreflightOverrides: PreflightOverrides = []
+    /// Last preflight warning text, shown next to the Load button until the
+    /// next attempt clears it. Empty after an `.ok` verdict.
+    var ramPreflightMessage: String = ""
+
     /// Context size override for Qwen3.5 (0 = use model's default).
     var qwen3CtxSize: Int = 0
 
@@ -141,6 +176,10 @@ final class LocalModelManager {
         }
 
         status = .starting
+        isWarmingUp = true
+        warmUpLabel = "Starting"
+        warmUpStartedAt = Date()
+        defer { isWarmingUp = false; warmUpLabel = "" }
 
         switch provider {
         case .llamaapp:
@@ -157,9 +196,11 @@ final class LocalModelManager {
                 status = .failed("The Llama app is not installed. Install it from https://llama.com or the Mac App Store, then try again.")
                 return
             }
+            warmUpLabel = "Launching Llama app"
             launchApp("Llama")
-            print("[LocalModel] Launched Llama app; waiting for its local server on \(host):\(port)")
-            if await waitForHealth(timeout: 30) {
+            print("[LocalModel] Launched Llama app; waiting up to \(Int(Self.warmUpTimeout))s for model load + server on \(host):\(port)")
+            warmUpLabel = "Waiting for Llama app to load its model"
+            if await waitForHealth(timeout: Int(Self.warmUpTimeout)) {
                 status = .running(pid: 0)
                 print("[LocalModel] Llama local server is up (port \(port))")
             } else {
@@ -173,6 +214,7 @@ final class LocalModelManager {
                 return
             }
             print("[LocalModel] Using binary: \(binPath)")
+            warmUpLabel = "Starting ollama server"
 
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -212,8 +254,17 @@ final class LocalModelManager {
                     process = proc
                     print("[LocalModel] ollama started (PID \(pid))")
                 } else {
-                    status = .failed("ollama started but the health check failed — check /tmp/ollama-stderr.log")
-                    kill(pid: pid)
+                    // ollama loads models on first request, so the server can
+                    // legally be up but idle — give it the same warm-up budget
+                    // as the other runtimes before declaring failure.
+                    if await waitForHealth(timeout: Int(Self.warmUpTimeout)) {
+                        status = .running(pid: pid)
+                        process = proc
+                        print("[LocalModel] ollama became healthy after extended wait (PID \(pid))")
+                    } else {
+                        status = .failed("ollama started but the health check failed — check /tmp/ollama-stderr.log")
+                        kill(pid: pid)
+                    }
                 }
             } catch {
                 status = .failed("Failed to start: \(error.localizedDescription)")
@@ -239,6 +290,8 @@ final class LocalModelManager {
     /// Stop the local model server — quit the Llama app, kill ollama, or
     /// terminate the llama-server child process (GGUF).
     func stop() {
+        isWarmingUp = false
+        warmUpLabel = ""
         endLoadProgress()
         if let inferenceServer {
             inferenceServer.stop()
@@ -370,6 +423,26 @@ final class LocalModelManager {
     /// doesn't fit in available memory — that abort-loop shows up as a fresh
     /// crash report and/or a "failed to fit" line in /tmp/llama-server.log.
     private func diagnoseLlamaServerFailure() -> String {
+        // Crash-LOOP watchdog: the warm-up now waits 10 minutes, but a model
+        // that cannot fit aborts within seconds of each relaunch. Two or more
+        // crashes inside the wait window mean the server is boot-looping, not
+        // loading — bail early with the memory diagnosis instead of making the
+        // user sit through the full budget.
+        let crashes = recentCrashCount(for: "llama", within: Self.warmUpTimeout + 60)
+        if crashes >= 2 {
+            let logTail = tailLog("/tmp/llama-server.log", lines: 10)
+            let relevant = logTail.last { $0.lowercased().contains("fit")
+                || $0.lowercased().contains("memory")
+                || $0.lowercased().contains("error")
+                || $0.lowercased().contains("assert") }
+            var msg = "The Llama app's server keeps crashing (\(crashes) times in the last \(Int(Self.warmUpTimeout / 60)) minutes) — its loaded model (and context size) doesn't fit in available memory. "
+            if let line = relevant, !line.isEmpty {
+                msg += "Server log: \"\(line.trimmingCharacters(in: .whitespacesAndNewlines))\". "
+            }
+            msg += "Fix: in the Llama app, load a smaller model or reduce the context length, and quit other memory-heavy apps before starting."
+            return msg
+        }
+
         let logTail = tailLog("/tmp/llama-server.log", lines: 40)
         let recentCrash = recentCrashReport(for: "llama", within: 180)
         let logText = logTail.joined(separator: "\n").lowercased()
@@ -428,20 +501,88 @@ final class LocalModelManager {
             return
         }
 
+        // Prism-packed GGUFs (PQ2_0/PTQ1_0 — e.g. Ternary-Bonsai) only load
+        // under the PrismML fork's llama-server; stock builds refuse them at
+        // GGUF parse ("invalid ggml type 142"). Header read only — no model
+        // load happens here.
+        let selectedMeta = GGUFParser.metadata(from: URL(fileURLWithPath: selectedGGUFPath))
+        let needsPrism = selectedMeta.requiresPrismRuntime
+
+        // In-place chat template sanitation (neutralize fatal Jinja raise_exception calls)
+        let sanitizeResult = GGUFTemplateSanitizer.sanitizeGGUFFile(atPath: selectedGGUFPath)
+        if sanitizeResult.success {
+            print("[LocalModelManager] Chat template check: \(sanitizeResult.message)")
+        }
+
+        // Free-RAM preflight: refuse (or surface a warning for) loads that
+        // would drive the machine into swap. The estimate mirrors the KV math
+        // the auto-config uses, so it disagrees with the real load rarely.
+        if !ramPreflightOverrides.contains(.skipPreflight) {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: selectedGGUFPath)
+            let modelBytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            var mmprojBytes: Int64 = 0
+            if !ggufMmprojPath.isEmpty,
+               let mAttrs = try? FileManager.default.attributesOfItem(atPath: ggufMmprojPath) {
+                mmprojBytes = (mAttrs[.size] as? NSNumber)?.int64Value ?? 0
+            }
+            // A server is already holding a model resident (reload onto a
+            // different model): its pages are NOT free for the new load. The
+            // OS reports them as used, but the old server may be ours — either
+            // way the new working set must fit in what is left over. Without
+            // this, a reload onto a second big model sailed through preflight
+            // on the old server's behalf and swapped when both were resident.
+            var idleServerBytes: UInt64 = 0
+            if isRunning || process?.isRunning == true || inferenceServer != nil {
+                idleServerBytes = RAMPreflight.runningServerWorkingSetBytes(modelBytes: modelBytes)
+            }
+            // The context the plan would pin: explicit override, else the
+            // auto-config's recommendation (not the model's native window).
+            let planForCtx = LocalModelAutoConfig.plan(forModelPath: selectedGGUFPath,
+                                                       alias: ggufModelAlias.isEmpty ? "preflight" : ggufModelAlias)
+            let preflight = RAMPreflight.check(modelBytes: modelBytes,
+                                               mmprojBytes: mmprojBytes,
+                                               meta: selectedMeta,
+                                               contextTokens: max(planForCtx.recommendedContext, 8_192),
+                                               idleServerBytes: idleServerBytes)
+            switch preflight.verdict {
+            case .blocked:
+                endLoadProgress()
+                status = .failed(preflight.message)
+                print("[LocalModel] Load blocked by RAM preflight: \(preflight.message)")
+                return
+            case .warn:
+                print("[LocalModel] RAM preflight warning: \(preflight.message)")
+                // Warning is surfaced to the UI (and confirmable there); the
+                // load proceeds — the OS can still page through it.
+                ramPreflightMessage = preflight.message
+            case .ok:
+                ramPreflightMessage = ""
+            }
+        } else {
+            ramPreflightMessage = ""
+        }
+
         // In-process engine: no child process, no port juggling, no runtime to
         // install. Falls through to llama-server when the embedded dylib is
-        // unavailable (Intel) or the user has turned it off.
-        if ConfigManager.shared.preferInProcessEngine, InProcessLlamaEngine.shared.isAvailable {
+        // unavailable (Intel) or the user has turned it off. The embedded
+        // engine is a stock ggml build — it cannot decode Prism packings, so
+        // prism models always take the child-process path.
+        if !needsPrism, ConfigManager.shared.preferInProcessEngine, InProcessLlamaEngine.shared.isAvailable {
             await startInProcess(forceRestart: forceRestart)
             return
         }
 
         // Resolve the llama.cpp runtime: bundled in the app > installed by
-        // JXRouter > already on this Mac.
+        // JXRouter > already on this Mac. A prism model elects the PrismML
+        // fork instead (see bestRuntime(forPrismModel:)); everything else is
+        // unaffected.
         let rt = LlamaRuntime.shared
         if rt.runtime == nil { await rt.resolve() }
-        guard let serverPath = rt.runtime?.path ?? findLlamaServer() else {
-            status = .failed("llama-server is not available. Install the built-in llama.cpp runtime in Settings ▸ Local Models.")
+        guard let serverPath = LlamaRuntime.bestRuntime(forPrismModel: needsPrism)?.path
+                ?? rt.runtime?.path ?? findLlamaServer() else {
+            status = .failed(needsPrism
+                ? "The PrismML llama-server runtime is not installed (required for this PQ2_0/PTQ1_0 model)."
+                : "llama-server is not available. Install the built-in llama.cpp runtime in Settings ▸ Local Models.")
             return
         }
 
@@ -523,6 +664,7 @@ final class LocalModelManager {
         loadPhaseLabel = ModelLoadProgress.Phase.launching.label
         loadBytesText = modelBytes > 0 ? "0 / \(Self.byteString(modelBytes))" : ""
         loadProgressIsMeasured = false
+        warmUpLabel = "Loading \(ggufModelAlias)"
 
         print("[LocalModel] Launching llama-server: \(binary)")
         print("[LocalModel]   Model:  \(plan.modelPath)  [\(plan.architecture)]")
@@ -649,6 +791,7 @@ final class LocalModelManager {
         loadPhaseLabel = "Loading weights"
         loadProgressIsMeasured = true
         loadBytesText = ""
+        warmUpLabel = "Loading \(ggufModelAlias)"
 
         let server = LocalInferenceServer()
         do {
@@ -832,22 +975,35 @@ final class LocalModelManager {
     /// Whether macOS recorded a crash report for the given process name in the
     /// last `within` seconds — i.e. the server is crash-looping, not just slow.
     private func recentCrashReport(for processName: String, within: TimeInterval) -> Bool {
+        recentCrashCount(for: processName, within: within) > 0
+    }
+
+    /// How many crash reports macOS recorded for the process in the window —
+    /// the crash-LOOP signal (1 crash = unlucky; ≥2 = boot-looping).
+    private func recentCrashCount(for processName: String, within: TimeInterval) -> Int {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let dir = "\(home)/Library/Logs/DiagnosticReports"
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return false }
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return 0 }
         let cutoff = Date().addingTimeInterval(-within)
+        var count = 0
         for file in files where file.hasPrefix(processName + "-") && file.hasSuffix(".ips") {
             let url = URL(fileURLWithPath: "\(dir)/\(file)")
             if let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                mod > cutoff {
-                return true
+                count += 1
             }
         }
-        return false
+        return count
     }
 
     /// Health-check against the server's OpenAI-compatible endpoint.
-    private func healthCheck() async -> Bool {
+    ///
+    /// `probeTimeout` scales with context: the adoption/refresh checks want a
+    /// snappy 2s probe, while the warm-up poll uses the longer window — a
+    /// server that is resident but mid-prefill answers /health only between
+    /// compute chunks, and a 2s probe declared a healthy-but-busy server dead
+    /// after barely one attempt.
+    private func healthCheck(probeTimeout: TimeInterval = 2) async -> Bool {
         // llama.app's server port is not stable (it can move after relaunches)
         // — resolve the live port so the health check matches reality.
         let effectivePort = provider == .llamaapp ? LocalServerDiscovery.liveLlamaPort() : port
@@ -857,7 +1013,7 @@ final class LocalModelManager {
         for _ in 0..<10 {
             do {
                 var req = URLRequest(url: url)
-                req.timeoutInterval = 2
+                req.timeoutInterval = probeTimeout
                 let (_, resp) = try await URLSession.shared.data(for: req)
                 if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
                     return true
@@ -869,13 +1025,201 @@ final class LocalModelManager {
     }
 
     /// Poll the health endpoint until it answers or the timeout elapses.
+    ///
+    /// The per-probe timeout is deliberately generous (4s): during a warm-up
+    /// the server is frequently resident but stalled inside prefill or page-in
+    /// work, and with a 2s probe `waitForHealth(600)` still failed after ~30s
+    /// of wall time because every poll window held exactly one attempt.
     private func waitForHealth(timeout: Int) async -> Bool {
         let deadline = Date().addingTimeInterval(TimeInterval(timeout))
         while Date() < deadline {
-            if await healthCheck() { return true }
+            if await healthCheck(probeTimeout: Self.warmUpProbeTimeout) { return true }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         return false
+    }
+
+    // MARK: - Warm-up gate
+
+    /// Is the request target one of JXRouter's own local model runtimes?
+    nonisolated static func isRoutedLocalProvider(_ pid: String) -> Bool {
+        ["local", "ollama", "lmstudio", "llamaapp", "llamacpp", "jan", "unsloth", "gguf"].contains(pid)
+    }
+
+    /// Whether the warm-up gate manages this provider — i.e. JXRouter starts
+    /// it (or adopts llama.app's server), so waiting for its warm-up is
+    /// meaningful. Third-party local runtimes (LM Studio, Jan, Ollama installed
+    /// by the user) fail over instead of waiting, exactly as before.
+    nonisolated static func isGateManagedProvider(_ pid: String) -> Bool {
+        switch pid {
+        case "gguf", "local", "llamaapp", "llamacpp": return true
+        default: return false
+        }
+    }
+
+    /// How long a routed request may wait for the local server to finish its
+    /// warm-up. A single big-GGUF load runs 1–4 minutes on this Mac; two
+    /// sequential loads (a reload right before the first chat) can exceed
+    /// `warmUpTimeout` alone, so the gate must outlast the slowest start.
+    nonisolated static let localWarmWaitBudget: TimeInterval = 720
+
+    /// Set while the gate's on-demand start is launching the server, so two
+    /// concurrent requests don't both spawn one (the second would kill the
+    /// first mid-load via killProcessOnPort).
+    @MainActor var gateAutoStartInFlight = false
+
+    /// Which LocalProvider the gate should start for a request that named
+    /// `providerId`. Requests routed at "gguf" start the GGUF runtime; the
+    /// llama.app aliases start the Llama app; "local" means whatever the
+    /// manager is currently set to. Nil = nothing to start.
+    @MainActor
+    static func gateStartProvider(for requested: String, manager: LocalModelManager) -> LocalProvider? {
+        switch requested {
+        case "gguf": return .gguf
+        case "llamaapp", "llamacpp": return .llamaapp
+        case "local": return manager.provider
+        default: return nil
+        }
+    }
+
+    /// Hold an incoming request until the local model server finishes loading,
+    /// then hand back the (unchanged) request.
+    ///
+    /// Cold-start guarantee: a Load/Reload kicked off from Settings (or from
+    /// JXRouter's own launch) takes minutes — app launch, weights paging in,
+    /// context allocation, then prefill. Without this gate, the first chat
+    /// routed to the model hit an instant connection-refused, the fallback
+    /// chain burned through to a remote provider, and the local model looked
+    /// broken. The probe accepts llama-server's own lifecycle: `/health`
+    /// answers 503 while the model loads and 200 only once it can serve, so a
+    /// gated request resumes exactly when the model is ready to respond.
+    ///
+    /// Only JXRouter's OWN runtimes are gated (this process starts them, so
+    /// waiting is meaningful). Third-party local servers (LM Studio, Jan, …)
+    /// fail over exactly as before.
+    ///
+    /// - Returns: `.cancelled` when the warm-up failed and the user cancelled
+    ///   the wait, or when the budget ran out; `.ready` otherwise.
+    static func awaitLocalServerReady(forProvider providerId: String,
+                                      manager: LocalModelManager = .shared) async -> GateOutcome {
+        guard isGateManagedProvider(providerId) else { return .ready }
+
+        let budget = localWarmWaitBudget
+        let deadline = Date().addingTimeInterval(budget)
+        var probeURL: URL?
+        var lastProbe = Date.distantPast
+        // One automatic load attempt per request: if the server isn't running
+        // at all, START it (this is the whole cold-start promise — a chat
+        // routed at an unloaded model must end with that model answering). If
+        // that attempt fails, the fail-dialog governs; no restart loops.
+        var autoStartAttempts = 0
+
+        while Date() < deadline {
+            // An answering server — whatever process owns it — ends the wait.
+            // For llamaapp the probe resolves the live port itself.
+            if manager.isRunning { return .ready }
+            if Date().timeIntervalSince(lastProbe) >= 1.0 {
+                lastProbe = Date()
+                if probeURL == nil { probeURL = Self.gateProbeURL(forProvider: providerId, manager: manager) }
+                if let url = probeURL, await Self.probeAnswers(url) { return .ready }
+            }
+
+            // Nothing is running and nothing is loading: kick the load off
+            // ourselves. The RAM preflight inside start() still guards the
+            // machine — a blocked load surfaces its diagnosis below.
+            if !manager.isWarmingUp,
+               !manager.gateAutoStartInFlight,
+               autoStartAttempts < 1,
+               manager.gateStartable(requested: providerId) {
+                autoStartAttempts += 1
+                manager.gateAutoStartInFlight = true
+                let target = Self.gateStartProvider(for: providerId, manager: manager)
+                Task { @MainActor in
+                    defer { manager.gateAutoStartInFlight = false }
+                    if let target {
+                        print("[LocalModel] Request gate: no local server running — starting \(target.serverName) on demand")
+                        manager.provider = target
+                        if target == .gguf {
+                            manager.port = ConfigManager.shared.ggufPort > 0 ? ConfigManager.shared.ggufPort : 8081
+                        }
+                        await manager.start()
+                    }
+                }
+            }
+
+            // Warm-up finished badly: surface the diagnosis and let the human
+            // choose — keep waiting (they are restarting the load) or end it.
+            if case .failed(let diag) = manager.status, !manager.isWarmingUp {
+                let cancelled = await GateUser.promptCancel(model: manager.displayName,
+                                                            diagnosis: diag)
+                if cancelled {
+                    print("[LocalModel] Request gate: user cancelled wait after failure — \(diag)")
+                    return .cancelled(diag)
+                }
+                // User chose to wait: leave the .failed state and keep polling.
+                manager.status = .stopped
+            }
+
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        print("[LocalModel] Request gate: \(Int(budget))s budget exhausted while \(manager.displayName) warmed up")
+        return .cancelled("The local model did not finish loading within \(Int(budget)) seconds.")
+    }
+
+    /// Whether the gate may start the server for this request right now: the
+    /// provider must be gate-managed AND the manager must not already be
+    /// mid-start (status .starting) for a different provider.
+    @MainActor
+    private func gateStartable(requested: String) -> Bool {
+        guard Self.isGateManagedProvider(requested) else { return false }
+        if case .starting = status { return false }
+        return true
+    }
+
+    /// The endpoint a gated provider's requests will actually hit.
+    private static func gateProbeURL(forProvider providerId: String, manager: LocalModelManager) -> URL? {
+        switch providerId {
+        case "gguf", "local":
+            let port = manager.port > 0 ? manager.port : ConfigManager.shared.ggufPort
+            return URL(string: "http://127.0.0.1:\(port)/health")
+        case "llamaapp", "llamacpp":
+            // llama.app rebinds its port across relaunches — probe the live one.
+            let port = LocalServerDiscovery.liveLlamaPort()
+            return URL(string: "http://127.0.0.1:\(port)/health")
+        default:
+            return nil
+        }
+    }
+
+    /// One lightweight probe. 200 = serving. 503 = llama-server's documented
+    /// "Loading model" answer — keep waiting. 404/405 = a server without
+    /// /health (older runtimes): fall back to /v1/models. No answer = not up.
+    private static func probeAnswers(_ url: URL) async -> Bool {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.5
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        switch http.statusCode {
+        case 200:
+            return true
+        case 404, 405:
+            // /health not implemented — try the models listing instead.
+            let models = url.absoluteString.replacingOccurrences(of: "/health", with: "/v1/models")
+            guard let mURL = URL(string: models) else { return false }
+            var mReq = URLRequest(url: mURL)
+            mReq.timeoutInterval = 1.5
+            guard let (_, mResp) = try? await URLSession.shared.data(for: mReq),
+                  let mHTTP = mResp as? HTTPURLResponse else { return false }
+            return mHTTP.statusCode == 200
+        default:
+            // Includes 503 (loading) — not ready yet, keep polling.
+            return false
+        }
+    }
+
+    /// The manager-facing name of the active provider for gate messaging.
+    var displayName: String {
+        provider.serverName
     }
 
     // MARK: - Readiness & Auto-Detect
@@ -1080,6 +1424,48 @@ final class LocalModelManager {
         }
 
         return nil
+    }
+
+    /// Public health probe for the warm-up gate: answers whether ANY server
+    /// (ours, llama.app's, or one started manually by the user) is currently
+    /// listening on the provider's endpoint.
+    func healthCheckPublic() async -> Bool {
+        await healthCheck()
+    }
+}
+
+// MARK: - Warm-up gate plumbing
+
+extension LocalModelManager {
+    /// Result of waiting on a local server's warm-up.
+    enum GateOutcome {
+        /// The server answers (or the request never targeted a gated runtime).
+        case ready
+        /// The wait ended without a server: the user cancelled, or the load
+        /// failed and the wait budget ran out. Carries the human diagnosis.
+        case cancelled(String)
+    }
+
+    /// Asks the human at the keyboard whether to keep waiting after a load
+    /// failed, using a modal NSAlert. Runs the dialog on the main thread via
+    /// a checked continuation — the gate (request handler) stays suspended
+    /// until the answer.
+    @MainActor
+    enum GateUser {
+        static func promptCancel(model: String, diagnosis: String) async -> Bool {
+            await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                let alert = NSAlert()
+                alert.messageText = "\(model) failed to load"
+                alert.informativeText = diagnosis + "\n\nKeep waiting? Choose Cancel to wait (e.g. while you restart the load), or Stop to end the request now."
+                alert.addButton(withTitle: "Stop the request")
+                alert.addButton(withTitle: "Keep waiting")
+                alert.alertStyle = .warning
+                DispatchQueue.main.async {
+                    let cancelled = alert.runModal().rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+                    cont.resume(returning: cancelled)
+                }
+            }
+        }
     }
 }
 

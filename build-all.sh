@@ -100,6 +100,93 @@ stage_llama_cpp() {
 }
 
 # ---------------------------------------------------------------------------
+# Bundle the PrismML fork runtime (llama-server) into the app so ternary
+# PQ2_0/PTQ1_0 GGUFs (e.g. Ternary-Bonsai) load with zero setup. Mirrors
+# stage_llama_cpp: prefers the copy JXRouter already installed, otherwise
+# downloads the newest PrismML release for this Mac. Staged into
+# llama-cpp-prism/ — a SIBLING of llama-cpp/ — so the stock runtime's bundler
+# can rm -rf its own directory without ever touching the fork. The app resolves
+# whichever prism copy (bundled vs managed) reports the newer build.
+# Set JXROUTER_SKIP_PRISM=1 to skip.
+# ---------------------------------------------------------------------------
+stage_prism_cpp() {
+    local APP_BUNDLE="$1"
+    local RES="$APP_BUNDLE/Contents/Resources/llama-cpp-prism"
+
+    if [ -n "${JXROUTER_SKIP_PRISM:-}" ]; then
+        echo "   Skipping PrismML bundling (JXROUTER_SKIP_PRISM is set)"
+        return 0
+    fi
+
+    local MANAGED="$HOME/Library/Application Support/JXRouter/llama-cpp/prism"
+    if [ -x "$MANAGED/llama-server" ]; then
+        rm -rf "$RES"; mkdir -p "$RES"
+        cp -R "$MANAGED/." "$RES"/ 2>/dev/null || true
+        xattr -dr com.apple.quarantine "$RES" 2>/dev/null || true
+        find "$RES" -maxdepth 1 \( -name 'llama-*' -o -name '*.dylib' \) -exec chmod 755 {} + 2>/dev/null || true
+        echo "   Bundled PrismML from the runtime installed by JXRouter"
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || { echo "   Warning: curl not found - skipping PrismML bundle"; return 0; }
+
+    local SUFFIX="arm64"
+    [ "$(uname -m)" = "arm64" ] || SUFFIX="x64"
+
+    # Newest PrismML release whose macOS tarball actually exists. Tags look
+    # like prism-b10743-adfffbe; assets like
+    # llama-prism-b10743-adfffbe-bin-macos-arm64.tar.gz (the kleidiai variant
+    # has a different name, so it naturally fails the HEAD probe and is
+    # skipped — the same rule the in-app updater applies).
+    local JSON="/tmp/jxrouter-prism-releases.json"
+    curl -sL --max-time 30 "https://api.github.com/repos/PrismML-Eng/llama.cpp/releases?per_page=10" -o "$JSON" 2>/dev/null || true
+    local TAG=""
+    local t a code
+    for t in $(grep -o '"tag_name": *"prism-b[0-9][^"]*"' "$JSON" 2>/dev/null \
+               | sed 's/.*"prism-/prism-/;s/"$//' | head -5); do
+        a="llama-${t}-bin-macos-${SUFFIX}.tar.gz"
+        code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 \
+               "https://github.com/PrismML-Eng/llama.cpp/releases/download/${t}/${a}" 2>/dev/null || true)
+        if [ "$code" = "200" ]; then TAG="$t"; break; fi
+    done
+    if [ -z "$TAG" ]; then
+        echo "   Warning: could not resolve a PrismML release - install it in Settings ▸ Local Models"
+        return 0
+    fi
+
+    local TMP="/tmp/jxrouter-prism-$TAG"
+    local ASSET="llama-${TAG}-bin-macos-${SUFFIX}.tar.gz"
+    rm -rf "$TMP"; mkdir -p "$TMP"
+    echo "   Downloading PrismML $TAG (macOS $SUFFIX)..."
+    if ! curl -sL --max-time 900 -o "$TMP/$ASSET" \
+         "https://github.com/PrismML-Eng/llama.cpp/releases/download/$TAG/$ASSET"; then
+        echo "   Warning: PrismML download failed - install it in Settings ▸ Local Models"
+        return 0
+    fi
+    rm -rf "$RES"; mkdir -p "$RES"
+    if ! tar -xzf "$TMP/$ASSET" -C "$RES" --strip-components=1; then
+        echo "   Warning: PrismML extraction failed - skipping"
+        rm -rf "$RES"
+        return 0
+    fi
+    rm -rf "$TMP"
+    xattr -dr com.apple.quarantine "$RES" 2>/dev/null || true
+    find "$RES" -maxdepth 1 \( -name 'llama-*' -o -name '*.dylib' \) -exec chmod 755 {} + 2>/dev/null || true
+
+    # Sanity: a PrismML build must carry the ternary decoders. Anything else
+    # would ship a llama-server that refuses exactly the models it exists for.
+    # NOTE: the marker is `prism.hadamard` (3 hits) inside the versioned
+    # libllama dylib — a release tarball strips the PQ2_0 assert strings, so a
+    # PQ2_0 grep returns 0 even on a genuine fork binary and must not be used.
+    if ! grep -a -r -q "prism.hadamard" "$RES" 2>/dev/null; then
+        echo "   Warning: downloaded PrismML build has no ternary (prism.hadamard) support - skipping"
+        rm -rf "$RES"
+        return 0
+    fi
+    echo "   Bundled PrismML $TAG into the app"
+}
+
+# ---------------------------------------------------------------------------
 # macOS — universal (Apple Silicon + Intel)
 # ---------------------------------------------------------------------------
 build_macos() {
@@ -125,6 +212,8 @@ build_macos() {
 
     # Bundle the llama.cpp runtime so the built-in GGUF loader needs no setup.
     stage_llama_cpp "$APP_BUNDLE"
+    # Bundle the PrismML fork so ternary (PQ2_0/PTQ1_0) models need no setup either.
+    stage_prism_cpp "$APP_BUNDLE"
 
     # Re-sign only if the resource copy broke the seal (keeps the Keychain
     # "Always Allow" grant stable across identical rebuilds)

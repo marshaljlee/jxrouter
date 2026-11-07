@@ -20,10 +20,11 @@ enum DesignToken {
 
     // MARK: - Radii
 
-    static let radiusSmall:  CGFloat = 4
+    static let radiusSmall:  CGFloat = 6
     static let radiusButton: CGFloat = 8
-    static let radiusCard:   CGFloat = 10
-    static let radiusPanel:  CGFloat = 12
+    static let radiusCard:   CGFloat = 14
+    static let radiusPanel:  CGFloat = 16
+    static let radiusPill:   CGFloat = 9999
 
     // MARK: - Shadows
 
@@ -31,16 +32,24 @@ enum DesignToken {
     static let shadowBlur:    CGFloat = 8
     static let shadowOpacity: Double  = 0.08
 
+    // MARK: - 4-Tier Surface Luminosity Elevations
+
+    static var elevationTier0: Color { Color.dsBackground }
+    static var elevationTier1: Color { Color.dsSurface }
+    static var elevationTier2: Color { Color.dsSurfaceRaised }
+    static var elevationTier3: Color { Color.adaptive(light: NSColor.white.withAlphaComponent(0.85), dark: NSColor(white: 0.12, alpha: 0.85)) }
+
     // MARK: - Animation Durations
 
     static let hoverDuration:      Double = 0.12
     static let pressDuration:      Double = 0.08
     static let transitionDuration: Double = 0.22
 
-    // MARK: - Springs
+    // MARK: - Springs (Kinetic 20-Skill Spec)
 
-    static let buttonSpring = Spring(response: 0.3, dampingRatio: 0.7)
-    static let contentSpring = Spring(response: 0.35, dampingRatio: 0.8)
+    static let buttonSpring: Animation = .spring(response: 0.25, dampingFraction: 0.82)
+    static let contentSpring: Animation = .spring(response: 0.32, dampingFraction: 0.80)
+    static let snappySpring: Animation = .spring(response: 0.18, dampingFraction: 0.88)
 
     // MARK: - Font Sizes
 

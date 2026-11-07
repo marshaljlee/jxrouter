@@ -1,0 +1,23 @@
+[
+  {"id": "CAP-01", "name": "Apple HIG macOS Fluid Grid Layout", "category": "Layout", "source": "developer.apple.com/design"},
+  {"id": "CAP-02", "name": "Spring Physics Linear Interpolation", "category": "Motion", "source": "developer.apple.com/documentation/swiftui/animation/spring"},
+  {"id": "CAP-03", "name": "4-Tier Surface Luminosity System", "category": "Color", "source": "radix-ui.com/colors"},
+  {"id": "CAP-04", "name": "Functional Micro-Border Elevations", "category": "Styling", "source": "ui.shadcn.com"},
+  {"id": "CAP-05", "name": "Semantic Status Pill Contrast Hierarchy", "category": "Accessibility", "source": "w3.org/WAI/WCAG21"},
+  {"id": "CAP-06", "name": "Proportional Card Padding Floors", "category": "Layout", "source": "refactoringui.com"},
+  {"id": "CAP-07", "name": "Reduced Motion Vestibular Safety", "category": "Accessibility", "source": "webkit.org/blog/accessibility"},
+  {"id": "CAP-08", "name": "Live Log Buffer Auto-Scroll Lock", "category": "UX", "source": "jetbrains.com/fleet/ux"},
+  {"id": "CAP-09", "name": "Non-Destructive Sheet Overlays", "category": "Interaction", "source": "developer.apple.com/design/human-interface-guidelines/sheets"},
+  {"id": "CAP-10", "name": "Zero-Loss Key Navigation", "category": "Interaction", "source": "w3.org/WAI/ARIA/apg"},
+  {"id": "CAP-11", "name": "Streaming Reasoning Token Disclosure", "category": "UX", "source": "deepseek.com/r1"},
+  {"id": "CAP-12", "name": "Live Latency Probe Micro-Badges", "category": "Telemetry", "source": "datadoghq.com/ux"},
+  {"id": "CAP-13", "name": "System Status Menu Dynamic Tinting", "category": "System", "source": "developer.apple.com/documentation/appkit/nsstatusitem"},
+  {"id": "CAP-14", "name": "Multi-Stop Harmonious Drop Shadows", "category": "Styling", "source": "joshwcomeau.com/css/designing-shadows"},
+  {"id": "CAP-15", "name": "Haptic/Audio State Feedback Cues", "category": "Micro-interaction", "source": "developer.apple.com/documentation/appkit/nshapticfeedbackperformer"},
+  {"id": "CAP-16", "name": "Zero-Layout-Shift Card Folding", "category": "Animation", "source": "web.dev/cls"},
+  {"id": "CAP-17", "name": "Interactive Code & Key Scrubbing", "category": "Security", "source": "1password.design"},
+  {"id": "CAP-18", "name": "Fluid Context Window Visualizer", "category": "DataViz", "source": "observablehq.com"},
+  {"id": "CAP-19", "name": "Adaptive Dark/Light Contrast Harmonizer", "category": "Theme", "source": "github.com/primer/primitives"},
+  {"id": "CAP-20", "name": "Dynamic Window Resize Resistance", "category": "Windowing", "source": "developer.apple.com/documentation/appkit/nswindow"}
+]
+

@@ -553,9 +553,17 @@ enum KeychainManager {
         // that writer in their ACL, so the app prompts on EVERY read — the
         // "keeps asking for keychain password" symptom.
         for account in accounts {
-            // Only repair items that exist. Updating a missing item returns
-            // errSecItemNotFound, which is not a repair failure.
-            guard value(fromService: service, key: account) != nil else { continue }
+            // Classify the item first: healthy and missing items need nothing;
+            // UNREADABLE ones are the patients this repair exists for. The
+            // old guard (`value(...) != nil`) skipped exactly those — an item
+            // whose ACL does not trust this build fails its silent read, so
+            // the repair loop walked past the very items it was built to fix
+            // and every redeploy re-stranded the provider keys.
+            switch read(fromService: service, key: account, allowInteraction: false) {
+            case .value: continue
+            case .notFound: continue
+            case .notPermitted, .timedOut: break
+            }
             var query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,

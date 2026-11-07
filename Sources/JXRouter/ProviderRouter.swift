@@ -77,6 +77,77 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     private var session: URLSession!
     
     var lastLatencyMs: Double = 0.0
+
+    // MARK: - AMEEM v3.0 (request-time middleware)
+    //
+    // The capability probe and the hallucination firewall are shared across
+    // requests. The probe is TTL-cached, so a model change needs no scheduling:
+    // every request re-derives from the live server once the TTL lapses.
+    let ameemProbe = AMEEMCapabilityProbe()
+    let ameemFirewall = AMEEMFirewall()
+
+    /// `scheme://host:port` for a provider base URL — the origin the AMEEM probe
+    /// addresses (`/v1/models`, `/props`, `/apply-template`). An origin only: a
+    /// path would produce the double-`/v1` fault the reference documents as C-12.
+    func ameemOrigin(of baseUrl: String) -> String? {
+        guard let url = URL(string: baseUrl), let scheme = url.scheme, let host = url.host else {
+            return nil
+        }
+        if let port = url.port { return "\(scheme)://\(host):\(port)" }
+        return "\(scheme)://\(host)"
+    }
+
+    /// An Anthropic-shaped error body for a refusal built outside `errorResponse`.
+    private func ameemRefusalBody(_ message: String) -> Data {
+        let body: [String: Any] = ["type": "error",
+                                   "error": ["type": "invalid_request_error", "message": message]]
+        return (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+    }
+
+    /// Whether a target URL is on this machine.
+    private func isLocalTarget(_ baseUrl: String) -> Bool {
+        baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")
+    }
+
+    /// AMEEM v3.0 request-time gate. Calibrates `openaiBody` in place for a local
+    /// target. Returns the calibration, or a refusal response when a guardrail
+    /// fails closed (I2). `enforced` is true only for the request's intended
+    /// provider — a fallback attempt is not the user's chosen local model.
+    private func ameemGate(
+        openaiBody: inout [String: Any],
+        providerId: String,
+        baseUrl: String,
+        apiKey: String,
+        enforced: Bool
+    ) async -> (calibration: AMEEMRequestGate.Calibration?, refusal: ProviderResponse?) {
+        guard enforced, AMEEMMode.current != .off,
+              isLocalProvider(providerId) || isLocalTarget(baseUrl),
+              let origin = ameemOrigin(of: baseUrl) else { return (nil, nil) }
+        do {
+            let calibration = try await AMEEMRequestGate.calibrate(
+                payload: openaiBody, origin: origin, apiKey: apiKey, probe: ameemProbe)
+            openaiBody = calibration.payload
+            return (calibration, nil)
+        } catch let violation as AMEEMGuardrailViolation {
+            guard AMEEMMode.current == .enforce else {
+                print("[AMEEM] (warn mode) \(violation.clientMessage)")
+                return (nil, nil)
+            }
+            print("[AMEEM] refused request: \(violation.clientMessage)")
+            var refusal = ProviderResponse(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: ameemRefusalBody(violation.clientMessage),
+                stream: nil)
+            refusal.ameemRefused = true
+            return (nil, refusal)
+        } catch {
+            // The probe could not run at all (DNS, socket, decode). Fail closed
+            // only in enforce mode; otherwise let the request proceed unchanged.
+            print("[AMEEM] gate error: \(error)")
+            return (nil, nil)
+        }
+    }
     
     init(config: ConfigManager = .shared) {
         self.config = config
@@ -164,6 +235,23 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
+                // Cold-start gate: when the chain's provider is JXRouter's own
+                // local model runtime and it is still loading, WAIT for it
+                // (bounded by the router's own chain cap) instead of failing
+                // over. The old behavior let the request hit connection-
+                // refused, burned the whole fallback chain on remote providers
+                // and surfaced a 503 while the model was minutes from ready.
+                if isLocalProvider(providerId) {
+                    switch await LocalModelManager.awaitLocalServerReady(forProvider: providerId) {
+                    case .ready:
+                        break
+                    case .cancelled(let reason):
+                        failures.append((providerId, 503))
+                        lastError = NSError(domain: "JXRouter.localGate", code: 503,
+                                            userInfo: [NSLocalizedDescriptionKey: reason])
+                        continue
+                    }
+                }
                 // Tier model overrides (e.g. Sonnet → minimaxai/minimax-m3) apply
                 // ONLY to the tier's own primary provider. A fallback must receive
                 // the model the client actually asked for — otherwise opencode-zen
@@ -176,8 +264,11 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 // burns through to a 503).
                 let budget = attemptTimeout(for: providerId, index: index)
                 var response = try await Self.withAttemptTimeout(seconds: budget) {
-                    try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, maxTime: Int(budget), clientHeaders: headers)
+                    try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, maxTime: Int(budget), clientHeaders: headers, ameemEnforced: index == 0)
                 }
+                // An AMEEM refusal is terminal — it names a configuration fault
+                // no fallback can fix, so surface it instead of burning the chain.
+                if response.ameemRefused { return response }
                 // Model-rejection rescue: a provider that refuses the REQUESTED
                 // model (400 model unavailable, 401 "model not supported", 404
                 // unknown model) gets ONE retry with its OWN default model. This
@@ -191,8 +282,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 if [400, 401, 404].contains(response.statusCode), defaultModelForProvider(providerId) != nil {
                     print("[ProviderRouter] \(providerId) rejected model — retrying with its default model")
                     response = try await Self.withAttemptTimeout(seconds: budget) {
-                        try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget), clientHeaders: headers)
+                        try await self.routeToProvider(providerId: providerId, request: messagesRequest, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget), clientHeaders: headers, ameemEnforced: index == 0)
                     }
+                    if response.ameemRefused { return response }
                 }
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                 
@@ -326,20 +418,37 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
             do {
                 let startTime = CFAbsoluteTimeGetCurrent()
+                // Same cold-start gate as the Anthropic messages path: wait for
+                // the local model to finish loading instead of burning the
+                // chain while it warms up.
+                if isLocalProvider(providerId) {
+                    switch await LocalModelManager.awaitLocalServerReady(forProvider: providerId) {
+                    case .ready:
+                        break
+                    case .cancelled(let reason):
+                        failures.append((providerId, 503))
+                        lastError = NSError(domain: "JXRouter.localGate", code: 503,
+                                            userInfo: [NSLocalizedDescriptionKey: reason])
+                        continue
+                    }
+                }
                 // Same rule as Anthropic messages: tier model overrides apply only
                 // to the tier's primary; fallbacks get the client's original model.
                 let budget = attemptTimeout(for: providerId, index: index)
                 var response = try await Self.withAttemptTimeout(seconds: budget) {
-                    try await self.routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream, applyTierMapping: index == 0, maxTime: Int(budget))
+                    try await self.routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream, applyTierMapping: index == 0, maxTime: Int(budget), ameemEnforced: index == 0)
                 }
+                // An AMEEM refusal is terminal — surface it, never fail over.
+                if response.ameemRefused { return response }
                 // Same model-rejection rescue as the Anthropic path: retry once
                 // with the provider's own default model so a dead primary is
                 // rescued by a fallback instead of failing the whole request.
                 if [400, 401, 404].contains(response.statusCode), defaultModelForProvider(providerId) != nil {
                     print("[ProviderRouter] \(providerId) rejected model — retrying with its default model")
                     response = try await Self.withAttemptTimeout(seconds: budget) {
-                        try await self.routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget))
+                        try await self.routeChatCompletionsToProvider(providerId: providerId, request: requestJSON, model: requestedModel, stream: wantsStream, applyTierMapping: index == 0, forceDefaultModel: true, maxTime: Int(budget), ameemEnforced: index == 0)
                     }
+                    if response.ameemRefused { return response }
                 }
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                 self.lastLatencyMs = elapsedMs
@@ -373,7 +482,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
     /// OpenAI-compatible endpoint. The model is resolved through the same tier
     /// logic as Anthropic requests; the response (including SSE) is returned
     /// untouched so the OpenAI client sees native OpenAI data.
-    private func routeChatCompletionsToProvider(providerId: String, request: [String: Any], model: String, stream: Bool, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30) async throws -> ProviderResponse {
+    private func routeChatCompletionsToProvider(providerId: String, request: [String: Any], model: String, stream: Bool, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30, ameemEnforced: Bool = false) async throws -> ProviderResponse {
         var body = request
         let resolvedModel = resolveModel(model, for: providerId, applyTierOverride: applyTierMapping, forceDefaultModel: forceDefaultModel)
         var effectiveModel = resolvedModel
@@ -394,6 +503,25 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             baseUrl = "http://127.0.0.1:\(LocalServerDiscovery.liveLlamaPort())/v1"
         }
         let effectiveMaxTime = isLocalProvider(providerId) ? 720 : maxTime
+
+        // --- AMEEM v3.0 request-time gate (local targets only).
+        var effectiveStream = stream
+        let (ameemCalibration, ameemRefusal) = await ameemGate(
+            openaiBody: &body, providerId: providerId, baseUrl: baseUrl,
+            apiKey: apiKey, enforced: ameemEnforced)
+        if let ameemRefusal { return ameemRefusal }
+        if ameemCalibration?.streamDowngraded == true { effectiveStream = false }
+
+        // --- OpenCode Zen free-tier client shim -------------------------------
+        // Same four gates as the translated path: UA `opencode/>=1.18.0`, a
+        // `ses_`+12 hex+14 base62 session, lowercase `bash` AND `read` in
+        // `tools`, and `stream: true`. An OpenAI-shaped harness (Codex, the
+        // OpenAI SDK) fails gates 3 and 4 as readily as Claude Code does.
+        let zenShim = OpenCodeZenShim.applies(providerId: providerId, baseUrl: baseUrl, apiKey: apiKey)
+        let callerToolNames = OpenCodeZenShim.toolNames(inOpenAITools: body["tools"])
+        var zenForcedStream = false
+        if zenShim { zenForcedStream = OpenCodeZenShim.conform(body: &body) }
+
         guard let url = URL(string: "\(baseUrl)/chat/completions") else {
             return errorResponse(statusCode: 500, type: "api_error", message: "Invalid provider URL: \(baseUrl)")
         }
@@ -402,6 +530,9 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
         var headers: [String: String] = ["Content-Type": "application/json", "Host": host]
         if !apiKey.isEmpty { headers["Authorization"] = "Bearer \(apiKey)" }
+        if zenShim {
+            OpenCodeZenShim.apply(to: &headers, origin: baseUrl, hasKey: !apiKey.isEmpty)
+        }
 
         let bodyData: Data
         do {
@@ -410,7 +541,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             print("[ProviderRouter] JSON serialization failed: \(error)")
             return errorResponse(statusCode: 500, type: "api_error", message: "Failed to serialize request body: \(error.localizedDescription)")
         }
-        if stream {
+        if effectiveStream {
             let (response, inputStream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip, maxTime: effectiveMaxTime)
             if response.statusCode != 200 {
                 var full = Data()
@@ -421,11 +552,59 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 statusCode: 200,
                 headers: ["Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"],
                 body: Data(),
-                stream: inputStream
+                stream: zenShim ? OpenCodeZenShim.filtering(inputStream, offered: callerToolNames) : inputStream
             )
         } else {
-            let (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip, maxTime: effectiveMaxTime)
-            return ProviderResponse(statusCode: response.statusCode, headers: ["Content-Type": response.mimeType ?? "application/json"], body: data)
+            var data: Data
+            let response: HTTPURLResponse
+            if zenForcedStream {
+                // Gate 4 refused `stream: false` upstream, so the request had to
+                // go out as SSE. Fold it back into one JSON body for the caller
+                // that asked for a non-streaming answer.
+                let (head, sse) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip, maxTime: effectiveMaxTime)
+                var raw = Data()
+                for await chunk in sse { raw.append(chunk) }
+                data = OpenCodeZenShim.aggregate(sseData: raw, model: effectiveModel, offered: callerToolNames)
+                response = head
+            } else {
+                let (fetched, http) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: bodyData, resolveIP: ip, maxTime: effectiveMaxTime)
+                data = fetched
+                response = http
+            }
+
+            // --- AMEEM response path: recovery first, then the firewall. The
+            //     client sees this body verbatim (raw OpenAI passthrough), so the
+            //     repair has to happen here rather than after a translation.
+            if response.statusCode == 200, let calibration = ameemCalibration {
+                let offered = Set(((body["tools"] as? [[String: Any]]) ?? [])
+                    .compactMap { ($0["function"] as? [String: Any])?["name"] as? String })
+                let firstUser = AMEEMRequestGate.firstUserTurn(in: body)
+                let (repaired, changed) = ameemFirewall.apply(
+                    toBody: data, model: effectiveModel, firstUserTurn: firstUser,
+                    dialect: calibration.profile.dialect,
+                    offeredTools: offered,
+                    terminalTools: calibration.terminalTools)
+                if changed { data = repaired }
+            }
+
+            // G-15: the upstream stream was downgraded so recovery could run. An
+            // OpenAI client that asked for SSE must still receive SSE.
+            if stream, ameemCalibration?.streamDowngraded == true, response.statusCode == 200,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return ProviderResponse(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream",
+                              "Cache-Control": "no-cache", "Connection": "keep-alive"],
+                    body: Data(),
+                    stream: AMEEMStreamBridge.openAIStream(fromResponseJSON: json, model: effectiveModel))
+            }
+            // Undo gate 3 for the raw-passthrough path: a call to the shim's own
+            // `bash`/`read` declaration must never reach a client that never
+            // offered them.
+            let outData = zenShim && response.statusCode == 200
+                ? OpenCodeZenShim.stripSyntheticToolCalls(fromBody: data, offered: callerToolNames)
+                : data
+            return ProviderResponse(statusCode: response.statusCode, headers: ["Content-Type": response.mimeType ?? "application/json"], body: outData)
         }
     }
 
@@ -511,7 +690,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
     // MARK: - Routing
     
-    private func routeToProvider(providerId: String, request: MessagesRequest, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30, clientHeaders: [String: String] = [:]) async throws -> ProviderResponse {
+    private func routeToProvider(providerId: String, request: MessagesRequest, applyTierMapping: Bool = true, forceDefaultModel: Bool = false, maxTime: Int = 30, clientHeaders: [String: String] = [:], ameemEnforced: Bool = false) async throws -> ProviderResponse {
         let resolvedModel = resolveModel(request.model, for: providerId, applyTierOverride: applyTierMapping, forceDefaultModel: forceDefaultModel)
         let apiKey = config.apiKey(for: providerId)
         var baseUrl = config.baseUrl(for: providerId)
@@ -590,21 +769,21 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         case "direct":
             return try await routeToAnthropicDirect(request: request, model: model, apiKey: apiKey, baseUrl: baseUrl, clientHeaders: clientHeaders)
         case "openrouter":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: true, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: true, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case "opencode-zen", "opencode-go", "openai":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case "nvidia-nim":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case "deepseek", "gemini", "gemini-oauth", "mistral", "codestral", "cohere", "groq", "fireworks", "sambanova", "cerebras", "huggingface", "github-models", "wafer", "kimi", "kimi-code", "minimax", "xai", "zai", "ollama-cloud", "ai-gateway", "antigravity", "custom", "jan":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case let pid where config.customProviders.contains(where: { $0.id == pid }):
             // Named custom providers (Settings → Providers → Custom Providers)
             // route through the same OpenAI-compatible path.
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case "local", "ollama":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: apiKey, baseUrl: config.localLlmBaseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         case "lmstudio", "llamaapp", "llamacpp", "unsloth", "gguf":
-            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: "", baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime)
+            return try await routeToOpenAICompatible(request: request, model: model, providerId: providerId, apiKey: "", baseUrl: baseUrl, isOpenRouter: false, maxTime: effectiveMaxTime, ameemEnforced: ameemEnforced)
         default:
             return errorResponse(statusCode: 400, type: "invalid_request_error", message: "Unknown provider: \(providerId)")
         }
@@ -660,11 +839,58 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
         }
     }
     
-    private func routeToOpenAICompatible(request: MessagesRequest, model: String, providerId: String, apiKey: String, baseUrl: String, isOpenRouter: Bool, maxTime: Int = 30) async throws -> ProviderResponse {
+    private func routeToOpenAICompatible(request: MessagesRequest, model: String, providerId: String, apiKey: String, baseUrl: String, isOpenRouter: Bool, maxTime: Int = 30, ameemEnforced: Bool = false) async throws -> ProviderResponse {
         // Resolve the effective reasoning pass-through for this provider + model
         // (global master switch → per-provider auto/on/off → capability heuristic).
         let reasoningEnabled = config.reasoningEnabled(for: providerId, model: model)
-        let openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model, enableThinking: reasoningEnabled)
+        var openaiBody = MessageTranslator.toOpenAIChat(request: request, model: model, enableThinking: reasoningEnabled)
+        // Defensive: drop anything JSONSerialization cannot serialize (NSNull
+        // from a null tool-schema property, stray non-JSON values). Without
+        // this a single poisoned value aborts the WHOLE body serialization and
+        // the request dies as 500 "Failed to serialize request body".
+        for (key, value) in openaiBody {
+            if let cleaned = MessageTranslator.dropUnserializableValues(value) {
+                openaiBody[key] = cleaned
+            } else {
+                openaiBody.removeValue(forKey: key)
+            }
+        }
+        // Pre-clamp to a cap learned from this provider's own 400 — after the
+        // first discovery the clamp becomes a first-try success.
+        if let requested = openaiBody["max_tokens"] as? Int,
+           let cap = OutputLimitClamp.knownCap(provider: providerId, model: model),
+           requested > cap {
+            openaiBody["max_tokens"] = cap
+        }
+
+        // Is this request bound for a server on this machine? AMEEM is the
+        // middleware between an agent harness and a local GGUF inference server,
+        // so its calibration applies here and only here — a cloud provider's
+        // samplers are not ours to clamp.
+        let isLocal = isLocalProvider(providerId) || isLocalTarget(baseUrl)
+        var effectiveStream = request.stream
+
+        // --- AMEEM v3.0 request-time gate -------------------------------------
+        // Every refusal is a structured 409 naming the gate (I2). A refusal is
+        // terminal: it names a configuration fault that no fallback fixes.
+        let (ameemCalibration, ameemRefusal) = await ameemGate(
+            openaiBody: &openaiBody, providerId: providerId, baseUrl: baseUrl,
+            apiKey: apiKey, enforced: ameemEnforced)
+        if let ameemRefusal { return ameemRefusal }
+        if ameemCalibration?.streamDowngraded == true { effectiveStream = false }
+
+        // --- OpenCode Zen free-tier client shim -------------------------------
+        // Zen's anonymous endpoint answers 403 FreeTierError to anything that is
+        // not the OpenCode client. Four gates, each bisected live (see
+        // OpenCodeZenShim): UA `opencode/>=1.18.0`, an `x-opencode-session` of
+        // exactly `ses_`+12 hex+14 base62, `tools` declaring lowercase `bash`
+        // AND `read`, and `stream: true`. Gates 3 and 4 live in the body, so
+        // headers alone are not enough. A keyed request is the paid path and is
+        // left untouched.
+        let zenShim = OpenCodeZenShim.applies(providerId: providerId, baseUrl: baseUrl, apiKey: apiKey)
+        let callerToolNames = MessageTranslator.toolNames(in: request)
+        var zenForcedStream = false
+        if zenShim { zenForcedStream = OpenCodeZenShim.conform(body: &openaiBody) }
 
         guard let url = URL(string: "\(baseUrl)/chat/completions") else {
             return errorResponse(statusCode: 500, type: "api_error", message: "Invalid provider URL: \(baseUrl)")
@@ -679,6 +905,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             print("[ProviderRouter] JSON serialization failed: \(error)")
             return errorResponse(statusCode: 500, type: "api_error", message: "Failed to serialize request body: \(error.localizedDescription)")
         }
+        Wiretap.tap(provider: providerId, model: model, body: body)
         var headers: [String: String] = [
             "Content-Type": "application/json",
             "Host": host
@@ -690,20 +917,47 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             headers["HTTP-Referer"] = "https://github.com/marshaljlee/jxproxy"
             headers["X-Title"] = "JXProxy"
         }
-        if providerId.hasPrefix("opencode") || baseUrl.contains("opencode.ai") {
-            let sessionId = "ses_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
-            let requestId = "req_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
-            headers["x-opencode-session"] = sessionId
-            headers["x-opencode-request"] = requestId
-            headers["x-opencode-client"] = "cli"
-            headers["User-Agent"] = "opencode/1.18.21"
+        if zenShim {
+            OpenCodeZenShim.apply(to: &headers, origin: baseUrl, hasKey: !apiKey.isEmpty)
         }
+        // Gate 4 forces the upstream to stream, so a call to the shim's own
+        // `bash`/`read` declarations is stripped from the stream before the
+        // Anthropic translation ever sees it.
+        let zenStreamFilter = zenShim ? OpenCodeZenShim.StreamFilter(offered: callerToolNames) : nil
         
-        let isLocal = isLocalProvider(providerId) || baseUrl.contains("127.0.0.1") || baseUrl.contains("localhost")
         let hasNativeTools = openaiBody["tools"] != nil
 
-        if request.stream {
+        if effectiveStream {
             var (response, stream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: body, resolveIP: ip, maxTime: maxTime)
+
+            // Output-cap clamp retry: a strict gateway that caps completion
+            // tokens (agnes: 65536) answers Claude Code's 128k max_tokens with
+            // a deterministic 400 — the chain then burns and the CLI retries
+            // itself to death. Same fix as LiteLLM/claude-code-proxy: read the
+            // cap the upstream just declared, retry once with a clamped
+            // max_tokens, and remember it so later requests pre-clamp.
+            if response.statusCode == 400 {
+                var errData = Data()
+                for await chunk in stream { errData.append(chunk) }
+                if let cap = OutputLimitClamp.capFromErrorBody(errData),
+                   let requested = openaiBody["max_tokens"] as? Int, requested > cap,
+                   var clampedDict = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] {
+                    OutputLimitClamp.noteCap(provider: providerId, model: model, cap: cap)
+                    print("[ProviderRouter] \(providerId) rejected max_tokens \(requested) — retrying clamped to \(cap)")
+                    clampedDict["max_tokens"] = cap
+                    if let clampedData = try? JSONSerialization.data(withJSONObject: clampedDict) {
+                        Wiretap.tap(provider: providerId, model: model, body: clampedData, tag: "req-clamped")
+                        let (retryResponse, retryStream) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: clampedData, resolveIP: ip, maxTime: maxTime)
+                        if retryResponse.statusCode == 200 {
+                            return try await handleOpenAIStreaming(response: retryResponse, stream: retryStream, request: request, reasoningEnabled: reasoningEnabled, toolFilter: zenStreamFilter)
+                        }
+                    }
+                }
+                // Inspection consumed the error stream — replay it for the
+                // error-conversion path below.
+                let replay = AsyncStream<Data> { cont in cont.yield(errData); cont.finish() }
+                stream = replay
+            }
 
             // Auto-heal for local models if the inference engine rejects tools format (e.g. 400 Bad Request, missing Jinja tool template)
             if response.statusCode != 200 && isLocal && hasNativeTools {
@@ -718,9 +972,38 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                 }
             }
 
-            return try await handleOpenAIStreaming(response: response, stream: stream, request: request, reasoningEnabled: reasoningEnabled)
+            return try await handleOpenAIStreaming(response: response, stream: stream, request: request, reasoningEnabled: reasoningEnabled, toolFilter: zenStreamFilter)
         } else {
-            var (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: body, resolveIP: ip, maxTime: maxTime)
+            var data: Data
+            var response: HTTPURLResponse
+            if zenForcedStream {
+                // Gate 4 refused `stream: false` upstream; the answer arrives as
+                // SSE and has to be folded back into one JSON body.
+                let (head, sse) = try await CurlClient.stream(url: url, method: "POST", headers: headers, body: body, resolveIP: ip, maxTime: maxTime)
+                var raw = Data()
+                for await chunk in sse { raw.append(chunk) }
+                data = OpenCodeZenShim.aggregate(sseData: raw, model: model, offered: callerToolNames)
+                response = head
+            } else {
+                (data, response) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: body, resolveIP: ip, maxTime: maxTime)
+            }
+            Wiretap.tap(provider: providerId, model: model, body: data, tag: "resp-\(response.statusCode)")
+
+            // Output-cap clamp retry — streaming twin of the block below/below.
+            if response.statusCode == 400, let cap = OutputLimitClamp.capFromErrorBody(data),
+               let requested = openaiBody["max_tokens"] as? Int, requested > cap,
+               var clampedDict = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] {
+                OutputLimitClamp.noteCap(provider: providerId, model: model, cap: cap)
+                print("[ProviderRouter] \(providerId) rejected max_tokens \(requested) — retrying clamped to \(cap)")
+                clampedDict["max_tokens"] = cap
+                if let clampedData = try? JSONSerialization.data(withJSONObject: clampedDict) {
+                    Wiretap.tap(provider: providerId, model: model, body: clampedData, tag: "req-clamped")
+                    let (retryData, retryResponse) = try await CurlClient.request(url: url, method: "POST", headers: headers, body: clampedData, resolveIP: ip, maxTime: maxTime)
+                    data = retryData
+                    response = retryResponse
+                    Wiretap.tap(provider: providerId, model: model, body: data, tag: "resp-\(response.statusCode)")
+                }
+            }
 
             // Auto-heal for local models if native tools reject with 400 or 500
             if response.statusCode != 200 && isLocal && hasNativeTools {
@@ -737,10 +1020,64 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
             let statusCode = response.statusCode
             guard statusCode == 200 else {
-                let converted = MessageTranslator.convertOpenAIErrorToAnthropic(data: data, statusCode: statusCode)
+                // Surface the REAL upstream shape: a gateway that answers an
+                // HTML/nginx page (proxy misroute, dead path, wrong base URL)
+                // used to be relayed as an unparseable body that the chain
+                // message reduced to a bare "HTTP 404" — hiding the nginx 404
+                // page that names the actual cause. JSON errors pass through
+                // untouched.
+                let converted: Data
+                if let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any], parsed["error"] != nil {
+                    converted = MessageTranslator.convertOpenAIErrorToAnthropic(data: data, statusCode: statusCode)
+                } else {
+                    let detail = ProviderValidator.serverMessage(data)
+                    let body: [String: Any] = [
+                        "type": "error",
+                        "error": ["type": "api_error",
+                                  "message": "\(providerId) returned HTTP \(statusCode): \(detail)"]
+                    ]
+                    converted = (try? JSONSerialization.data(withJSONObject: body)) ?? data
+                }
                 return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: converted)
             }
-            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: MessageTranslator.convertOpenAIResponseToAnthropic(data: data, model: request.model, enableThinking: reasoningEnabled))
+            // --- AMEEM response path: recovery runs first, then the firewall
+            //     (Pillar C). A turn with a native or recovered call is good and
+            //     is returned untouched; only a bare completion claim on a
+            //     terminal-capable suite, with budget remaining, is repaired.
+            if let calibration = ameemCalibration {
+                let offered = Set(((openaiBody["tools"] as? [[String: Any]]) ?? [])
+                    .compactMap { ($0["function"] as? [String: Any])?["name"] as? String })
+                let firstUser = AMEEMRequestGate.firstUserTurn(in: openaiBody)
+                let (repaired, changed) = ameemFirewall.apply(
+                    toBody: data, model: model, firstUserTurn: firstUser,
+                    dialect: calibration.profile.dialect,
+                    offeredTools: offered,
+                    terminalTools: calibration.terminalTools)
+                if changed { data = repaired }
+            }
+
+            // Undo gate 3: a call to the shim's own `bash`/`read` declaration
+            // must never reach a client that never offered them.
+            if zenShim {
+                data = OpenCodeZenShim.stripSyntheticToolCalls(fromBody: data, offered: callerToolNames)
+            }
+
+            let anthropicBody = MessageTranslator.convertOpenAIResponseToAnthropic(
+                data: data, model: request.model, enableThinking: reasoningEnabled)
+
+            // G-15: the upstream stream was downgraded so recovery could run. A
+            // client that asked for SSE must still receive SSE, so re-frame the
+            // complete response back into the dialect it expects.
+            if request.stream, ameemCalibration?.streamDowngraded == true,
+               let messageJSON = try? JSONSerialization.jsonObject(with: anthropicBody) as? [String: Any] {
+                return ProviderResponse(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/event-stream",
+                              "Cache-Control": "no-cache", "Connection": "keep-alive"],
+                    body: Data(),
+                    stream: AMEEMStreamBridge.anthropicStream(fromMessageJSON: messageJSON, model: request.model))
+            }
+            return ProviderResponse(statusCode: 200, headers: ["Content-Type": "application/json"], body: anthropicBody)
         }
     }
     
@@ -764,7 +1101,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
     // MARK: - Streaming
     
-    private func handleOpenAIStreaming(response: HTTPURLResponse, stream inputStream: AsyncStream<Data>, request: MessagesRequest, reasoningEnabled: Bool) async throws -> ProviderResponse {
+    private func handleOpenAIStreaming(response: HTTPURLResponse, stream inputStream: AsyncStream<Data>, request: MessagesRequest, reasoningEnabled: Bool, toolFilter: OpenCodeZenShim.StreamFilter? = nil) async throws -> ProviderResponse {
         let statusCode = response.statusCode
 
         if statusCode != 200 {
@@ -772,6 +1109,7 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             for await chunk in inputStream {
                 fullData.append(chunk)
             }
+            Wiretap.tap(provider: response.url?.host ?? "stream", model: "", body: fullData, tag: "stream-err-\(statusCode)")
             let converted = MessageTranslator.convertOpenAIErrorToAnthropic(data: fullData, statusCode: statusCode)
             return ProviderResponse(statusCode: statusCode, headers: ["Content-Type": "application/json"], body: converted)
         }
@@ -812,13 +1150,22 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
             streamLoop: for await chunk in inputStream {
                 pingFlag.noteActivity()
                 buffer.append(chunk)
+                Wiretap.tap(provider: "upstream", model: "", body: chunk, tag: "up")
 
                 while let newlineRange = buffer.range(of: Data("\n".utf8)) {
                     let lineData = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
                     buffer.removeSubrange(buffer.startIndex..<newlineRange.upperBound)
 
-                    guard let line = String(data: lineData, encoding: .utf8), line.hasPrefix("data: ") else { continue }
-                    let dataString = String(line.dropFirst(6))
+                    // OpenAI sends "data: ", but several OpenAI-compatible
+                    // gateways emit "data:" with NO space. Only accepting the
+                    // spaced form silently dropped every chunk from those
+                    // upstreams — the Anthropic side then saw an empty stream
+                    // and served the defensive "empty message" tail, which the
+                    // CLI renders as an instant blank reply with no error.
+                    guard let line = String(data: lineData, encoding: .utf8),
+                          line.hasPrefix("data:"), line.count > "data:".count else { continue }
+                    var dataString = line.dropFirst("data:".count)
+                    if dataString.hasPrefix(" ") { dataString = dataString.dropFirst() }
 
                     if dataString == "[DONE]" {
                         if !hasFinished {
@@ -833,9 +1180,13 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
                     }
 
                     guard let chunkData = dataString.data(using: .utf8),
-                          let chunkDict = try? JSONSerialization.jsonObject(with: chunkData) as? [String: Any] else {
+                          var chunkDict = try? JSONSerialization.jsonObject(with: chunkData) as? [String: Any] else {
                         continue
                     }
+                    // OpenCode Zen shim: a call to the synthetic `bash`/`read`
+                    // declaration is dropped here, before it can become an
+                    // Anthropic tool_use block the client never asked for.
+                    if let toolFilter { toolFilter.filter(&chunkDict) }
 
                     let events = MessageTranslator.openAIToAnthropicSSE(chunk: chunkDict, model: request.model, state: &streamState, enableThinking: reasoningEnabled)
                     for event in events {
@@ -1147,9 +1498,96 @@ final class ProviderRouter: NSObject, URLSessionDelegate {
 
 }
 
+/// Per-(provider, model) output-token caps learned from upstream 400s —
+/// the in-memory equivalent of the per-provider output limits LiteLLM and
+/// claude-code-proxy keep in their provider configs. Claude Code sizes
+/// max_tokens for the target model's full window (a [1m]-context model asks
+/// for 128k output), which strict OpenAI-compatible gateways reject with a
+/// deterministic "max_tokens exceeds the limit of N".
+enum OutputLimitClamp {
+    private static let lock = NSLock()
+    private static var caps: [String: Int] = [:]
+
+    private static func key(provider: String, model: String) -> String { "\(provider)|\(model)" }
+
+    static func knownCap(provider: String, model: String) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        return caps[key(provider: provider, model: model)]
+    }
+
+    static func noteCap(provider: String, model: String, cap: Int) {
+        guard cap >= 1024 else { return }
+        lock.lock(); defer { lock.unlock() }
+        caps[key(provider: provider, model: model)] = cap
+    }
+
+    /// Extract a declared output cap from an upstream error body.
+    /// Matches "max_tokens exceeds the limit of 65536" and close variants.
+    static func capFromErrorBody(_ data: Data) -> Int? {
+        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return nil }
+        let lower = text.lowercased()
+        // Context-window overflow is NOT an output-cap error: its numbers are
+        // prompt/context sizes (llama-server's "exceeds the available context
+        // size (32768 tokens)"), and clamping max_tokens to those poisons
+        // every later request for the provider.
+        if lower.contains("available context size") || lower.contains("context length")
+                || lower.contains("context size") || lower.contains("n_prompt_tokens")
+                || lower.contains("exceed_context_size") {
+            return nil
+        }
+        guard lower.contains("max_tokens") || lower.contains("maximum")
+                || lower.contains("too large") || lower.contains("too long") else { return nil }
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        // Prefer an explicitly declared limit — this also beats a large
+        // requested value echoed back inside the message ("max_tokens 128000
+        // exceeds the limit of 65536" must yield 65536, not 128000).
+        for pattern in ["limit of ([0-9]{3,})", "limit:? ([0-9]{3,})", "maximum[^0-9]{0,20}([0-9]{3,})"] {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let m = regex.firstMatch(in: text, range: full),
+                  m.range(at: 1).location != NSNotFound,
+                  let value = Int(ns.substring(with: m.range(at: 1))) else { continue }
+            return value
+        }
+        // Fallback: the longest digit run of ≥ 4 chars — 65536, 32768…
+        guard let regex = try? NSRegularExpression(pattern: "[0-9]{4,}") else { return nil }
+        var best: Int?
+        for m in regex.matches(in: text, range: full) {
+            guard let value = Int(ns.substring(with: m.range)) else { continue }
+            if best == nil || value > best! { best = value }
+        }
+        return best
+    }
+}
+
 /// Thread-safe completion flag shared between the SSE translation pump and the
 /// keep-alive ping task (the pump runs on a detached Task, the ping on another —
 /// both need to observe/set completion without a data race).
+/// Minimal env-gated wiretap for protocol benchmarking (T1): launch JXRouter
+/// with JXROUTER_TRACE=1 and every upstream request/response exchange is
+/// appended to /tmp/jxrouter_trace.log. Bodies only — auth headers are never
+/// captured, so provider keys cannot leak into the trace.
+enum Wiretap {
+    private static let enabled = ProcessInfo.processInfo.environment["JXROUTER_TRACE"] == "1"
+
+    static func tap(provider: String, model: String, body: Data, tag: String = "req") {
+        guard enabled, !body.isEmpty else { return }
+        let maxBytes = 65_536
+        var text = String(decoding: body.prefix(maxBytes), as: UTF8.self)
+        if body.count > maxBytes { text += "\n…[truncated \(body.count - maxBytes) bytes]" }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let line = "\n===== ts=\(stamp) [\(tag)] provider=\(provider) model=\(model) bytes=\(body.count) =====\n\(text)\n"
+        let path = "/tmp/jxrouter_trace.log"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            defer { try? fh.close() }
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
 final class StreamCompletionFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var _isSet = false

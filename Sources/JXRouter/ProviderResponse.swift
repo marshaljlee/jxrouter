@@ -14,6 +14,10 @@ struct ProviderResponse {
     var servingProvider: String?
     /// True when the request was served by a fallback (index > 0 in the chain).
     var usedFallback: Bool = false
+    /// True when AMEEM refused the request at ingress (a guardrail violation).
+    /// A refusal is terminal: the chain must surface it, not fail over, because
+    /// the gate names a configuration fault that no other provider fixes.
+    var ameemRefused: Bool = false
 
     // Custom memberwise initializer matching the call sites in ProviderRouter:
     // ProviderResponse(statusCode:headers:body:stream:) — stream must precede body.
